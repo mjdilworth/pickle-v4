@@ -1,0 +1,441 @@
+#include "input_handler.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/select.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
+#include <termios.h>
+#include <linux/kd.h>       // For console mode constants
+
+// Global terminal state for emergency restoration
+static struct termios g_orig_termios;
+static struct termios g_original_term;  // Alternative name for compatibility
+static bool g_terminal_modified = false;
+static int g_stdin_fd = -1;
+
+// Comprehensive terminal restoration function
+static void restore_terminal_state(void) {
+	if (g_terminal_modified) {
+		// Try to restore text console mode
+		int console_fd = open("/dev/tty", O_RDWR);
+		if (console_fd >= 0) {
+			// Switch back to text mode
+			ioctl(console_fd, KDSETMODE, KD_TEXT);
+			close(console_fd);
+		}
+		
+		// Restore original terminal attributes with immediate effect
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_original_term);
+		
+		// Additional terminal reset commands to ensure proper state
+		printf("\033[?25h");    // Show cursor
+		printf("\033[0m");      // Reset all attributes  
+		printf("\033c");        // Reset terminal (alternative: printf("\033[2J\033[H"))
+		printf("\r\n");         // Carriage return + newline for clean prompt
+		
+		// Force output and ensure line discipline is restored
+		fflush(stdout);
+		fflush(stderr);
+		
+		// Extra safety: explicitly restore canonical and echo modes
+		struct termios current;
+		if (tcgetattr(STDIN_FILENO, &current) == 0) {
+			current.c_lflag |= (ECHO | ICANON);  // Ensure echo and canonical mode
+			current.c_cc[VMIN] = 1;              // Restore blocking read
+			current.c_cc[VTIME] = 0;             // No timeout
+			tcsetattr(STDIN_FILENO, TCSAFLUSH, &current);
+		}
+		
+		g_terminal_modified = false;
+	}
+}
+
+static const char *input_device_paths[] = {
+    "/dev/input/event0",
+    "/dev/input/event1",
+    "/dev/input/event2",
+    "/dev/input/event3",
+    "/dev/input/event4",
+    NULL
+};
+
+void input_clear_keys(input_context_t *input) {
+    // Clear all key states - useful for terminal mode
+    memset(input->keys_pressed, false, sizeof(input->keys_pressed));
+    input->toggle_corners = false;
+    input->toggle_border = false;
+    input->toggle_help = false;
+}
+
+static int find_keyboard_device(void) {
+    // Try to find a keyboard device by checking input devices
+    DIR *dir = opendir("/dev/input");
+    if (!dir) {
+        fprintf(stderr, "Failed to open /dev/input directory\n");
+        return -1;
+    }
+    
+    struct dirent *entry;
+    char device_path[512];  // Increased buffer size to avoid truncation warnings
+    int fd = -1;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "event", 5) == 0) {
+            // Safe string formatting with bounds checking
+            int ret = snprintf(device_path, sizeof(device_path), "/dev/input/%s", entry->d_name);
+            if (ret >= (int)sizeof(device_path)) {
+                continue; // Skip if path would be truncated
+            }
+            
+            fd = open(device_path, O_RDONLY | O_NONBLOCK);
+            if (fd >= 0) {
+                // Test if this device can generate keyboard events
+                char name[256] = "Unknown";
+                ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+                
+                // Look for keyboard-related keywords in device name
+                if (strstr(name, "keyboard") || strstr(name, "Keyboard") ||
+                    strstr(name, "USB") || strstr(name, "AT")) {
+                    printf("Found keyboard device: %s (%s)\n", device_path, name);
+                    break;
+                }
+                
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+    
+    closedir(dir);
+    
+    // If we couldn't find a keyboard device, try the first available event device
+    if (fd < 0) {
+        for (int i = 0; input_device_paths[i]; i++) {
+            fd = open(input_device_paths[i], O_RDONLY | O_NONBLOCK);
+            if (fd >= 0) {
+                // Using input device
+                break;
+            }
+        }
+    }
+    
+    return fd;
+}
+
+static int setup_terminal_input(input_context_t *input) {
+    input->stdin_fd = STDIN_FILENO;
+    
+    // Get current terminal attributes
+    if (tcgetattr(input->stdin_fd, &input->orig_termios) != 0) {
+        return -1;
+    }
+    
+    // Save global copy for emergency restoration
+    g_orig_termios = input->orig_termios;
+    g_original_term = input->orig_termios;  // Save for comprehensive restore function
+    g_stdin_fd = input->stdin_fd;
+    g_terminal_modified = true;
+    
+    // Set up non-canonical, non-echo mode for immediate input
+    struct termios raw = input->orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);  // Disable echo and canonical mode
+    raw.c_cc[VMIN] = 0;               // Non-blocking read
+    raw.c_cc[VTIME] = 0;              // No timeout
+    
+    if (tcsetattr(input->stdin_fd, TCSAFLUSH, &raw) != 0) {
+        return -1;
+    }
+    
+    printf("Using terminal input mode (press keys directly)\n");
+    printf("Controls: q=quit, h=help, c=corners, b=border, 1-4=select corner, arrows=move\n");
+    return 0;
+}
+
+// Global terminal restoration function for emergencies
+void input_restore_terminal_global(void) {
+    restore_terminal_state();
+    
+    // Additional safety measures for terminal restoration
+    printf("\nTerminal restored\n");
+    fflush(stdout);
+    
+    // Force terminal to reset to a known good state
+    system("stty sane 2>/dev/null || true");
+}
+
+static void restore_terminal(input_context_t *input) {
+    if (input->use_stdin_fallback && input->stdin_fd >= 0) {
+        // Use the comprehensive restore function
+        restore_terminal_state();
+    }
+}
+
+int input_init(input_context_t *input) {
+    memset(input, 0, sizeof(*input));
+    
+    // Check if we're in SSH or other terminal-only environment
+    bool prefer_terminal = (getenv("SSH_CLIENT") != NULL) || 
+                          (getenv("SSH_CONNECTION") != NULL) ||
+                          (!isatty(STDIN_FILENO));
+    
+    if (prefer_terminal) {
+        printf("Terminal environment detected, using terminal input...\n");
+        if (setup_terminal_input(input) == 0) {
+            input->use_stdin_fallback = true;
+            input->keyboard_fd = -1;
+        } else {
+            fprintf(stderr, "Failed to set up terminal input\n");
+            return -1;
+        }
+    } else {
+        input->keyboard_fd = find_keyboard_device();
+        if (input->keyboard_fd < 0) {
+            printf("Event device input not available, trying terminal input...\n");
+            
+            // Try terminal input as fallback
+            if (setup_terminal_input(input) == 0) {
+                input->use_stdin_fallback = true;
+                input->keyboard_fd = -1; // Mark event device as unavailable
+            } else {
+                fprintf(stderr, "Failed to set up any input method\n");
+                return -1;
+            }
+        } else {
+            printf("Using event device input\n");
+            input->use_stdin_fallback = false;
+        }
+    }
+    
+    input->should_quit = false;
+    // Input handler initialization complete
+    return 0;
+}
+
+void input_cleanup(input_context_t *input) {
+    if (input->keyboard_fd >= 0) {
+        close(input->keyboard_fd);
+    }
+    
+    // Restore terminal if we were using stdin fallback
+    restore_terminal(input);
+    
+    memset(input, 0, sizeof(*input));
+}
+
+void input_update(input_context_t *input) {
+    static bool prev_keys[256] = {false};
+    
+    // Store previous key states for edge detection
+    memcpy(prev_keys, input->keys_pressed, sizeof(prev_keys));
+    
+    // Clear one-shot keys at start of each frame
+    memset(input->keys_just_pressed, false, sizeof(input->keys_just_pressed));
+    
+    if (input->use_stdin_fallback) {
+        // Handle terminal input
+        char ch;
+        while (read(input->stdin_fd, &ch, 1) == 1) {
+            // Convert ASCII characters to our internal key codes
+            switch (ch) {
+                case 'q':
+                case 'Q':
+                    input->should_quit = true;
+                    printf("Quit requested\n");
+                    break;
+                case 27: // ESC - check for arrow key sequences
+                    {
+                        char seq[3];
+                        // Try to read the escape sequence
+                        if (read(input->stdin_fd, &seq[0], 1) == 1 && seq[0] == '[') {
+                            if (read(input->stdin_fd, &seq[1], 1) == 1) {
+                                switch (seq[1]) {
+                                    case 'A': // Up arrow
+                                        input->keys_just_pressed[KEY_UP] = true;
+                                        printf("Up arrow pressed\n");
+                                        break;
+                                    case 'B': // Down arrow
+                                        input->keys_just_pressed[KEY_DOWN] = true;
+                                        printf("Down arrow pressed\n");
+                                        break;
+                                    case 'C': // Right arrow
+                                        input->keys_just_pressed[KEY_RIGHT] = true;
+                                        printf("Right arrow pressed\n");
+                                        break;
+                                    case 'D': // Left arrow
+                                        input->keys_just_pressed[KEY_LEFT] = true;
+                                        printf("Left arrow pressed\n");
+                                        break;
+                                    default:
+                                        // Unknown escape sequence, treat as quit
+                                        input->should_quit = true;
+                                        printf("Quit requested (ESC)\n");
+                                        break;
+                                }
+                            } else {
+                                // Just ESC by itself
+                                input->should_quit = true;
+                                printf("Quit requested (ESC)\n");
+                            }
+                        } else {
+                            // Just ESC by itself
+                            input->should_quit = true;
+                            printf("Quit requested (ESC)\n");
+                        }
+                    }
+                    break;
+                case '1':
+                    input->keys_just_pressed[KEY_1] = true;
+                    printf("Key 1 pressed (select corner 1)\n");
+                    break;
+                case '2':
+                    input->keys_just_pressed[KEY_2] = true;
+                    printf("Key 2 pressed (select corner 2)\n");
+                    break;
+                case '3':
+                    input->keys_just_pressed[KEY_3] = true;
+                    printf("Key 3 pressed (select corner 3)\n");
+                    break;
+                case '4':
+                    input->keys_just_pressed[KEY_4] = true;
+                    printf("Key 4 pressed (select corner 4)\n");
+                    break;
+                case 'c':
+                case 'C':
+                    input->toggle_corners = true;
+                    printf("Toggle corner highlights\n");
+                    break;
+                case 'b':
+                case 'B':
+                    input->toggle_border = true;
+                    printf("Toggle border highlights\n");
+                    break;
+                case 'h':
+                case 'H':
+                    input->toggle_help = true;
+                    printf("Toggle help overlay\n");
+                    break;
+                case 'w':
+                case 'W':
+                    input->keys_just_pressed[KEY_UP] = true;
+                    printf("Up (W) pressed\n");
+                    break;
+                case 's':
+                case 'S':
+                    input->keys_just_pressed[KEY_DOWN] = true;
+                    printf("Down (S) pressed\n");
+                    break;
+                case 'a':
+                case 'A':
+                    input->keys_just_pressed[KEY_LEFT] = true;
+                    printf("Left (A) pressed\n");
+                    break;
+                case 'd':
+                case 'D':
+                    input->keys_just_pressed[KEY_RIGHT] = true;
+                    printf("Right (D) pressed\n");
+                    break;
+                case 'r':
+                case 'R':
+                    input->keys_just_pressed[KEY_R] = true;
+                    printf("R key pressed (reset keystone)\n");
+                    break;
+            }
+        }
+        
+    } else {
+        // Handle event device input (original method)
+        struct input_event ev;
+        while (read(input->keyboard_fd, &ev, sizeof(ev)) == sizeof(ev)) {
+            if (ev.type == EV_KEY) {
+                if (ev.code < 256) {
+                    // Update key state
+                    input->keys_pressed[ev.code] = (ev.value != 0);
+                    
+                    // Handle specific keys
+                    if (ev.value == 1) { // Key press
+                        switch (ev.code) {
+                            case KEY_Q:
+                            case KEY_ESC:
+                                input->should_quit = true;
+                                printf("Quit requested\n");
+                                break;
+                            case KEY_1:
+                                printf("Key 1 pressed (select corner 1)\n");
+                                break;
+                            case KEY_2:
+                                printf("Key 2 pressed (select corner 2)\n");
+                                break;
+                            case KEY_3:
+                                printf("Key 3 pressed (select corner 3)\n");
+                                break;
+                            case KEY_4:
+                                printf("Key 4 pressed (select corner 4)\n");
+                                break;
+                            case KEY_C:
+                                input->toggle_corners = true;
+                                printf("Toggle corner highlights\n");
+                                break;
+                            case KEY_UP:
+                                printf("Up arrow pressed\n");
+                                break;
+                            case KEY_DOWN:
+                                printf("Down arrow pressed\n");
+                                break;
+                            case KEY_LEFT:
+                                printf("Left arrow pressed\n");
+                                break;
+                            case KEY_RIGHT:
+                                printf("Right arrow pressed\n");
+                                break;
+                            case KEY_R:
+                                printf("R pressed (reset keystone)\n");
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+
+}
+
+bool input_is_key_pressed(input_context_t *input, int key) {
+    if (key >= 0 && key < 256) {
+        return input->keys_pressed[key];
+    }
+    return false;
+}
+
+bool input_is_key_just_pressed(input_context_t *input, int key) {
+    // In terminal mode, use the one-shot array
+    if (input->use_stdin_fallback) {
+        if (key >= 0 && key < 256) {
+            return input->keys_just_pressed[key];
+        }
+        return false;
+    }
+    
+    // For hardware input, use edge detection
+    static bool prev_keys[256] = {false};
+    static bool first_call = true;
+    
+    if (first_call) {
+        memset(prev_keys, false, sizeof(prev_keys));
+        first_call = false;
+    }
+    
+    bool current_state = input_is_key_pressed(input, key);
+    bool was_just_pressed = current_state && !prev_keys[key];
+    
+    prev_keys[key] = current_state;
+    return was_just_pressed;
+}
+
+bool input_should_quit(input_context_t *input) {
+    return input->should_quit;
+}
