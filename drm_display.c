@@ -10,6 +10,9 @@
 #include <sys/select.h>
 #include <stdint.h>
 
+// Forward declarations
+static void drm_handle_pending_flips(display_ctx_t *drm);
+
 static const char *drm_device_paths[] = {
     "/dev/dri/card1",       // Working display card (detected by diagnostics)
     "/dev/dri/card0",       // Fallback display card
@@ -207,6 +210,16 @@ void drm_page_flip_handler(int fd, unsigned int frame, unsigned int sec,
                           unsigned int usec, void *data) {
     (void)fd; (void)frame; (void)sec; (void)usec; // Suppress unused warnings
     display_ctx_t *drm = (display_ctx_t *)data;
+    
+    // Page flip completed - now safe to release the previous buffer
+    if (drm->current_bo) {
+        gbm_surface_release_buffer(drm->gbm_surface, drm->current_bo);
+    }
+    
+    // Update current buffer to the one that just got displayed
+    drm->current_bo = drm->next_bo;
+    drm->current_fb_id = drm->next_fb_id;
+    
     drm->waiting_for_flip = false;
 }
 
@@ -222,6 +235,30 @@ int drm_set_mode(display_ctx_t *drm, uint32_t fb_id) {
     
     drm->mode_set_done = true;
     return 0;
+}
+
+// Handle any pending page flip completions without blocking
+static void drm_handle_pending_flips(display_ctx_t *drm) {
+    if (!drm->waiting_for_flip) {
+        return; // No pending flips
+    }
+    
+    // Non-blocking check for pending events
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(drm->drm_fd, &fds);
+    
+    struct timeval timeout = {0, 0}; // Non-blocking (immediate return)
+    
+    drmEventContext evctx = {
+        .version = DRM_EVENT_CONTEXT_VERSION,
+        .page_flip_handler = drm_page_flip_handler,
+    };
+    
+    int ret = select(drm->drm_fd + 1, &fds, NULL, NULL, &timeout);
+    if (ret > 0 && FD_ISSET(drm->drm_fd, &fds)) {
+        drmHandleEvent(drm->drm_fd, &evctx);
+    }
 }
 
 int drm_swap_buffers(display_ctx_t *drm) {
@@ -254,7 +291,16 @@ int drm_swap_buffers(display_ctx_t *drm) {
         return 0;
     }
     
-    // Queue page flip
+    // Handle any pending page flip completions first (non-blocking)
+    drm_handle_pending_flips(drm);
+    
+    // If we're still waiting for a previous flip, skip this frame to avoid stalling
+    if (drm->waiting_for_flip) {
+        gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
+        return 0; // Not an error, just frame skip for performance
+    }
+    
+    // Queue page flip (asynchronous)
     drm->waiting_for_flip = true;
     int ret = drmModePageFlip(drm->drm_fd, drm->crtc_id, drm->next_fb_id,
                              DRM_MODE_PAGE_FLIP_EVENT, drm);
@@ -265,37 +311,9 @@ int drm_swap_buffers(display_ctx_t *drm) {
         return -1;
     }
     
-    // Wait for page flip completion
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(drm->drm_fd, &fds);
-    
-    drmEventContext evctx = {
-        .version = DRM_EVENT_CONTEXT_VERSION,
-        .page_flip_handler = drm_page_flip_handler,
-    };
-    
-    while (drm->waiting_for_flip) {
-        ret = select(drm->drm_fd + 1, &fds, NULL, NULL, NULL);
-        if (ret < 0) {
-            fprintf(stderr, "Select error: %s\n", strerror(errno));
-            break;
-        } else if (ret == 0) {
-            fprintf(stderr, "Select timeout\n");
-            break;
-        } else if (FD_ISSET(drm->drm_fd, &fds)) {
-            drmHandleEvent(drm->drm_fd, &evctx);
-        }
-    }
-    
-    // Release previous buffer
-    if (drm->current_bo) {
-        gbm_surface_release_buffer(drm->gbm_surface, drm->current_bo);
-    }
-    
-    // Update current buffer
-    drm->current_bo = drm->next_bo;
-    drm->current_fb_id = drm->next_fb_id;
+    // Don't wait for completion - let it complete asynchronously
+    // The page flip handler will update the buffers when it completes
+    return 0;
     
     return 0;
 }

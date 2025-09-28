@@ -41,6 +41,10 @@ void keystone_toggle_border(keystone_context_t *keystone);
 bool keystone_border_visible(keystone_context_t *keystone);
 void keystone_toggle_help(keystone_context_t *keystone);
 bool keystone_help_visible(keystone_context_t *keystone);
+int keystone_save_to_file(keystone_context_t *keystone, const char *filename);
+int keystone_load_from_file(keystone_context_t *keystone, const char *filename);
+int keystone_save_settings(keystone_context_t *keystone);
+int keystone_load_settings(keystone_context_t *keystone);
 
 // Corner indices
 #define CORNER_TOP_LEFT     0

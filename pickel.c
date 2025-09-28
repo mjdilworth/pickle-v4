@@ -47,6 +47,9 @@ static void setup_signal_handlers(void) {
 }
 
 int main(int argc, char *argv[]) {
+    printf("Starting pickle video player...\n");
+    fflush(stdout);
+    
     bool loop_playback = false;
     char *video_file = NULL;
     
@@ -69,13 +72,20 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  1-4   - select keystone corners\n");
         fprintf(stderr, "  arrows/wasd - move selected corner\n");
         fprintf(stderr, "  r     - reset keystone\n");
+        fprintf(stderr, "  p     - save keystone settings\n");
         fprintf(stderr, "  c     - toggle corner highlights\n");
         fprintf(stderr, "  b     - toggle border highlights\n");
         return 1;
     }
 
+    printf("Setting up application context...\n");
+    fflush(stdout);
+    
     app_context_t app = {0};
     g_app = &app;  // Set global reference for signal handlers
+    
+    printf("Setting up signal handlers...\n");
+    fflush(stdout);
     
     // Set up signal handlers for clean exit
     setup_signal_handlers();
@@ -86,6 +96,9 @@ int main(int argc, char *argv[]) {
         g_app = NULL;  // Clear global reference
         return 1;
     }
+    
+    printf("Starting main application loop...\n");
+    fflush(stdout);
     
     app_run(&app);
     app_cleanup(&app);

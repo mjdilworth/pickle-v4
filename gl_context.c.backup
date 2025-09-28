@@ -379,13 +379,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     }
     
     glClear(GL_COLOR_BUFFER_BIT);
-    
-    // Set up OpenGL state only once or when needed
-    if (!gl_state_set) {
-        glViewport(0, 0, drm->width, drm->height);
-        gl_state_set = true;
-    }
-    
+
     // CRITICAL: Complete buffer unbinding before state restoration
     // This is needed to prevent state leakage from previous operations
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -401,22 +395,12 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
     
-    // Position attribute
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    // Set up vertex attributes
     glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
     
-    // Texture coordinate attribute  
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
-    
-    // Set MVP matrix (identity - only once)
-    float mvp_matrix[16] = {
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1
-    };
-    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     
     // Explicitly disable blending - overlays might have enabled it
     glDisable(GL_BLEND);
@@ -424,45 +408,84 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     // Disable depth test - make sure video is always visible
     glDisable(GL_DEPTH_TEST);
     
+    // Set MVP matrix (identity)
+    float mvp_matrix[16] = {
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        };
+        glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+        
+        // Restore texture units and samplers (critical for video rendering)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, gl->texture_u);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+        glActiveTexture(GL_TEXTURE0); // Reset to unit 0
+        
+        // Set texture sampler uniforms
+        glUniform1i(gl->u_texture_y, 0);
+        glUniform1i(gl->u_texture_u, 1);
+        glUniform1i(gl->u_texture_v, 2);
+        
+        // Restore blend and depth state for video rendering
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        
+        // Check for OpenGL errors after state restoration
+        GLenum error = glGetError();
+        if (error != GL_NO_ERROR) {
+            static int error_count = 0;
+            if (error_count < 5) {
+                printf("Video: OpenGL error during state restoration: 0x%x\n", error);
+                error_count++;
+            }
+        }
+        
+        render_state_set = true;
+    }
+    
     // Set keystone matrix (may change dynamically)
     const float *keystone_matrix = keystone_get_matrix(keystone);
+    
+    // Debug: Check for invalid keystone matrix on first few frames
+    static int matrix_debug_count = 0;
+    if (matrix_debug_count < 3) {
+        bool matrix_invalid = false;
+        // Check if matrix has NaN or very small determinants that would collapse the image
+        for (int i = 0; i < 16; i++) {
+            if (isnan(keystone_matrix[i]) || isinf(keystone_matrix[i])) {
+                matrix_invalid = true;
+                break;
+            }
+        }
+        if (matrix_invalid || frame_rendered < 5) {
+            printf("Keystone matrix:\n");
+            for (int i = 0; i < 4; i++) {
+                printf("  [%.3f %.3f %.3f %.3f]\n", 
+                       keystone_matrix[i*4], keystone_matrix[i*4+1], 
+                       keystone_matrix[i*4+2], keystone_matrix[i*4+3]);
+            }
+            
+            // Show where the video quad corners end up after transformation
+            printf("Video quad will be transformed to:\n");
+            // Apply transformation to video quad corners (-1,-1) to (1,1)
+            float corners[4][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}};
+            for (int i = 0; i < 4; i++) {
+                float x = corners[i][0], y = corners[i][1];
+                float w = keystone_matrix[12]*x + keystone_matrix[13]*y + keystone_matrix[15];
+                float tx = (keystone_matrix[0]*x + keystone_matrix[1]*y + keystone_matrix[3]) / w;
+                float ty = (keystone_matrix[4]*x + keystone_matrix[5]*y + keystone_matrix[7]) / w;
+                printf("  Corner %d: (%.3f, %.3f) -> (%.3f, %.3f)\n", i, x, y, tx, ty);
+            }
+            matrix_debug_count++;
+        }
+    }
+    
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
-    
-    // Restore texture units and samplers (critical for video rendering)
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_y);
-    
-    // Set proper texture parameters (might have been changed by overlays)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_u);
-    
-    // Set proper texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
-    
-    // Set proper texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    // Reset to texture unit 0
-    glActiveTexture(GL_TEXTURE0);
-    
-    // Set texture sampler uniforms
-    glUniform1i(gl->u_texture_y, 0);
-    glUniform1i(gl->u_texture_u, 1);
-    glUniform1i(gl->u_texture_v, 2);
     
     // Update YUV textures if video data is provided
     if (y_data && u_data && v_data) {
@@ -485,6 +508,12 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         // Y texture - OPTIMIZED: minimize texture operations
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+        
+        // Set proper texture parameters (might have been changed by overlays)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         if (y_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_data);
@@ -516,6 +545,12 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         // U texture - OPTIMIZED: minimize texture operations  
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, gl->texture_u);
+        
+        // Set proper texture parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         if (u_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_data);
@@ -547,6 +582,12 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         // V texture - OPTIMIZED: minimize texture operations
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+        
+        // Set proper texture parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         if (v_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_data);
@@ -575,6 +616,13 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             }
         }
         
+        // OPTIMIZED: Set texture uniforms only once
+        if (size_changed) {
+            glUniform1i(gl->u_texture_y, 0);
+            glUniform1i(gl->u_texture_u, 1);
+            glUniform1i(gl->u_texture_v, 2);
+        }
+        
         if (frame_rendered == 0) {
             printf("GPU YUV→RGB rendering started (%dx%d)\n", width, height);
         }
@@ -586,7 +634,6 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         // Skip test pattern for now - YUV textures need proper initialization
         printf("Waiting for video data...\n");
     }
-    
     // Check for OpenGL errors before drawing
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
@@ -602,6 +649,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         printf("OpenGL error after draw: 0x%x\n", error);
     }
 }
+
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
     static int swap_count = 0;
     

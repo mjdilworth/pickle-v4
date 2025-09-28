@@ -34,7 +34,7 @@ static void restore_terminal_state(void) {
 		// Additional terminal reset commands to ensure proper state
 		printf("\033[?25h");    // Show cursor
 		printf("\033[0m");      // Reset all attributes  
-		printf("\033c");        // Reset terminal (alternative: printf("\033[2J\033[H"))
+		// DON'T reset terminal - preserve output: printf("\033c");
 		printf("\r\n");         // Carriage return + newline for clean prompt
 		
 		// Force output and ensure line discipline is restored
@@ -69,6 +69,7 @@ void input_clear_keys(input_context_t *input) {
     input->toggle_corners = false;
     input->toggle_border = false;
     input->toggle_help = false;
+    input->save_keystone = false;
 }
 
 static int find_keyboard_device(void) {
@@ -129,6 +130,13 @@ static int find_keyboard_device(void) {
 static int setup_terminal_input(input_context_t *input) {
     input->stdin_fd = STDIN_FILENO;
     
+    // Check if stdin is a terminal (tty)
+    if (!isatty(input->stdin_fd)) {
+        printf("Input is not a terminal, using simplified input mode\n");
+        // For non-tty input (pipes, redirects), just use stdin directly
+        return 0;
+    }
+    
     // Get current terminal attributes
     if (tcgetattr(input->stdin_fd, &input->orig_termios) != 0) {
         return -1;
@@ -150,8 +158,12 @@ static int setup_terminal_input(input_context_t *input) {
         return -1;
     }
     
+    // Mark that we modified the terminal
+    g_terminal_modified = true;
+    
     printf("Using terminal input mode (press keys directly)\n");
     printf("Controls: q=quit, h=help, c=corners, b=border, 1-4=select corner, arrows=move\n");
+    fflush(stdout);
     return 0;
 }
 
@@ -238,7 +250,8 @@ void input_update(input_context_t *input) {
     if (input->use_stdin_fallback) {
         // Handle terminal input
         char ch;
-        while (read(input->stdin_fd, &ch, 1) == 1) {
+        int bytes_read = read(input->stdin_fd, &ch, 1);
+        while (bytes_read == 1) {
             // Convert ASCII characters to our internal key codes
             switch (ch) {
                 case 'q':
@@ -255,19 +268,32 @@ void input_update(input_context_t *input) {
                                 switch (seq[1]) {
                                     case 'A': // Up arrow
                                         input->keys_just_pressed[KEY_UP] = true;
-                                        printf("Up arrow pressed\n");
+                                        input->keys_pressed[KEY_UP] = true;
+                                        // Hold for multiple frames in terminal mode
+                                        static int up_hold = 0;
+                                        up_hold = 5; // Hold for 5 frames
+                                        printf("\n*** UP ARROW PRESSED (will hold for %d frames) ***\n", up_hold);
                                         break;
                                     case 'B': // Down arrow
                                         input->keys_just_pressed[KEY_DOWN] = true;
-                                        printf("Down arrow pressed\n");
+                                        input->keys_pressed[KEY_DOWN] = true;
+                                        static int down_hold = 0;
+                                        down_hold = 5; // Hold for 5 frames
+                                        printf("\n*** DOWN ARROW PRESSED (will hold for %d frames) ***\n", down_hold);
                                         break;
                                     case 'C': // Right arrow
                                         input->keys_just_pressed[KEY_RIGHT] = true;
-                                        printf("Right arrow pressed\n");
+                                        input->keys_pressed[KEY_RIGHT] = true;
+                                        static int right_hold = 0;
+                                        right_hold = 5; // Hold for 5 frames
+                                        printf("\n*** RIGHT ARROW PRESSED (will hold for %d frames) ***\n", right_hold);
                                         break;
                                     case 'D': // Left arrow
                                         input->keys_just_pressed[KEY_LEFT] = true;
-                                        printf("Left arrow pressed\n");
+                                        input->keys_pressed[KEY_LEFT] = true;
+                                        static int left_hold = 0;
+                                        left_hold = 5; // Hold for 5 frames
+                                        printf("\n*** LEFT ARROW PRESSED (will hold for %d frames) ***\n", left_hold);
                                         break;
                                     default:
                                         // Unknown escape sequence, treat as quit
@@ -318,32 +344,20 @@ void input_update(input_context_t *input) {
                     input->toggle_help = true;
                     printf("Toggle help overlay\n");
                     break;
-                case 'w':
-                case 'W':
-                    input->keys_just_pressed[KEY_UP] = true;
-                    printf("Up (W) pressed\n");
-                    break;
-                case 's':
-                case 'S':
-                    input->keys_just_pressed[KEY_DOWN] = true;
-                    printf("Down (S) pressed\n");
-                    break;
-                case 'a':
-                case 'A':
-                    input->keys_just_pressed[KEY_LEFT] = true;
-                    printf("Left (A) pressed\n");
-                    break;
-                case 'd':
-                case 'D':
-                    input->keys_just_pressed[KEY_RIGHT] = true;
-                    printf("Right (D) pressed\n");
-                    break;
+
                 case 'r':
                 case 'R':
                     input->keys_just_pressed[KEY_R] = true;
                     printf("R key pressed (reset keystone)\n");
                     break;
+                case 'p':
+                case 'P':
+                    input->save_keystone = true;
+                    printf("P key pressed (save keystone)\n");
+                    break;
             }
+            // Read next character
+            bytes_read = read(input->stdin_fd, &ch, 1);
         }
         
     } else {
@@ -405,6 +419,20 @@ void input_update(input_context_t *input) {
 }
 
 bool input_is_key_pressed(input_context_t *input, int key) {
+    // Enhanced debug for arrow keys to help diagnose movement issues
+    if (key == KEY_LEFT || key == KEY_RIGHT || key == KEY_UP || key == KEY_DOWN) {
+        const char* key_name = "UNKNOWN";
+        if (key == KEY_LEFT) key_name = "LEFT";
+        else if (key == KEY_RIGHT) key_name = "RIGHT";
+        else if (key == KEY_UP) key_name = "UP";
+        else if (key == KEY_DOWN) key_name = "DOWN";
+        
+        if (input->keys_pressed[key]) {
+            printf("KEY STATE: %s arrow IS PRESSED\n", key_name);
+            return true;
+        }
+    }
+    
     if (key >= 0 && key < 256) {
         return input->keys_pressed[key];
     }
@@ -415,7 +443,11 @@ bool input_is_key_just_pressed(input_context_t *input, int key) {
     // In terminal mode, use the one-shot array
     if (input->use_stdin_fallback) {
         if (key >= 0 && key < 256) {
-            return input->keys_just_pressed[key];
+            bool was_pressed = input->keys_just_pressed[key];
+            if (was_pressed) {
+                input->keys_just_pressed[key] = false; // Clear after reading
+            }
+            return was_pressed;
         }
         return false;
     }

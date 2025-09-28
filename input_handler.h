@@ -14,6 +14,7 @@ typedef struct {
     bool toggle_corners;
     bool toggle_border;
     bool toggle_help;
+    bool save_keystone;
     
     // Terminal input fallback
     bool use_stdin_fallback;

@@ -2,7 +2,7 @@
 #define GL_CONTEXT_H
 
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl31.h>  // OpenGL ES 3.1 for modern features
 #include <gbm.h>
 #include <stdbool.h>
 #include "drm_display.h"
@@ -30,7 +30,15 @@ typedef struct {
     GLuint ebo;
     GLuint vao;
     
-    // Shader uniforms
+    // Modern ES 3.1 Uniform Buffer Objects
+    GLuint transform_ubo;      // TransformMatrices UBO
+    GLuint video_settings_ubo; // VideoSettings UBO
+    
+    // UBO binding points
+    GLuint transform_binding_point;
+    GLuint video_settings_binding_point;
+    
+    // Legacy uniform locations (fallback)
     GLint u_mvp_matrix;
     GLint u_texture_y;    // Y plane sampler
     GLint u_texture_u;    // U plane sampler
@@ -66,6 +74,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
 void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);
+void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
 
 // Shader source code
 extern const char *vertex_shader_source;
