@@ -139,22 +139,7 @@ void app_run(app_context_t *app) {
             keystone_select_corner(app->keystone, CORNER_TOP_LEFT);     // Visual "4" (top-left)
         }
         
-        // Check if we have arrow key input (works whether a corner is selected or not)
-        bool has_arrow_input = 
-            input_is_key_pressed(app->input, KEY_LEFT) ||
-            input_is_key_pressed(app->input, KEY_RIGHT) ||
-            input_is_key_pressed(app->input, KEY_UP) ||
-            input_is_key_pressed(app->input, KEY_DOWN);
-            
-        if (has_arrow_input) {
-            printf("\n*** DETECTED ARROW KEY INPUT ***\n");
-        }
-        
-        // If we have a selected corner, log it for debugging
-        if (app->keystone->selected_corner >= 0) {
-            printf("\n*** ACTIVE CORNER: %d ***\n", 
-                   app->keystone->selected_corner + 1);
-        }
+        // Check for arrow key input (simply helps the corner movement by triggering input_is_key_pressed)
 
         // Reset keystone
         if (input_is_key_just_pressed(app->input, KEY_R)) {
@@ -403,47 +388,28 @@ void app_run(app_context_t *app) {
         
         total_render_time += render_time;
 
-        // IMPORTANT: Process keystone movement *immediately after* input update
-        // This ensures arrow keys are seen before any state clearing happens
+        // Process keystone movement immediately after input update
         float move_x = 0.0f, move_y = 0.0f;
         if (input_is_key_pressed(app->input, KEY_LEFT)) move_x = -1.0f;  // LEFT = negative X
         if (input_is_key_pressed(app->input, KEY_RIGHT)) move_x = 1.0f;  // RIGHT = positive X  
-        if (input_is_key_pressed(app->input, KEY_UP)) move_y = 1.0f;     // UP = positive Y (screen coordinates)
-        if (input_is_key_pressed(app->input, KEY_DOWN)) move_y = -1.0f;  // DOWN = negative Y (screen coordinates)
-
-        // Debug info about key states
-        printf("ARROW STATES: LEFT=%d RIGHT=%d UP=%d DOWN=%d\n",
-               input_is_key_pressed(app->input, KEY_LEFT) ? 1 : 0,
-               input_is_key_pressed(app->input, KEY_RIGHT) ? 1 : 0,
-               input_is_key_pressed(app->input, KEY_UP) ? 1 : 0,
-               input_is_key_pressed(app->input, KEY_DOWN) ? 1 : 0);
+        if (input_is_key_pressed(app->input, KEY_UP)) move_y = 1.0f;     // UP = positive Y
+        if (input_is_key_pressed(app->input, KEY_DOWN)) move_y = -1.0f;  // DOWN = negative Y
 
         // Only attempt to move if we have a selected corner and movement input
         if (app->keystone->selected_corner >= 0 && (move_x != 0.0f || move_y != 0.0f)) {
-            printf("MOVING CORNER %d by (%.1f, %.1f)\n", 
-                   app->keystone->selected_corner + 1, move_x, move_y);
-            
             // Apply the movement
             keystone_move_corner(app->keystone, move_x, move_y);
-            
-            // Keep track that we moved this frame
-            printf("Corner %d was moved by (%.1f, %.1f)\n", 
-                   app->keystone->selected_corner + 1, move_x, move_y);
         }
         
-        // Clear input state for next frame (terminal mode needs this)
+                // Clear input state for next frame (terminal mode needs this)
         if (app->input->use_stdin_fallback) {
-            // MODIFIED: Only clear arrow keys if no corner is selected
+            // Only clear arrow keys if no corner is selected
             if (app->keystone->selected_corner < 0) {
                 // No corner selected, clear arrow key states
                 app->input->keys_pressed[KEY_UP] = false;
                 app->input->keys_pressed[KEY_DOWN] = false;
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
-            } else {
-                // Corner is selected, keep arrow keys active to allow continuous movement
-                printf("Corner %d selected - keeping arrow key states\n", 
-                       app->keystone->selected_corner + 1);
             }
         }
 

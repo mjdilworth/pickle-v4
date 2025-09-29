@@ -269,31 +269,22 @@ void input_update(input_context_t *input) {
                                     case 'A': // Up arrow
                                         input->keys_just_pressed[KEY_UP] = true;
                                         input->keys_pressed[KEY_UP] = true;
-                                        // Hold for multiple frames in terminal mode
-                                        static int up_hold = 0;
-                                        up_hold = 5; // Hold for 5 frames
-                                        printf("\n*** UP ARROW PRESSED (will hold for %d frames) ***\n", up_hold);
+                                        // Hold functionality removed
                                         break;
                                     case 'B': // Down arrow
                                         input->keys_just_pressed[KEY_DOWN] = true;
                                         input->keys_pressed[KEY_DOWN] = true;
-                                        static int down_hold = 0;
-                                        down_hold = 5; // Hold for 5 frames
-                                        printf("\n*** DOWN ARROW PRESSED (will hold for %d frames) ***\n", down_hold);
+                                        // Hold functionality removed
                                         break;
                                     case 'C': // Right arrow
                                         input->keys_just_pressed[KEY_RIGHT] = true;
                                         input->keys_pressed[KEY_RIGHT] = true;
-                                        static int right_hold = 0;
-                                        right_hold = 5; // Hold for 5 frames
-                                        printf("\n*** RIGHT ARROW PRESSED (will hold for %d frames) ***\n", right_hold);
+                                        // Hold functionality removed
                                         break;
                                     case 'D': // Left arrow
                                         input->keys_just_pressed[KEY_LEFT] = true;
                                         input->keys_pressed[KEY_LEFT] = true;
-                                        static int left_hold = 0;
-                                        left_hold = 5; // Hold for 5 frames
-                                        printf("\n*** LEFT ARROW PRESSED (will hold for %d frames) ***\n", left_hold);
+                                        // Hold functionality removed
                                         break;
                                     default:
                                         // Unknown escape sequence, treat as quit
@@ -419,20 +410,6 @@ void input_update(input_context_t *input) {
 }
 
 bool input_is_key_pressed(input_context_t *input, int key) {
-    // Enhanced debug for arrow keys to help diagnose movement issues
-    if (key == KEY_LEFT || key == KEY_RIGHT || key == KEY_UP || key == KEY_DOWN) {
-        const char* key_name = "UNKNOWN";
-        if (key == KEY_LEFT) key_name = "LEFT";
-        else if (key == KEY_RIGHT) key_name = "RIGHT";
-        else if (key == KEY_UP) key_name = "UP";
-        else if (key == KEY_DOWN) key_name = "DOWN";
-        
-        if (input->keys_pressed[key]) {
-            printf("KEY STATE: %s arrow IS PRESSED\n", key_name);
-            return true;
-        }
-    }
-    
     if (key >= 0 && key < 256) {
         return input->keys_pressed[key];
     }
