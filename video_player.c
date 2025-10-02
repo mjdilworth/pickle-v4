@@ -8,6 +8,49 @@
 #include <time.h>
 #include <linux/input.h>
 
+static bool process_keystone_movement(app_context_t *app, double delta_time, double target_frame_time) {
+    if (!app || !app->keystone || !app->input) {
+        return false;
+    }
+
+    bool left = input_is_key_pressed(app->input, KEY_LEFT);
+    bool right = input_is_key_pressed(app->input, KEY_RIGHT);
+    bool up = input_is_key_pressed(app->input, KEY_UP);
+    bool down = input_is_key_pressed(app->input, KEY_DOWN);
+
+    if (app->input->use_stdin_fallback) {
+        left = left || input_is_key_just_pressed(app->input, KEY_LEFT);
+        right = right || input_is_key_just_pressed(app->input, KEY_RIGHT);
+        up = up || input_is_key_just_pressed(app->input, KEY_UP);
+        down = down || input_is_key_just_pressed(app->input, KEY_DOWN);
+    }
+
+    float move_x = 0.0f;
+    float move_y = 0.0f;
+
+    if (left != right) {
+        move_x = left ? -1.0f : 1.0f;
+    }
+    if (up != down) {
+        move_y = up ? 1.0f : -1.0f;
+    }
+
+    if (app->keystone->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
+        return false;
+    }
+
+    float speed_scale = 1.0f;
+    if (target_frame_time > 0.0 && delta_time > 0.0) {
+        speed_scale = (float)(delta_time / target_frame_time);
+        if (speed_scale < 0.25f) speed_scale = 0.25f;
+        if (speed_scale > 3.0f) speed_scale = 3.0f;
+    }
+
+    keystone_move_corner(app->keystone, move_x * speed_scale, move_y * speed_scale);
+    app->needs_redraw = true;
+    return true;
+}
+
 int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
@@ -65,7 +108,11 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
     }
     
     // Load saved keystone settings if available
-    keystone_load_settings(app->keystone);
+    if (keystone_load_settings(app->keystone) == 0) {
+        printf("Loaded saved keystone settings from pickle_keystone.conf\n");
+    } else {
+        printf("No saved keystone settings found, using defaults\n");
+    }
 
     // Initialize input handler
     if (input_init(app->input) != 0) {
@@ -91,9 +138,14 @@ void app_run(app_context_t *app) {
                app->video->fps, target_frame_time * 1000);
     }
     
-    // Adaptive timing for complex videos - start with 2x slower for complex videos
-    double min_frame_time = target_frame_time;
-    double adaptive_frame_time = target_frame_time * 2.0; // Start slower for complex decoding
+    // IMPROVED: Simpler, more stable frame timing
+    double frame_budget = target_frame_time;  // How much time we have per frame
+    // 10% buffer for timing overhead
+    
+    // Adaptive frame timing variables
+    double min_frame_time = target_frame_time;  // Minimum frame time (target FPS)
+    double adaptive_frame_time = target_frame_time;  // Current adaptive frame time
+    
     int consecutive_decode_failures = 0;
     
     // Frame timing diagnostics
@@ -141,14 +193,19 @@ void app_run(app_context_t *app) {
         
         // Check for arrow key input (simply helps the corner movement by triggering input_is_key_pressed)
 
-        // Reset keystone
+        // Reset keystone to defaults
         if (input_is_key_just_pressed(app->input, KEY_R)) {
             keystone_reset_corners(app->keystone);
+            printf("Keystone reset to defaults\n");
         }
         
-        // Save keystone settings
+        // Save keystone settings (S key or P key for compatibility)
         if (app->input->save_keystone) {
-            keystone_save_settings(app->keystone);
+            if (keystone_save_settings(app->keystone) == 0) {
+                printf("Keystone settings saved to pickle_keystone.conf\n");
+            } else {
+                printf("Failed to save keystone settings\n");
+            }
             app->input->save_keystone = false; // Reset flag
         }
         
@@ -175,7 +232,7 @@ void app_run(app_context_t *app) {
         static int frame_count = 0;
         static uint8_t *last_video_data = NULL;
         
-        if (delta_time >= adaptive_frame_time) {
+        if (delta_time >= frame_budget) {
             // Update timing first to maintain consistent frame rate
             last_time = current_time;
             
@@ -215,8 +272,8 @@ void app_run(app_context_t *app) {
                     // Show diagnostic info periodically
                     if (show_diagnostics && diagnostic_frame_count % 60 == 0) {
                         double avg_decode_time = total_decode_time / diagnostic_frame_count;
-                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms, Adaptive: %.1fms\n",
-                               avg_decode_time * 1000, min_frame_time * 1000, adaptive_frame_time * 1000);
+                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms\n",
+                               avg_decode_time * 1000, target_frame_time * 1000);
                         fflush(stdout);
                     }
                     
@@ -228,10 +285,10 @@ void app_run(app_context_t *app) {
                 app->input->keys_pressed[KEY_DOWN] = false;
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
-                printf("No corner selected, clearing arrow key states\n");
+                // printf("No corner selected, clearing arrow key states\n");
             } else {
-                printf("Corner %d selected, preserving arrow key states\n", 
-                       app->keystone->selected_corner);
+                // printf("Corner %d selected, preserving arrow key states\n", 
+                //        app->keystone->selected_corner);
             }
                     static int slow_decode_count = 0;
                     if (decode_time > adaptive_frame_time * 2.0) { // More generous threshold
@@ -389,29 +446,7 @@ void app_run(app_context_t *app) {
         total_render_time += render_time;
 
         // Process keystone movement immediately after input update
-        float move_x = 0.0f, move_y = 0.0f;
-        if (input_is_key_pressed(app->input, KEY_LEFT)) move_x = -1.0f;  // LEFT = negative X
-        if (input_is_key_pressed(app->input, KEY_RIGHT)) move_x = 1.0f;  // RIGHT = positive X  
-        if (input_is_key_pressed(app->input, KEY_UP)) move_y = 1.0f;     // UP = positive Y
-        if (input_is_key_pressed(app->input, KEY_DOWN)) move_y = -1.0f;  // DOWN = negative Y
-
-        // Only attempt to move if we have a selected corner and movement input
-        if (app->keystone->selected_corner >= 0 && (move_x != 0.0f || move_y != 0.0f)) {
-            // Apply the movement
-            keystone_move_corner(app->keystone, move_x, move_y);
-        }
-        
-                // Clear input state for next frame (terminal mode needs this)
-        if (app->input->use_stdin_fallback) {
-            // Only clear arrow keys if no corner is selected
-            if (app->keystone->selected_corner < 0) {
-                // No corner selected, clear arrow key states
-                app->input->keys_pressed[KEY_UP] = false;
-                app->input->keys_pressed[KEY_DOWN] = false;
-                app->input->keys_pressed[KEY_LEFT] = false;
-                app->input->keys_pressed[KEY_RIGHT] = false;
-            }
-        }
+        process_keystone_movement(app, delta_time, target_frame_time);
 
         // Implement variable frame rate control based on performance
         double total_frame_time = decode_time + render_time;
@@ -457,7 +492,9 @@ void app_cleanup(app_context_t *app) {
     }
     if (app->keystone) {
         // Save keystone settings on exit
-        keystone_save_settings(app->keystone);
+        if (keystone_save_settings(app->keystone) == 0) {
+            printf("Keystone settings saved on exit\n");
+        }
         keystone_cleanup(app->keystone);
         free(app->keystone);
     }

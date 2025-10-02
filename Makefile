@@ -4,7 +4,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 -g
 TARGET = pickle
-SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c keystone.c input_handler.c
+SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c keystone.c input_handler.c v4l2_utils.c
 OBJECTS = $(SOURCES:.c=.o)
 
 # Library dependencies for RPi4

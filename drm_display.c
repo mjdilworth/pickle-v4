@@ -76,6 +76,27 @@ static drmModeEncoder* find_encoder(display_ctx_t *drm) {
 int drm_init(display_ctx_t *drm) {
     memset(drm, 0, sizeof(*drm));
 
+    // Check if we're running under X11 or Wayland (early detection)
+    const char *display = getenv("DISPLAY");
+    const char *wayland_display = getenv("WAYLAND_DISPLAY");
+    
+    // Only block if we're clearly under a graphical session
+    if ((display && strlen(display) > 0) || (wayland_display && strlen(wayland_display) > 0)) {
+        fprintf(stderr, "\n=== Cannot Initialize DRM ===\n");
+        fprintf(stderr, "Running under a display server (X11/Wayland).\n");
+        fprintf(stderr, "DISPLAY=%s\n", display ? display : "(not set)");
+        fprintf(stderr, "WAYLAND_DISPLAY=%s\n", wayland_display ? wayland_display : "(not set)");
+        fprintf(stderr, "DRM/KMS requires direct console access.\n\n");
+        fprintf(stderr, "Quick fix:\n");
+        fprintf(stderr, "  1. Switch to console: Ctrl+Alt+F1 (or F2-F6)\n");
+        fprintf(stderr, "  2. Login and run: sudo ./pickle <video>\n");
+        fprintf(stderr, "\nPermanent fix:\n");
+        fprintf(stderr, "  sudo systemctl set-default multi-user.target\n");
+        fprintf(stderr, "  sudo reboot\n");
+        fprintf(stderr, "================================\n\n");
+        return -1;
+    }
+
     // Open DRM device
     drm->drm_fd = find_drm_device();
     if (drm->drm_fd < 0) {
@@ -224,12 +245,30 @@ void drm_page_flip_handler(int fd, unsigned int frame, unsigned int sec,
 }
 
 int drm_set_mode(display_ctx_t *drm, uint32_t fb_id) {
+    static bool error_shown = false;
+    
     int ret = drmModeSetCrtc(drm->drm_fd, drm->crtc_id, fb_id,
                              0, 0, // x, y offset
                              &drm->connector_id, 1,
                              &drm->mode);
     if (ret != 0) {
-        fprintf(stderr, "Failed to set CRTC mode: %s\n", strerror(errno));
+        // Only show detailed error once
+        if (!error_shown) {
+            fprintf(stderr, "Failed to set CRTC mode: %s\n", strerror(errno));
+            
+            // Provide helpful diagnostics
+            if (errno == EACCES || errno == EPERM) {
+                fprintf(stderr, "\n=== DRM Permission Error ===\n");
+                fprintf(stderr, "Another process may be using the display (X11, Wayland, etc.)\n");
+                fprintf(stderr, "Solutions:\n");
+                fprintf(stderr, "  1. Stop display manager: sudo systemctl stop lightdm\n");
+                fprintf(stderr, "  2. Run with sudo: sudo ./pickle <video>\n");
+                fprintf(stderr, "  3. Add to groups: sudo usermod -a -G video,render $USER\n");
+                fprintf(stderr, "     (then logout/login)\n");
+                fprintf(stderr, "============================\n\n");
+            }
+            error_shown = true;
+        }
         return -1;
     }
     
@@ -281,7 +320,12 @@ int drm_swap_buffers(display_ctx_t *drm) {
         printf("Setting display mode...\n");
         int ret = drm_set_mode(drm, drm->next_fb_id);
         if (ret) {
-            printf("DRM: drm_set_mode failed with code %d\n", ret);
+            // Only print error once, then fail gracefully
+            static bool error_printed = false;
+            if (!error_printed) {
+                printf("DRM: drm_set_mode failed with code %d\n", ret);
+                error_printed = true;
+            }
             gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
             return ret;
         }
@@ -313,8 +357,6 @@ int drm_swap_buffers(display_ctx_t *drm) {
     
     // Don't wait for completion - let it complete asynchronously
     // The page flip handler will update the buffers when it completes
-    return 0;
-    
     return 0;
 }
 

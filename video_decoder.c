@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "video_decoder.h"
+#include "v4l2_utils.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -122,6 +123,49 @@ int video_init(video_context_t *video, const char *filename) {
         // Don't force pixel format - let the decoder choose the best format
         video->codec_ctx->thread_count = 1; // V4L2 handles threading internally
         printf("V4L2 M2M configured - will auto-detect output format\n");
+        
+        // CRITICAL FIX: Convert avcC extradata to Annex-B for V4L2 M2M compatibility
+        if (codecpar->extradata && codecpar->extradata_size > 0) {
+            printf("V4L2 stream analysis: First 8 bytes: ");
+            for (int i = 0; i < 8 && i < codecpar->extradata_size; i++) {
+                printf("%02x ", codecpar->extradata[i]);
+            }
+            printf("\n");
+            
+            // Check if this is avcC format (first byte == 1)
+            if (codecpar->extradata[0] == 1) {
+                printf("[INFO]  V4L2 stream: Detected avcC format - converting to Annex-B\n");
+                
+                uint8_t *annexb_extradata = NULL;
+                size_t annexb_size = 0;
+                
+                if (avcc_extradata_to_annexb(codecpar->extradata, codecpar->extradata_size, 
+                                           &annexb_extradata, &annexb_size) == 0) {
+                    // Replace the original extradata with Annex-B version
+                    av_freep(&video->codec_ctx->extradata);
+                    video->codec_ctx->extradata = av_malloc(annexb_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                    if (video->codec_ctx->extradata) {
+                        memcpy(video->codec_ctx->extradata, annexb_extradata, annexb_size);
+                        memset(video->codec_ctx->extradata + annexb_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+                        video->codec_ctx->extradata_size = annexb_size;
+                        printf("[INFO]  V4L2 integration: Successfully converted extradata to Annex-B (%zu bytes)\n", annexb_size);
+                        
+                        // Store length size for later use in packet conversion
+                        video->avcc_length_size = get_avcc_length_size(codecpar->extradata, codecpar->extradata_size);
+                        printf("[INFO]  V4L2 integration: NAL length size: %d bytes\n", video->avcc_length_size);
+                    } else {
+                        printf("[WARN]  V4L2 integration: Failed to allocate memory for converted extradata\n");
+                    }
+                    free(annexb_extradata);
+                } else {
+                    printf("[WARN]  V4L2 stream: Failed to convert avcC to Annex-B - may not be compatible with V4L2 decoder\n");
+                }
+            } else {
+                printf("[INFO]  V4L2 stream: Not avcC format - assuming already Annex-B compatible\n");
+            }
+        } else {
+            printf("[INFO]  V4L2 stream: No extradata found\n");
+        }
     } else {
         // Software decoding settings
         video->codec_ctx->thread_count = 4;
@@ -254,6 +298,21 @@ int video_decode_frame(video_context_t *video) {
         if (decode_call_count <= 5) {
             printf("Sending video packet to decoder...\n");
             fflush(stdout);
+        }
+        
+        // CRITICAL FIX: Convert avcC packet to Annex-B for V4L2 M2M hardware decoder
+        if (video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M && 
+            video->avcc_length_size > 0 && video->packet->data && video->packet->size > 0) {
+            
+            int new_size = convert_sample_avcc_to_annexb_inplace(video->packet->data, 
+                                                               video->packet->size, 
+                                                               video->avcc_length_size);
+            if (new_size > 0 && new_size != video->packet->size) {
+                video->packet->size = new_size;
+                if (decode_call_count <= 3) {
+                    printf("V4L2 packet converted: avcC→Annex-B (%d bytes)\n", new_size);
+                }
+            }
         }
         
         // Send packet to decoder

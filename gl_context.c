@@ -282,6 +282,14 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
+    // OPTIMIZATION: Configure VSync for smooth frame pacing
+    // Set swap interval to 1 for VSync (reduces buffer swap timing variance)
+    if (!eglSwapInterval(gl->egl_display, 1)) {
+        printf("Warning: Could not enable VSync (swap interval), may have frame timing issues\n");
+    } else {
+        printf("VSync enabled for smooth frame pacing\n");
+    }
+
     // Create shaders and program
     if (create_program(gl) != 0) {
         gl_cleanup(gl);
@@ -301,11 +309,11 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
 void gl_setup_buffers(gl_context_t *gl) {
     // Quad vertices (position + texture coordinates)  
     float vertices[] = {
-        // Position  // TexCoord (flipped V to fix upside-down video)
-        -1.0f, -1.0f, 0.0f, 0.0f,  // Bottom-left
-         1.0f, -1.0f, 1.0f, 0.0f,  // Bottom-right
-         1.0f,  1.0f, 1.0f, 1.0f,  // Top-right
-        -1.0f,  1.0f, 0.0f, 1.0f   // Top-left
+        // Position  // TexCoord (V flipped: 1.0 at top, 0.0 at bottom)
+        -1.0f, -1.0f, 0.0f, 1.0f,  // Bottom-left
+         1.0f, -1.0f, 1.0f, 1.0f,  // Bottom-right
+         1.0f,  1.0f, 1.0f, 0.0f,  // Top-right
+        -1.0f,  1.0f, 0.0f, 0.0f   // Top-left
     };
 
     GLuint indices[] = {
@@ -643,12 +651,12 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     float corner_vertices[4000]; // Large buffer for squares and text
     int vertex_count = 0;
     
-    // Show the actual control point positions (not transformed positions)
-    // Each corner should display exactly where the user has positioned it
+    // Render corner indicators at the keystone corner positions
+    // Since the video quad is transformed TO these positions, the overlays should be here too
     for (int i = 0; i < 4; i++) {
-        // Get the raw control point position (what the user has set)
+        // Get the keystone corner position (where this video corner appears on screen)
         float tx = keystone->corners[i].x;
-        float ty = keystone->corners[i].y; // Use direct Y coordinate (already in OpenGL system)
+        float ty = keystone->corners[i].y;
         
         // Create a small square centered at transformed corner position
         if (vertex_count + 4 <= 3900) { // Leave room for text

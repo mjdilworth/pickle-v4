@@ -21,6 +21,7 @@ typedef struct {
     bool running;
     bool loop_playback;
     const char *video_file;
+    bool needs_redraw;       // Flag to indicate frame needs redrawing
 } app_context_t;
 
 // Main application functions

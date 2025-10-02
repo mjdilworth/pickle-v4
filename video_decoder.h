@@ -39,6 +39,9 @@ typedef struct {
     enum AVPixelFormat hw_pix_fmt;
     AVBufferRef *hw_device_ctx;
     
+    // avcC to Annex-B conversion support
+    int avcc_length_size;       // NAL length size (1-4 bytes) for packet conversion
+    
     // Frame buffering for smooth playback
     #define MAX_BUFFERED_FRAMES 4
     AVFrame *frame_buffer[MAX_BUFFERED_FRAMES];

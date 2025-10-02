@@ -27,7 +27,7 @@ static int solve_linear_system(float A[8][9]) {
         
         // Check for numerically singular matrix
         if (max_val < 1e-6) {
-            printf("Warning: Near-singular matrix encountered in keystone calculation\n");
+            // printf("Warning: Near-singular matrix encountered in keystone calculation\n");
             return -1; // Singular matrix
         }
         
@@ -61,13 +61,13 @@ static int solve_linear_system(float A[8][9]) {
     // Verify solution quality
     for (int i = 0; i < 8; i++) {
         if (fabs(A[i][i] - 1.0f) > 1e-5 || isnan(A[i][8]) || isinf(A[i][8])) {
-            printf("Warning: Potentially unstable keystone solution\n");
+            // printf("Warning: Potentially unstable keystone solution\n");
             return -1; // Unstable solution
         }
         
         // Limit extreme values in the solution to avoid unstable projections
         if (fabs(A[i][8]) > 10.0f) {
-            printf("Warning: Clamping extreme value in keystone matrix\n");
+            // printf("Warning: Clamping extreme value in keystone matrix\n");  
             A[i][8] = (A[i][8] > 0) ? 10.0f : -10.0f;
         }
     }
@@ -77,15 +77,15 @@ static int solve_linear_system(float A[8][9]) {
 
 // Calculate perspective transformation matrix using a more stable algorithm
 static void calculate_perspective_matrix(float *matrix, const point_t corners[4]) {
-    // IMPROVED: More stable transformation calculation
-    // Source points (keystone corners - the trapezoid shape)
-    float src_x[4] = {corners[0].x, corners[1].x, corners[2].x, corners[3].x};
-    float src_y[4] = {corners[0].y, corners[1].y, corners[2].y, corners[3].y};
+    // CORRECTED: For rendering, we need to transform FROM standard quad TO keystone trapezoid
+    // Source points: standard video quad (-1 to 1)
+    float src_x[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
+    float src_y[4] = {1.0f, 1.0f, -1.0f, -1.0f};
     
-    // Destination points (full video quad: -1 to 1)
+    // Destination points: keystone corners (where the video should appear)
     // Corner order: top-left, top-right, bottom-right, bottom-left
-    float dst_x[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
-    float dst_y[4] = {1.0f, 1.0f, -1.0f, -1.0f};
+    float dst_x[4] = {corners[0].x, corners[1].x, corners[2].x, corners[3].x};
+    float dst_y[4] = {corners[0].y, corners[1].y, corners[2].y, corners[3].y};
     
     // Check for default configuration (identity transformation)
     bool is_identity = true;
@@ -102,17 +102,17 @@ static void calculate_perspective_matrix(float *matrix, const point_t corners[4]
     }
     
     // Check for degenerate configurations (to prevent erratic behavior)
-    // Calculate the area of the quadrilateral using the shoelace formula
+    // Calculate the area of the destination quadrilateral (keystone shape) using the shoelace formula
     float area = 0.0f;
     for (int i = 0; i < 4; i++) {
         int j = (i + 1) % 4;
-        area += src_x[i] * src_y[j] - src_x[j] * src_y[i];
+        area += dst_x[i] * dst_y[j] - dst_x[j] * dst_y[i];
     }
     area = 0.5f * fabs(area);
     
     // If area is too small, use identity matrix to prevent instability
     if (area < 0.01f) {
-        printf("Warning: Near-degenerate keystone configuration detected (area: %f). Using identity.\n", area);
+        // printf("Warning: Near-degenerate keystone configuration detected (area: %f). Using identity.\n", area);
         matrix_identity(matrix);
         return;
     }
@@ -189,7 +189,7 @@ int keystone_init(keystone_context_t *keystone) {
     keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f, -1.0f};  // Corner 1 (visual)
     
     keystone->selected_corner = CORNER_BOTTOM_LEFT; // Select corner 1 by default
-    keystone->move_step = 0.1f; // 10% movement per key press
+    keystone->move_step = 0.05f; // Default movement per key press (5%)
     keystone->matrix_dirty = true;
     keystone->show_corners = true;  // Show corners by default
     keystone->show_border = true;   // Show border by default
@@ -220,9 +220,12 @@ void keystone_select_corner(keystone_context_t *keystone, int corner) {
 void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
     if (keystone->selected_corner >= 0 && keystone->selected_corner < 4) {
         point_t *corner = &keystone->corners[keystone->selected_corner];
-        
-        // Use a smaller step size for more precise control
-        float move_step = 0.05f;  // 5% per keypress, reduced from 10%
+
+        // Allow callers to scale movement; fall back to a sane default
+        float move_step = keystone->move_step;
+        if (move_step <= 0.0f) {
+            move_step = 0.05f;
+        }
         
         // Store the previous position in case we need to revert
         float prev_x = corner->x;
@@ -249,7 +252,7 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
         
         // If the resulting area is too small, revert the movement
         if (area < 0.1f) {
-            printf("Invalid keystone configuration prevented (area too small)\n");
+            // printf("Invalid keystone configuration prevented (area too small)\n");
             corner->x = prev_x;
             corner->y = prev_y;
         } else {
@@ -313,9 +316,18 @@ int keystone_save_to_file(keystone_context_t *keystone, const char *filename) {
         return -1;
     }
     
+    // Save version marker for future compatibility
+    fprintf(file, "# Pickle Keystone Configuration v1.0\n");
+    
+    // Save overlay display states
+    fprintf(file, "show_corners=%d\n", keystone->show_corners ? 1 : 0);
+    fprintf(file, "show_border=%d\n", keystone->show_border ? 1 : 0);
+    fprintf(file, "show_help=%d\n", keystone->show_help ? 1 : 0);
+    
     // Save the corner positions
+    fprintf(file, "# Corner positions (x y)\n");
     for (int i = 0; i < 4; i++) {
-        fprintf(file, "%.6f %.6f\n", keystone->corners[i].x, keystone->corners[i].y);
+        fprintf(file, "corner%d=%.6f %.6f\n", i, keystone->corners[i].x, keystone->corners[i].y);
     }
     
     fclose(file);
@@ -328,17 +340,45 @@ int keystone_load_from_file(keystone_context_t *keystone, const char *filename) 
         return -1;
     }
     
-    // Load the corner positions
-    for (int i = 0; i < 4; i++) {
-        if (fscanf(file, "%f %f", &keystone->corners[i].x, &keystone->corners[i].y) != 2) {
-            fclose(file);
-            return -1;
+    char line[256];
+    int corners_loaded = 0;
+    
+    while (fgets(line, sizeof(line), file)) {
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '\n') {
+            continue;
+        }
+        
+        // Parse overlay display states
+        int value;
+        if (sscanf(line, "show_corners=%d", &value) == 1) {
+            keystone->show_corners = (value != 0);
+        } else if (sscanf(line, "show_border=%d", &value) == 1) {
+            keystone->show_border = (value != 0);
+        } else if (sscanf(line, "show_help=%d", &value) == 1) {
+            keystone->show_help = (value != 0);
+        } else {
+            // Parse corner positions
+            int corner_num;
+            float x, y;
+            if (sscanf(line, "corner%d=%f %f", &corner_num, &x, &y) == 3) {
+                if (corner_num >= 0 && corner_num < 4) {
+                    keystone->corners[corner_num].x = x;
+                    keystone->corners[corner_num].y = y;
+                    corners_loaded++;
+                }
+            }
         }
     }
     
-    keystone->matrix_dirty = true;
-    
     fclose(file);
+    
+    // Verify we loaded all corners
+    if (corners_loaded != 4) {
+        return -1;
+    }
+    
+    keystone->matrix_dirty = true;
     return 0;
 }
 

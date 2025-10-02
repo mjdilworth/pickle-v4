@@ -162,7 +162,7 @@ static int setup_terminal_input(input_context_t *input) {
     g_terminal_modified = true;
     
     printf("Using terminal input mode (press keys directly)\n");
-    printf("Controls: q=quit, h=help, c=corners, b=border, 1-4=select corner, arrows=move\n");
+    printf("Controls: 1-4=select corner, arrows=move, s=save, r=reset, c=corners, b=border, h=help, q=quit\n");
     fflush(stdout);
     return 0;
 }
@@ -241,6 +241,14 @@ void input_cleanup(input_context_t *input) {
 void input_update(input_context_t *input) {
     static bool prev_keys[256] = {false};
     
+    if (input->use_stdin_fallback) {
+        // Terminal mode has no key-up events; treat directional keys as one-shot
+        input->keys_pressed[KEY_UP] = false;
+        input->keys_pressed[KEY_DOWN] = false;
+        input->keys_pressed[KEY_LEFT] = false;
+        input->keys_pressed[KEY_RIGHT] = false;
+    }
+
     // Store previous key states for edge detection
     memcpy(prev_keys, input->keys_pressed, sizeof(prev_keys));
     
@@ -306,45 +314,50 @@ void input_update(input_context_t *input) {
                     break;
                 case '1':
                     input->keys_just_pressed[KEY_1] = true;
-                    printf("Key 1 pressed (select corner 1)\n");
+                    // printf("Key 1 pressed (select corner 1)\n");
                     break;
                 case '2':
                     input->keys_just_pressed[KEY_2] = true;
-                    printf("Key 2 pressed (select corner 2)\n");
+                    // printf("Key 2 pressed (select corner 2)\n");
                     break;
                 case '3':
                     input->keys_just_pressed[KEY_3] = true;
-                    printf("Key 3 pressed (select corner 3)\n");
+                    // printf("Key 3 pressed (select corner 3)\n");
                     break;
                 case '4':
                     input->keys_just_pressed[KEY_4] = true;
-                    printf("Key 4 pressed (select corner 4)\n");
+                    // printf("Key 4 pressed (select corner 4)\n");
+                    break;
+                case 's':
+                case 'S':
+                    input->save_keystone = true;
+                    // printf("S key pressed (save keystone)\n");
                     break;
                 case 'c':
                 case 'C':
                     input->toggle_corners = true;
-                    printf("Toggle corner highlights\n");
+                    // printf("Toggle corner highlights\n");
                     break;
                 case 'b':
                 case 'B':
                     input->toggle_border = true;
-                    printf("Toggle border highlights\n");
+                    // printf("Toggle border highlights\n");
                     break;
                 case 'h':
                 case 'H':
                     input->toggle_help = true;
-                    printf("Toggle help overlay\n");
+                    // printf("Toggle help overlay\n");
                     break;
 
                 case 'r':
                 case 'R':
                     input->keys_just_pressed[KEY_R] = true;
-                    printf("R key pressed (reset keystone)\n");
+                    // printf("R key pressed (reset keystone)\n");
                     break;
                 case 'p':
                 case 'P':
                     input->save_keystone = true;
-                    printf("P key pressed (save keystone)\n");
+                    // printf("P key pressed (save keystone)\n");
                     break;
             }
             // Read next character
@@ -361,7 +374,7 @@ void input_update(input_context_t *input) {
                     input->keys_pressed[ev.code] = (ev.value != 0);
                     
                     // Handle specific keys
-                    if (ev.value == 1) { // Key press
+                    if (ev.value == 1) // Key press
                         switch (ev.code) {
                             case KEY_Q:
                             case KEY_ESC:
@@ -369,38 +382,37 @@ void input_update(input_context_t *input) {
                                 printf("Quit requested\n");
                                 break;
                             case KEY_1:
-                                printf("Key 1 pressed (select corner 1)\n");
+                                // printf("Key 1 pressed (select corner 1)\n");
                                 break;
                             case KEY_2:
-                                printf("Key 2 pressed (select corner 2)\n");
+                                // printf("Key 2 pressed (select corner 2)\n");
                                 break;
                             case KEY_3:
-                                printf("Key 3 pressed (select corner 3)\n");
+                                // printf("Key 3 pressed (select corner 3)\n");
                                 break;
                             case KEY_4:
-                                printf("Key 4 pressed (select corner 4)\n");
+                                // printf("Key 4 pressed (select corner 4)\n");
                                 break;
                             case KEY_C:
                                 input->toggle_corners = true;
-                                printf("Toggle corner highlights\n");
+                                // printf("Toggle corner highlights\n");
                                 break;
                             case KEY_UP:
-                                printf("Up arrow pressed\n");
+                                // printf("Up arrow pressed\n");
                                 break;
                             case KEY_DOWN:
-                                printf("Down arrow pressed\n");
+                                // printf("Down arrow pressed\n");
                                 break;
                             case KEY_LEFT:
-                                printf("Left arrow pressed\n");
+                                // printf("Left arrow pressed\n");
                                 break;
                             case KEY_RIGHT:
-                                printf("Right arrow pressed\n");
+                                // printf("Right arrow pressed\n");
                                 break;
                             case KEY_R:
-                                printf("R pressed (reset keystone)\n");
+                                // printf("R pressed (reset keystone)\n");
                                 break;
                         }
-                    }
                 }
             }
         }
