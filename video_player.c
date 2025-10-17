@@ -54,6 +54,11 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     if (app->keystone->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
         return false;
     }
+    
+    // Only allow movement if border or corners are visible
+    if (!app->keystone->show_border && !app->keystone->show_corners) {
+        return false;
+    }
 
     float speed_scale = 1.0f;
     if (target_frame_time > 0.0 && delta_time > 0.0) {

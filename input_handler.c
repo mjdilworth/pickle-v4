@@ -215,6 +215,11 @@ static void restore_terminal(input_context_t *input) {
 int input_init(input_context_t *input) {
     memset(input, 0, sizeof(*input));
     
+    // Initialize gamepad polling timer
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    input->last_gamepad_poll_time = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    
     // Check if we're in SSH or other terminal-only environment
     bool prefer_terminal = (getenv("SSH_CLIENT") != NULL) || 
                           (getenv("SSH_CONNECTION") != NULL) ||
@@ -265,6 +270,21 @@ int input_init(input_context_t *input) {
     return 0;
 }
 
+// Attempt to connect to gamepad (used for periodic polling)
+static bool try_connect_gamepad(input_context_t *input) {
+    if (input->gamepad_fd >= 0) {
+        return true; // Already connected
+    }
+    
+    input->gamepad_fd = find_gamepad_device();
+    if (input->gamepad_fd >= 0) {
+        input->gamepad_enabled = true;
+        printf("Gamepad connected!\n");
+        return true;
+    }
+    return false;
+}
+
 void input_cleanup(input_context_t *input) {
     if (input->keyboard_fd >= 0) {
         close(input->keyboard_fd);
@@ -282,6 +302,18 @@ void input_cleanup(input_context_t *input) {
 
 void input_update(input_context_t *input) {
     static bool prev_keys[256] = {false};
+    
+    // Periodically poll for gamepad connection (every 3 seconds)
+    if (!input->gamepad_enabled) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        uint64_t current_time = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        
+        if (current_time - input->last_gamepad_poll_time > 3000) {
+            input->last_gamepad_poll_time = current_time;
+            try_connect_gamepad(input);
+        }
+    }
     
     if (input->use_stdin_fallback) {
         // Terminal mode has no key-up events; treat directional keys as one-shot
@@ -482,7 +514,8 @@ void input_update(input_context_t *input) {
         
         // Read all pending joystick events
         int event_count = 0;
-        while (read(input->gamepad_fd, &js, sizeof(js)) == sizeof(js)) {
+        ssize_t read_result;
+        while ((read_result = read(input->gamepad_fd, &js, sizeof(js))) == sizeof(js)) {
             event_count++;
             if (input->debug_gamepad) {
                 printf("[GAMEPAD] Event %d: type=%d number=%d value=%d\n", 
@@ -569,6 +602,18 @@ void input_update(input_context_t *input) {
                     input->gamepad_dpad_y = dpad_y;
                 }
             }
+        }
+        
+        // Check if gamepad disconnected (read returned error other than EAGAIN)
+        if (read_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            printf("Gamepad disconnected (error: %s), will retry connection...\n", strerror(errno));
+            close(input->gamepad_fd);
+            input->gamepad_fd = -1;
+            input->gamepad_enabled = false;
+            // Reset poll timer to try reconnecting soon
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            input->last_gamepad_poll_time = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
         }
         
         // Check for START+SELECT held for 2 seconds (quit combo)

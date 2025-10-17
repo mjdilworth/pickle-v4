@@ -31,6 +31,7 @@ typedef struct {
     int16_t gamepad_axis_y;             // Left stick Y axis
     int16_t gamepad_dpad_x;             // D-pad X (-1, 0, 1)
     int16_t gamepad_dpad_y;             // D-pad Y (-1, 0, 1)
+    uint64_t last_gamepad_poll_time;    // Time of last gamepad detection attempt (ms)
     
     // Gamepad action flags
     bool gamepad_cycle_corner;          // X button: cycle through corners
