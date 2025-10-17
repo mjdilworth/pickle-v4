@@ -7,9 +7,17 @@
 #include <errno.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <dirent.h>
 #include <termios.h>
 #include <linux/kd.h>       // For console mode constants
+
+// Bit manipulation macros for input device capabilities
+#define NBITS(x) ((((x)-1)/8)+1)
+#define OFF(x)  ((x)%8)
+#define BIT(x)  (1UL<<OFF(x))
+#define LONG(x) ((x)/8)
+#define test_bit(bit, array) ((array[LONG(bit)] >> OFF(bit)) & 1)
 
 // Global terminal state for emergency restoration
 static struct termios g_orig_termios;
@@ -127,6 +135,24 @@ static int find_keyboard_device(void) {
     return fd;
 }
 
+static int find_gamepad_device(void) {
+    // Try to open joystick device (simpler API than evdev)
+    const char *device = "/dev/input/js0";
+    int fd = open(device, O_RDONLY | O_NONBLOCK);
+    
+    if (fd < 0) {
+        // No joystick found
+        return -1;
+    }
+    
+    // Get joystick name
+    char name[256] = "Unknown";
+    ioctl(fd, JSIOCGNAME(sizeof(name)), name);
+    
+    printf("Found gamepad device: %s (%s)\n", device, name);
+    return fd;
+}
+
 static int setup_terminal_input(input_context_t *input) {
     input->stdin_fd = STDIN_FILENO;
     
@@ -223,6 +249,18 @@ int input_init(input_context_t *input) {
     }
     
     input->should_quit = false;
+    
+    // Try to initialize gamepad (optional, doesn't fail if not found)
+    input->gamepad_fd = find_gamepad_device();
+    if (input->gamepad_fd >= 0) {
+        input->gamepad_enabled = true;
+        printf("Gamepad input enabled\n");
+    } else {
+        input->gamepad_enabled = false;
+        input->gamepad_fd = -1;
+        printf("No gamepad detected (keyboard/terminal input only)\n");
+    }
+    
     // Input handler initialization complete
     return 0;
 }
@@ -230,6 +268,10 @@ int input_init(input_context_t *input) {
 void input_cleanup(input_context_t *input) {
     if (input->keyboard_fd >= 0) {
         close(input->keyboard_fd);
+    }
+    
+    if (input->gamepad_fd >= 0) {
+        close(input->gamepad_fd);
     }
     
     // Restore terminal if we were using stdin fallback
@@ -418,6 +460,138 @@ void input_update(input_context_t *input) {
         }
     }
     
+    // Process gamepad input (joystick API - can run alongside keyboard)
+    if (input->gamepad_enabled && input->gamepad_fd >= 0) {
+        struct js_event js;
+        
+        if (input->debug_gamepad) {
+            static int debug_counter = 0;
+            if ((debug_counter++ % 300) == 0) {  // Every ~10 seconds at 30fps
+                printf("[GAMEPAD] Gamepad processing active (fd=%d, enabled=%d)\n", 
+                       input->gamepad_fd, input->gamepad_enabled);
+            }
+        }
+        
+        // Clear one-shot gamepad button presses
+        memset(input->gamepad_buttons_just_pressed, false, sizeof(input->gamepad_buttons_just_pressed));
+        input->gamepad_cycle_corner = false;
+        input->gamepad_decrease_step = false;
+        input->gamepad_increase_step = false;
+        input->gamepad_reset_keystone = false;
+        input->gamepad_toggle_mode = false;
+        
+        // Read all pending joystick events
+        int event_count = 0;
+        while (read(input->gamepad_fd, &js, sizeof(js)) == sizeof(js)) {
+            event_count++;
+            if (input->debug_gamepad) {
+                printf("[GAMEPAD] Event %d: type=%d number=%d value=%d\n", 
+                       event_count, js.type, js.number, js.value);
+            }
+            
+            // Skip initial state events sent when joystick is first opened
+            if (js.type & JS_EVENT_INIT) {
+                if (input->debug_gamepad) {
+                    printf("[GAMEPAD] Skipping INIT event\n");
+                }
+                continue;
+            }
+            
+            if (js.type == JS_EVENT_BUTTON) {
+                // Button event
+                if (js.number < 32) {
+                    bool was_pressed = input->gamepad_buttons[js.number];
+                    input->gamepad_buttons[js.number] = (js.value != 0);
+                    
+                    // Detect button press (rising edge)
+                    if (!was_pressed && input->gamepad_buttons[js.number]) {
+                        input->gamepad_buttons_just_pressed[js.number] = true;
+                        
+                        // Debug logging
+                        if (input->debug_gamepad) {
+                            const char *btn_names[] = {
+                                "A", "B", "X", "Y", "L1", "R1", "SELECT", "START", "HOME"
+                            };
+                            const char *btn_name = (js.number < 9) ? btn_names[js.number] : "UNKNOWN";
+                            printf("[GAMEPAD] Button pressed: %s (button %d)\n", btn_name, js.number);
+                        }
+                        
+                        // Map specific buttons to actions
+                        // 8BitDo Zero 2 button layout: B=0, A=1, Y=2, X=3
+                        if (js.number == JS_BUTTON_X) {  // Button 3 = TOP button (X)
+                            input->gamepad_cycle_corner = true;
+                        } else if (js.number == JS_BUTTON_B) {  // Button 0 = BOTTOM button (B)
+                            input->toggle_border = true;
+                        } else if (js.number == JS_BUTTON_A) {  // Button 1 = RIGHT button (A)
+                            input->toggle_corners = true;
+                        } else if (js.number == JS_BUTTON_Y) {  // Button 2 = LEFT button (Y)
+                            input->toggle_help = true;
+                        } else if (js.number == JS_BUTTON_L1) {
+                            input->gamepad_decrease_step = true;
+                        } else if (js.number == JS_BUTTON_R1) {
+                            input->gamepad_increase_step = true;
+                        } else if (js.number == JS_BUTTON_SELECT) {
+                            input->gamepad_reset_keystone = true;
+                        } else if (js.number == JS_BUTTON_START) {
+                            input->save_keystone = true;
+                        } else if (js.number == JS_BUTTON_HOME) {
+                            input->gamepad_toggle_mode = true;
+                        }
+                    }
+                }
+            } else if (js.type == JS_EVENT_AXIS) {
+                // Axis event
+                if (js.number == JS_AXIS_LEFT_X) {
+                    int16_t old_value = input->gamepad_axis_x;
+                    input->gamepad_axis_x = js.value;
+                    if (input->debug_gamepad && abs(old_value - js.value) > 1000) {
+                        printf("[GAMEPAD] Left stick X: %d\n", js.value);
+                    }
+                } else if (js.number == JS_AXIS_LEFT_Y) {
+                    int16_t old_value = input->gamepad_axis_y;
+                    input->gamepad_axis_y = js.value;
+                    if (input->debug_gamepad && abs(old_value - js.value) > 1000) {
+                        printf("[GAMEPAD] Left stick Y: %d\n", js.value);
+                    }
+                } else if (js.number == JS_AXIS_DPAD_X) {
+                    // D-pad X: convert from -32767/0/32767 to -1/0/1
+                    int8_t dpad_x = (js.value < -16000) ? -1 : (js.value > 16000) ? 1 : 0;
+                    if (input->debug_gamepad && dpad_x != input->gamepad_dpad_x) {
+                        printf("[GAMEPAD] D-pad X: %d\n", dpad_x);
+                    }
+                    input->gamepad_dpad_x = dpad_x;
+                } else if (js.number == JS_AXIS_DPAD_Y) {
+                    // D-pad Y: convert from -32767/0/32767 to -1/0/1
+                    int8_t dpad_y = (js.value < -16000) ? -1 : (js.value > 16000) ? 1 : 0;
+                    if (input->debug_gamepad && dpad_y != input->gamepad_dpad_y) {
+                        printf("[GAMEPAD] D-pad Y: %d\n", dpad_y);
+                    }
+                    input->gamepad_dpad_y = dpad_y;
+                }
+            }
+        }
+        
+        // Check for START+SELECT held for 2 seconds (quit combo)
+        if (input->gamepad_buttons[JS_BUTTON_START] && input->gamepad_buttons[JS_BUTTON_SELECT]) {
+            if (input->gamepad_start_select_time == 0) {
+                // Start timing
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                input->gamepad_start_select_time = tv.tv_sec * 1000ULL + tv.tv_usec / 1000;
+            } else {
+                // Check if held for 2 seconds
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                uint64_t now = tv.tv_sec * 1000ULL + tv.tv_usec / 1000;
+                if (now - input->gamepad_start_select_time >= 2000) {
+                    input->should_quit = true;
+                    printf("Quit requested (START+SELECT held)\n");
+                }
+            }
+        } else {
+            input->gamepad_start_select_time = 0;
+        }
+    }
 
 }
 

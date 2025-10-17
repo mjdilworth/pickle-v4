@@ -86,18 +86,21 @@ const char *fragment_shader_source =
 const char *corner_vertex_shader_source = 
     "#version 310 es\n"
     "layout(location = 0) in vec2 a_position;\n"
+    "layout(location = 1) in vec4 a_color;\n"
     "uniform mat4 u_mvp_matrix;\n"
+    "out vec4 v_color;\n"
     "void main() {\n"
     "    gl_Position = u_mvp_matrix * vec4(a_position, 0.0, 1.0);\n"
+    "    v_color = a_color;\n"
     "}\n";
 
 const char *corner_fragment_shader_source = 
     "#version 310 es\n"
     "precision mediump float;\n"
-    "uniform vec4 u_color;\n"
+    "in vec4 v_color;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
-    "    fragColor = u_color;\n"
+    "    fragColor = v_color;\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *source) {
@@ -309,11 +312,11 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
 void gl_setup_buffers(gl_context_t *gl) {
     // Quad vertices (position + texture coordinates)  
     float vertices[] = {
-        // Position  // TexCoord (V flipped: 1.0 at top, 0.0 at bottom)
-        -1.0f, -1.0f, 0.0f, 1.0f,  // Bottom-left
-         1.0f, -1.0f, 1.0f, 1.0f,  // Bottom-right
-         1.0f,  1.0f, 1.0f, 0.0f,  // Top-right
-        -1.0f,  1.0f, 0.0f, 0.0f   // Top-left
+        // Position  // TexCoord (standard orientation)
+        -1.0f, -1.0f, 0.0f, 0.0f,  // Bottom-left
+         1.0f, -1.0f, 1.0f, 0.0f,  // Bottom-right
+         1.0f,  1.0f, 1.0f, 1.0f,  // Top-right
+        -1.0f,  1.0f, 0.0f, 1.0f   // Top-left
     };
 
     GLuint indices[] = {
@@ -647,65 +650,92 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     // Create corner positions (small squares)
     float corner_size = 0.015f; // 1.5% of screen size (smaller)
     
-    // Corner vertices for 4 small squares plus text
-    float corner_vertices[4000]; // Large buffer for squares and text
+    // Corner vertices with colors: [x, y, r, g, b, a] per vertex
+    float corner_vertices[10000]; // Large buffer for position+color data and text
     int vertex_count = 0;
     
-    // Render corner indicators at the keystone corner positions
-    // Since the video quad is transformed TO these positions, the overlays should be here too
+    // Determine colors for each corner
+    float corner_colors[4][4];
     for (int i = 0; i < 4; i++) {
-        // Get the keystone corner position (where this video corner appears on screen)
+        if (keystone->selected_corner == i) {
+            // Green for selected
+            corner_colors[i][0] = 0.0f;
+            corner_colors[i][1] = 1.0f;
+            corner_colors[i][2] = 0.0f;
+            corner_colors[i][3] = 1.0f;
+        } else {
+            // White for unselected
+            corner_colors[i][0] = 1.0f;
+            corner_colors[i][1] = 1.0f;
+            corner_colors[i][2] = 1.0f;
+            corner_colors[i][3] = 1.0f;
+        }
+    }
+    
+    // Render corner indicators at the keystone corner positions
+    for (int i = 0; i < 4; i++) {
+        // Get the keystone corner position
         float tx = keystone->corners[i].x;
         float ty = keystone->corners[i].y;
+        float *color = corner_colors[i];
         
-        // Create a small square centered at transformed corner position
-        if (vertex_count + 4 <= 3900) { // Leave room for text
-            corner_vertices[vertex_count*2 + 0] = tx - corner_size; // Bottom-left
-            corner_vertices[vertex_count*2 + 1] = ty - corner_size;
+        // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
+        if (vertex_count + 4 <= 1600) { // Leave room for text
+            // Bottom-left
+            corner_vertices[vertex_count*6 + 0] = tx - corner_size;
+            corner_vertices[vertex_count*6 + 1] = ty - corner_size;
+            corner_vertices[vertex_count*6 + 2] = color[0];
+            corner_vertices[vertex_count*6 + 3] = color[1];
+            corner_vertices[vertex_count*6 + 4] = color[2];
+            corner_vertices[vertex_count*6 + 5] = color[3];
             vertex_count++;
-            corner_vertices[vertex_count*2 + 0] = tx + corner_size; // Bottom-right
-            corner_vertices[vertex_count*2 + 1] = ty - corner_size;
+            
+            // Bottom-right
+            corner_vertices[vertex_count*6 + 0] = tx + corner_size;
+            corner_vertices[vertex_count*6 + 1] = ty - corner_size;
+            corner_vertices[vertex_count*6 + 2] = color[0];
+            corner_vertices[vertex_count*6 + 3] = color[1];
+            corner_vertices[vertex_count*6 + 4] = color[2];
+            corner_vertices[vertex_count*6 + 5] = color[3];
             vertex_count++;
-            corner_vertices[vertex_count*2 + 0] = tx + corner_size; // Top-right
-            corner_vertices[vertex_count*2 + 1] = ty + corner_size;
+            
+            // Top-right
+            corner_vertices[vertex_count*6 + 0] = tx + corner_size;
+            corner_vertices[vertex_count*6 + 1] = ty + corner_size;
+            corner_vertices[vertex_count*6 + 2] = color[0];
+            corner_vertices[vertex_count*6 + 3] = color[1];
+            corner_vertices[vertex_count*6 + 4] = color[2];
+            corner_vertices[vertex_count*6 + 5] = color[3];
             vertex_count++;
-            corner_vertices[vertex_count*2 + 0] = tx - corner_size; // Top-left
-            corner_vertices[vertex_count*2 + 1] = ty + corner_size;
+            
+            // Top-left
+            corner_vertices[vertex_count*6 + 0] = tx - corner_size;
+            corner_vertices[vertex_count*6 + 1] = ty + corner_size;
+            corner_vertices[vertex_count*6 + 2] = color[0];
+            corner_vertices[vertex_count*6 + 3] = color[1];
+            corner_vertices[vertex_count*6 + 4] = color[2];
+            corner_vertices[vertex_count*6 + 5] = color[3];
             vertex_count++;
         }
         
-        // Add corner number text - fix swapped positions
-        char corner_number[2];
-        // User reports: 1 is where 4 should be, 4 is where 1 should be, 
-        // 2 is where 3 should be, 3 is where 2 should be
-        // So we need to swap the mappings completely:
-        int display_number;
-        if (i == 0) display_number = 4;      // CORNER_TOP_LEFT → show "4" (was showing "1")
-        else if (i == 1) display_number = 3; // CORNER_TOP_RIGHT → show "3" (was showing "2")
-        else if (i == 2) display_number = 2; // CORNER_BOTTOM_RIGHT → show "2" (was showing "3")  
-        else display_number = 1;             // CORNER_BOTTOM_LEFT → show "1" (was showing "4")
-        
-        corner_number[0] = '0' + display_number;
-        corner_number[1] = '\0';
-        
-        // Position text slightly offset from corner center
-        float text_x = tx + corner_size * 1.5f;
-        float text_y = ty + corner_size * 0.5f;
-        float text_size = 0.02f; // Small text size
-        
-        draw_text_simple(corner_vertices, &vertex_count, corner_number, text_x, text_y, text_size);
+        // Skip text for now - we'll add it back later
     }
     
-    // Update corner VBO with new positions
+    // Update corner VBO with new positions and colors
     glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 2 * sizeof(float), corner_vertices, GL_DYNAMIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), corner_vertices, GL_DYNAMIC_DRAW);
     
     // Use corner shader program
     glUseProgram(gl->corner_program);
     
-    // Set up vertex attributes
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    // Set up vertex attributes - interleaved position (2) + color (4)
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Enable color attribute (location 1)
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
     
     // Set identity matrix for MVP (corners in normalized coordinates)
     float identity[16] = {
@@ -716,37 +746,24 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Render each corner square with different colors
+    // Render all 4 corner squares - colors are now in vertex data
+    static int debug_frame = 0;
+    static int last_selected = -999;
+    bool do_debug = (debug_frame++ % 300 == 0);
+    
+    // Debug when selection changes
+    if (keystone->selected_corner != last_selected) {
+        printf("[RENDER] Selected corner changed: %d -> %d\n", last_selected, keystone->selected_corner);
+        last_selected = keystone->selected_corner;
+    }
+    
+    // Draw all corner squares in one call - each corner is 4 vertices
     for (int i = 0; i < 4; i++) {
-        // Set color based on corner (and selection state)
-        float color[4];
-        if (keystone->selected_corner == i) {
-            // Highlight selected corner in bright green (solid)
-            color[0] = 0.0f; color[1] = 1.0f; color[2] = 0.0f; color[3] = 1.0f;
-        } else {
-            // Regular corners in bright red (solid for testing)
-            color[0] = 1.0f; color[1] = 0.0f; color[2] = 0.0f; color[3] = 1.0f;
-        }
-        glUniform4fv(gl->corner_u_color, 1, color);
-        
-        // Draw corner as triangle fan (4 vertices forming a square)
         glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
     }
     
-    // Render corner number text in white
-    if (vertex_count > 16) { // If we have text vertices
-        float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // White text
-        glUniform4fv(gl->corner_u_color, 1, text_color);
-        
-        // Draw all text pixels (each character pixel is a 4-vertex rectangle)
-        int text_start = 16; // Skip the 16 corner square vertices
-        int text_pixels = (vertex_count - 16) / 4; // Number of character pixels
-        for (int i = 0; i < text_pixels; i++) {
-            glDrawArrays(GL_TRIANGLE_FAN, text_start + i * 4, 4);
-        }
-    }
-    
     glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1); // Disable color attribute
     
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
@@ -768,8 +785,12 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
     
-    // Create border line vertices (4 lines connecting the corners)
-    float border_vertices[16]; // 4 lines * 2 vertices * 2 coords = 16 floats
+    // Create border line vertices with color (4 lines connecting the corners)
+    // Each vertex: x, y, r, g, b, a (6 floats per vertex)
+    float border_vertices[48]; // 8 vertices * 6 floats = 48 floats
+    
+    // Yellow color for all border vertices
+    float r = 1.0f, g = 1.0f, b = 0.0f, a = 1.0f;
     
     // Show the control point positions (where user has positioned corners)
     point_t *corners = keystone->corners;
@@ -777,26 +798,34 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Line 1: Top-left to top-right (use direct Y coordinates)
     border_vertices[0] = corners[CORNER_TOP_LEFT].x;
     border_vertices[1] = corners[CORNER_TOP_LEFT].y;
-    border_vertices[2] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[3] = corners[CORNER_TOP_RIGHT].y;
+    border_vertices[2] = r; border_vertices[3] = g; border_vertices[4] = b; border_vertices[5] = a;
+    border_vertices[6] = corners[CORNER_TOP_RIGHT].x;
+    border_vertices[7] = corners[CORNER_TOP_RIGHT].y;
+    border_vertices[8] = r; border_vertices[9] = g; border_vertices[10] = b; border_vertices[11] = a;
     
     // Line 2: Top-right to bottom-right
-    border_vertices[4] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[5] = corners[CORNER_TOP_RIGHT].y;
-    border_vertices[6] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[7] = corners[CORNER_BOTTOM_RIGHT].y;
+    border_vertices[12] = corners[CORNER_TOP_RIGHT].x;
+    border_vertices[13] = corners[CORNER_TOP_RIGHT].y;
+    border_vertices[14] = r; border_vertices[15] = g; border_vertices[16] = b; border_vertices[17] = a;
+    border_vertices[18] = corners[CORNER_BOTTOM_RIGHT].x;
+    border_vertices[19] = corners[CORNER_BOTTOM_RIGHT].y;
+    border_vertices[20] = r; border_vertices[21] = g; border_vertices[22] = b; border_vertices[23] = a;
     
     // Line 3: Bottom-right to bottom-left
-    border_vertices[8] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[9] = corners[CORNER_BOTTOM_RIGHT].y;
-    border_vertices[10] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[11] = corners[CORNER_BOTTOM_LEFT].y;
+    border_vertices[24] = corners[CORNER_BOTTOM_RIGHT].x;
+    border_vertices[25] = corners[CORNER_BOTTOM_RIGHT].y;
+    border_vertices[26] = r; border_vertices[27] = g; border_vertices[28] = b; border_vertices[29] = a;
+    border_vertices[30] = corners[CORNER_BOTTOM_LEFT].x;
+    border_vertices[31] = corners[CORNER_BOTTOM_LEFT].y;
+    border_vertices[32] = r; border_vertices[33] = g; border_vertices[34] = b; border_vertices[35] = a;
     
     // Line 4: Bottom-left to top-left
-    border_vertices[12] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[13] = corners[CORNER_BOTTOM_LEFT].y;
-    border_vertices[14] = corners[CORNER_TOP_LEFT].x;
-    border_vertices[15] = corners[CORNER_TOP_LEFT].y;
+    border_vertices[36] = corners[CORNER_BOTTOM_LEFT].x;
+    border_vertices[37] = corners[CORNER_BOTTOM_LEFT].y;
+    border_vertices[38] = r; border_vertices[39] = g; border_vertices[40] = b; border_vertices[41] = a;
+    border_vertices[42] = corners[CORNER_TOP_LEFT].x;
+    border_vertices[43] = corners[CORNER_TOP_LEFT].y;
+    border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
     
     // Update border VBO with new positions
     glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
@@ -805,9 +834,14 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Use corner shader program (same as corners, just different geometry)
     glUseProgram(gl->corner_program);
     
-    // Set up vertex attributes
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float); // x, y, r, g, b, a
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
     
     // Set identity matrix for MVP (border in normalized coordinates)
     float identity[16] = {
@@ -818,20 +852,17 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Set border color (bright yellow for better visibility)
-    float border_color[4] = {1.0f, 1.0f, 0.0f, 1.0f}; // Bright yellow
-    glUniform4fv(gl->corner_u_color, 1, border_color);
-    
     // Set line width for better visibility
     glLineWidth(3.0f);
     
-    // Draw border as 4 separate lines
+    // Draw border as 4 separate lines (8 vertices with colors from vertex data)
     glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
     
     // Reset line width
     glLineWidth(1.0f);
     
     glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
     
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
@@ -840,81 +871,120 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // NOTE: Don't unbind buffers here - video_player.c handles complete state restoration
 }
 
-// Simple 5x7 bitmap font data
-static const unsigned char font_5x7[][7] = {
+// Complete 5x7 bitmap font data - each byte represents one row, 5 bits used
+static const unsigned char font_5x7[128][7] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-    ['A'] = {0x20, 0x50, 0x88, 0xF8, 0x88, 0x88, 0x00},
+    ['!'] = {0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00},
+    ['/'] = {0x08, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00},
+    [':'] = {0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00},
+    ['-'] = {0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00},
+    ['('] = {0x10, 0x20, 0x20, 0x20, 0x20, 0x10, 0x00},
+    [')'] = {0x20, 0x10, 0x10, 0x10, 0x10, 0x20, 0x00},
+    ['0'] = {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x70, 0x00},
+    ['1'] = {0x20, 0x60, 0x20, 0x20, 0x20, 0x70, 0x00},
+    ['2'] = {0x70, 0x88, 0x08, 0x30, 0x40, 0xF8, 0x00},
+    ['3'] = {0x70, 0x88, 0x30, 0x08, 0x88, 0x70, 0x00},
+    ['4'] = {0x10, 0x30, 0x50, 0x90, 0xF8, 0x10, 0x00},
+    ['5'] = {0xF8, 0x80, 0xF0, 0x08, 0x88, 0x70, 0x00},
+    ['6'] = {0x30, 0x40, 0x80, 0xF0, 0x88, 0x70, 0x00},
+    ['7'] = {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00},
+    ['8'] = {0x70, 0x88, 0x70, 0x88, 0x88, 0x70, 0x00},
+    ['9'] = {0x70, 0x88, 0x78, 0x08, 0x10, 0x60, 0x00},
+    ['A'] = {0x20, 0x50, 0x88, 0x88, 0xF8, 0x88, 0x00},
     ['B'] = {0xF0, 0x88, 0xF0, 0x88, 0x88, 0xF0, 0x00},
     ['C'] = {0x70, 0x88, 0x80, 0x80, 0x88, 0x70, 0x00},
     ['D'] = {0xF0, 0x88, 0x88, 0x88, 0x88, 0xF0, 0x00},
     ['E'] = {0xF8, 0x80, 0xF0, 0x80, 0x80, 0xF8, 0x00},
     ['F'] = {0xF8, 0x80, 0xF0, 0x80, 0x80, 0x80, 0x00},
-    ['G'] = {0x70, 0x88, 0x80, 0x98, 0x88, 0x70, 0x00},
+    ['G'] = {0x70, 0x88, 0x80, 0xB8, 0x88, 0x78, 0x00},
     ['H'] = {0x88, 0x88, 0xF8, 0x88, 0x88, 0x88, 0x00},
     ['I'] = {0x70, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00},
     ['J'] = {0x38, 0x10, 0x10, 0x10, 0x90, 0x60, 0x00},
-    ['K'] = {0x88, 0x90, 0xA0, 0xC0, 0xA0, 0x98, 0x00},
+    ['K'] = {0x88, 0x90, 0xA0, 0xC0, 0xA0, 0x90, 0x00},
     ['L'] = {0x80, 0x80, 0x80, 0x80, 0x80, 0xF8, 0x00},
-    ['M'] = {0x88, 0xD8, 0xA8, 0x88, 0x88, 0x88, 0x00},
+    ['M'] = {0x88, 0xD8, 0xA8, 0xA8, 0x88, 0x88, 0x00},
     ['N'] = {0x88, 0xC8, 0xA8, 0x98, 0x88, 0x88, 0x00},
     ['O'] = {0x70, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00},
     ['P'] = {0xF0, 0x88, 0x88, 0xF0, 0x80, 0x80, 0x00},
     ['Q'] = {0x70, 0x88, 0x88, 0xA8, 0x90, 0x68, 0x00},
-    ['R'] = {0xF0, 0x88, 0x88, 0xF0, 0xA0, 0x98, 0x00},
-    ['S'] = {0x70, 0x88, 0x60, 0x18, 0x88, 0x70, 0x00},
+    ['R'] = {0xF0, 0x88, 0x88, 0xF0, 0xA0, 0x90, 0x00},
+    ['S'] = {0x70, 0x88, 0x60, 0x10, 0x88, 0x70, 0x00},
     ['T'] = {0xF8, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00},
     ['U'] = {0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00},
     ['V'] = {0x88, 0x88, 0x88, 0x50, 0x50, 0x20, 0x00},
-    ['W'] = {0x88, 0x88, 0x88, 0xA8, 0xD8, 0x88, 0x00},
+    ['W'] = {0x88, 0x88, 0xA8, 0xA8, 0xD8, 0x88, 0x00},
     ['X'] = {0x88, 0x50, 0x20, 0x20, 0x50, 0x88, 0x00},
     ['Y'] = {0x88, 0x88, 0x50, 0x20, 0x20, 0x20, 0x00},
     ['Z'] = {0xF8, 0x08, 0x10, 0x20, 0x40, 0xF8, 0x00},
-    ['0'] = {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x70, 0x00},
-    ['1'] = {0x20, 0x60, 0x20, 0x20, 0x20, 0x70, 0x00},
-    ['2'] = {0x70, 0x88, 0x08, 0x70, 0x80, 0xF8, 0x00},
-    ['3'] = {0x70, 0x88, 0x30, 0x08, 0x88, 0x70, 0x00},
-    ['4'] = {0x90, 0x90, 0x90, 0xF8, 0x10, 0x10, 0x00},
-    ['5'] = {0xF8, 0x80, 0xF0, 0x08, 0x88, 0x70, 0x00},
-    ['6'] = {0x70, 0x80, 0xF0, 0x88, 0x88, 0x70, 0x00},
-    ['7'] = {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00},
-    ['8'] = {0x70, 0x88, 0x70, 0x88, 0x88, 0x70, 0x00},
-    ['9'] = {0x70, 0x88, 0x78, 0x08, 0x08, 0x70, 0x00},
-    [':'] = {0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00},
-    ['='] = {0x00, 0x00, 0xF8, 0x00, 0xF8, 0x00, 0x00},
-    ['-'] = {0x00, 0x00, 0x00, 0xF8, 0x00, 0x00, 0x00},
-    ['h'] = {0x80, 0x80, 0xF0, 0x88, 0x88, 0x88, 0x00},
-    ['e'] = {0x00, 0x70, 0x88, 0xF8, 0x80, 0x70, 0x00},
-    ['l'] = {0x60, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00},
+    ['a'] = {0x00, 0x00, 0x70, 0x08, 0x78, 0x88, 0x78},
+    ['b'] = {0x80, 0x80, 0xF0, 0x88, 0x88, 0x88, 0xF0},
+    ['c'] = {0x00, 0x00, 0x70, 0x88, 0x80, 0x88, 0x70},
+    ['d'] = {0x08, 0x08, 0x78, 0x88, 0x88, 0x88, 0x78},
+    ['e'] = {0x00, 0x00, 0x70, 0x88, 0xF8, 0x80, 0x70},
+    ['f'] = {0x30, 0x48, 0x40, 0xF0, 0x40, 0x40, 0x40},
+    ['g'] = {0x00, 0x78, 0x88, 0x88, 0x78, 0x08, 0x70},
+    ['h'] = {0x80, 0x80, 0xF0, 0x88, 0x88, 0x88, 0x88},
+    ['i'] = {0x20, 0x00, 0x60, 0x20, 0x20, 0x20, 0x70},
+    ['j'] = {0x10, 0x00, 0x30, 0x10, 0x10, 0x90, 0x60},
+    ['k'] = {0x80, 0x80, 0x90, 0xA0, 0xC0, 0xA0, 0x90},
+    ['l'] = {0x60, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70},
+    ['m'] = {0x00, 0x00, 0xD0, 0xA8, 0xA8, 0xA8, 0xA8},
+    ['n'] = {0x00, 0x00, 0xF0, 0x88, 0x88, 0x88, 0x88},
+    ['o'] = {0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x70},
     ['p'] = {0x00, 0xF0, 0x88, 0x88, 0xF0, 0x80, 0x80},
+    ['q'] = {0x00, 0x78, 0x88, 0x88, 0x78, 0x08, 0x08},
+    ['r'] = {0x00, 0x00, 0xB0, 0xC8, 0x80, 0x80, 0x80},
+    ['s'] = {0x00, 0x00, 0x78, 0x80, 0x70, 0x08, 0xF0},
+    ['t'] = {0x40, 0x40, 0xF0, 0x40, 0x40, 0x48, 0x30},
+    ['u'] = {0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0x78},
+    ['v'] = {0x00, 0x00, 0x88, 0x88, 0x88, 0x50, 0x20},
+    ['w'] = {0x00, 0x00, 0x88, 0xA8, 0xA8, 0xA8, 0x50},
+    ['x'] = {0x00, 0x00, 0x88, 0x50, 0x20, 0x50, 0x88},
+    ['y'] = {0x00, 0x88, 0x88, 0x88, 0x78, 0x08, 0x70},
+    ['z'] = {0x00, 0x00, 0xF8, 0x10, 0x20, 0x40, 0xF8},
 };
 
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size) {
-    if (*vertex_count >= 1800) return; // Safety limit
+    if (*vertex_count >= 4900) return; // Safety limit
     
-    // Check bounds - handle both signed and unsigned char
-    if ((unsigned char)c > 127) return;
+    // Check bounds and handle unknown characters
+    unsigned char uc = (unsigned char)c;
+    if (uc > 127) return;
     
-    const unsigned char *char_data = font_5x7[(int)c];
-    if (!char_data) return;
+    const unsigned char *char_data = font_5x7[uc];
     
-    float pixel_size = size / 8.0f;
+    // Check if character has any data (handle sparse array)
+    bool has_data = false;
+    for (int i = 0; i < 7; i++) {
+        if (char_data[i] != 0) {
+            has_data = true;
+            break;
+        }
+    }
+    if (!has_data && c != ' ') return; // Skip undefined chars except space
+    
+    float pixel_size = size / 7.0f;  // 5x7 font, divide by 7 for height
     
     for (int row = 0; row < 7; row++) {
         unsigned char row_data = char_data[row];
-        for (int col = 0; col < 5; col++) {
-            if ((row_data >> (7-col)) & 1) { // Check if pixel is set
-                if (*vertex_count + 4 <= 1800) {
+        for (int col = 0; col < 8; col++) {  // Check all 8 bits
+            if ((row_data >> (7-col)) & 1) { // Check if pixel is set (MSB first)
+                if (*vertex_count + 4 <= 4900) {
                     float px = x + col * pixel_size;
-                    float py = y + (6-row) * pixel_size; // Flip Y
+                    float py = y - (row * pixel_size); // Top to bottom
                     
                     // Add rectangle for this pixel
-                    vertices[(*vertex_count)*2] = px; vertices[(*vertex_count)*2+1] = py;
+                    vertices[(*vertex_count)*2] = px; 
+                    vertices[(*vertex_count)*2+1] = py;
                     (*vertex_count)++;
-                    vertices[(*vertex_count)*2] = px + pixel_size; vertices[(*vertex_count)*2+1] = py;
+                    vertices[(*vertex_count)*2] = px + pixel_size; 
+                    vertices[(*vertex_count)*2+1] = py;
                     (*vertex_count)++;
-                    vertices[(*vertex_count)*2] = px + pixel_size; vertices[(*vertex_count)*2+1] = py + pixel_size;
+                    vertices[(*vertex_count)*2] = px + pixel_size; 
+                    vertices[(*vertex_count)*2+1] = py - pixel_size;
                     (*vertex_count)++;
-                    vertices[(*vertex_count)*2] = px; vertices[(*vertex_count)*2+1] = py + pixel_size;
+                    vertices[(*vertex_count)*2] = px; 
+                    vertices[(*vertex_count)*2+1] = py - pixel_size;
                     (*vertex_count)++;
                 }
             }
@@ -923,12 +993,12 @@ static void draw_char_simple(float *vertices, int *vertex_count, char c, float x
 }
 
 static void draw_text_simple(float *vertices, int *vertex_count, const char *text, float x, float y, float size) {
-    float char_width = size * 0.7f;
-    float line_height = size * 1.2f;
+    float char_width = size * 1.2f;    // Character width including spacing
+    float line_height = size * 1.3f;   // Tighter line spacing to fit more text
     float current_x = x;
     float current_y = y;
     
-    while (*text && *vertex_count < 1700) {
+    while (*text && *vertex_count < 4900) {
         if (*text == '\n') {
             current_x = x;
             current_y -= line_height;
@@ -946,31 +1016,30 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     }
     
     // Create help overlay with text
-    float help_vertices[4000]; // Buffer for text vertices
+    float help_vertices[10000]; // Large buffer for text vertices
     int vertex_count = 0;
     
-    // Background rectangle
-    help_vertices[0] = -0.95f; help_vertices[1] = -0.95f;  // Bottom-left
-    help_vertices[2] =  0.95f; help_vertices[3] = -0.95f;  // Bottom-right  
-    help_vertices[4] =  0.95f; help_vertices[5] =  0.95f;  // Top-right
-    help_vertices[6] = -0.95f; help_vertices[7] =  0.95f;  // Top-left
+    // Large centered background
+    help_vertices[0] = -0.7f; help_vertices[1] = -0.55f;  // Bottom-left
+    help_vertices[2] =  0.7f; help_vertices[3] = -0.55f;  // Bottom-right  
+    help_vertices[4] =  0.7f; help_vertices[5] =  0.55f;  // Top-right
+    help_vertices[6] = -0.7f; help_vertices[7] =  0.55f;  // Top-left
     vertex_count = 4;
     
-    // Add help text
+    // Compact help text - all controls fit on screen
     const char* help_text = 
-        "KEYSTONE CONTROLS\n"
+        "CONTROLS\n"
         "\n"
-        "Q/ESC = QUIT\n"
-        "H = HELP\n"
-        "C = CORNERS\n"
-        "B = BORDER\n"
-        "R = RESET\n"
-        "P = SAVE\n"
-        "\n"
-        "1-4 = SELECT CORNER\n"
-        "ARROWS = MOVE CORNER";
+        "1234 Corner\n"
+        "Arrows Move\n"
+        "S Save\n"
+        "R Reset\n"
+        "C Corners\n"
+        "B Border\n"
+        "H Help\n"
+        "Q Quit";
     
-    draw_text_simple(help_vertices, &vertex_count, help_text, -0.9f, 0.8f, 0.03f);
+    draw_text_simple(help_vertices, &vertex_count, help_text, -0.65f, 0.48f, 0.025f);
     
     // Update help VBO with text geometry
     glBindBuffer(GL_ARRAY_BUFFER, gl->help_vbo);

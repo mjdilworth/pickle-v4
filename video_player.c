@@ -24,6 +24,22 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         up = up || input_is_key_just_pressed(app->input, KEY_UP);
         down = down || input_is_key_just_pressed(app->input, KEY_DOWN);
     }
+    
+    // Add gamepad input (D-pad and left analog stick)
+    if (app->input->gamepad_enabled) {
+        // D-pad input
+        if (app->input->gamepad_dpad_x < 0) left = true;
+        if (app->input->gamepad_dpad_x > 0) right = true;
+        if (app->input->gamepad_dpad_y < 0) up = true;
+        if (app->input->gamepad_dpad_y > 0) down = true;
+        
+        // Analog stick input (with deadzone)
+        const int16_t deadzone = 8000; // ~25% deadzone
+        if (app->input->gamepad_axis_x < -deadzone) left = true;
+        if (app->input->gamepad_axis_x > deadzone) right = true;
+        if (app->input->gamepad_axis_y < -deadzone) up = true;
+        if (app->input->gamepad_axis_y > deadzone) down = true;
+    }
 
     float move_x = 0.0f;
     float move_y = 0.0f;
@@ -120,6 +136,9 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
         app_cleanup(app);
         return -1;
     }
+    
+    // Pass debug flag to input handler
+    app->input->debug_gamepad = app->debug_gamepad;
 
     gl_setup_buffers(app->gl);
 
@@ -152,7 +171,6 @@ void app_run(app_context_t *app) {
     struct timespec decode_start, decode_end, render_start, render_end;
     double total_decode_time = 0, total_render_time = 0;
     int diagnostic_frame_count = 0;
-    bool show_diagnostics = true;
 
     // Main loop starting
     double startup_time = (double)last_time.tv_sec + last_time.tv_nsec / 1e9;
@@ -218,6 +236,7 @@ void app_run(app_context_t *app) {
         // Toggle border visibility
         if (app->input->toggle_border) {
             keystone_toggle_border(app->keystone);
+            printf("Border toggled: %s\n", app->keystone->show_border ? "ON" : "OFF");
             app->input->toggle_border = false; // Reset flag
         }
         
@@ -225,6 +244,59 @@ void app_run(app_context_t *app) {
         if (app->input->toggle_help) {
             keystone_toggle_help(app->keystone);
             app->input->toggle_help = false; // Reset flag
+        }
+        
+        // Gamepad-specific actions
+        if (app->input->gamepad_enabled) {
+            // X button: Cycle through corners
+            if (app->input->gamepad_cycle_corner) {
+                int current = app->keystone->selected_corner;
+                
+                // If no corner selected, start with top-left
+                if (current < 0 || current > 3) {
+                    current = CORNER_TOP_LEFT;
+                    keystone_select_corner(app->keystone, current);
+                    printf("[CYCLE] Starting with index %d (TOP_LEFT)\n", current);
+                } else {
+                    // Cycle: TOP_LEFT(0) -> TOP_RIGHT(1) -> BOTTOM_RIGHT(2) -> BOTTOM_LEFT(3) -> TOP_LEFT
+                    int next;
+                    switch (current) {
+                        case CORNER_TOP_LEFT:     next = CORNER_TOP_RIGHT; break;
+                        case CORNER_TOP_RIGHT:    next = CORNER_BOTTOM_RIGHT; break;
+                        case CORNER_BOTTOM_RIGHT: next = CORNER_BOTTOM_LEFT; break;
+                        case CORNER_BOTTOM_LEFT:  next = CORNER_TOP_LEFT; break;
+                        default:                  next = CORNER_TOP_LEFT; break;
+                    }
+                    keystone_select_corner(app->keystone, next);
+                    const char* names[] = {"TL(0)", "TR(1)", "BR(2)", "BL(3)"};
+                    printf("[CYCLE] %s -> %s (selected_corner is now %d)\n", 
+                           names[current], names[next], app->keystone->selected_corner);
+                }
+                app->input->gamepad_cycle_corner = false;
+            }
+            
+            // L1/R1: Decrease/increase step size
+            if (app->input->gamepad_decrease_step) {
+                keystone_decrease_step_size(app->keystone);
+                app->input->gamepad_decrease_step = false;
+            }
+            if (app->input->gamepad_increase_step) {
+                keystone_increase_step_size(app->keystone);
+                app->input->gamepad_increase_step = false;
+            }
+            
+            // SELECT: Reset keystone
+            if (app->input->gamepad_reset_keystone) {
+                keystone_reset_corners(app->keystone);
+                printf("Keystone reset to defaults (gamepad)\n");
+                app->input->gamepad_reset_keystone = false;
+            }
+            
+            // START: Toggle keystone mode (corners visibility)
+            if (app->input->gamepad_toggle_mode) {
+                keystone_toggle_corners(app->keystone);
+                app->input->gamepad_toggle_mode = false;
+            }
         }
 
         // Decode video frame if enough time has passed
@@ -270,7 +342,7 @@ void app_run(app_context_t *app) {
                     diagnostic_frame_count++;
                     
                     // Show diagnostic info periodically
-                    if (show_diagnostics && diagnostic_frame_count % 60 == 0) {
+                    if (app->show_timing && diagnostic_frame_count % 60 == 0) {
                         double avg_decode_time = total_decode_time / diagnostic_frame_count;
                         printf("Frame timing - Avg decode: %.1fms, Target: %.1fms\n",
                                avg_decode_time * 1000, target_frame_time * 1000);
@@ -435,10 +507,12 @@ void app_run(app_context_t *app) {
                           (swap_end.tv_nsec - swap_start.tv_nsec) / 1e9;
         
         // Report detailed timing for long frames
-        static int detailed_timing_count = 0;
-        if (swap_time > 0.050 || (detailed_timing_count++ % 120 == 0)) { // Every 2 seconds or if swap > 50ms
-            printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
-                   gl_time * 1000, overlay_time * 1000, swap_time * 1000);
+        if (app->show_timing) {
+            static int detailed_timing_count = 0;
+            if (swap_time > 0.050 || (detailed_timing_count++ % 120 == 0)) { // Every 2 seconds or if swap > 50ms
+                printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
+                       gl_time * 1000, overlay_time * 1000, swap_time * 1000);
+            }
         }
         render_time = (render_end.tv_sec - render_start.tv_sec) +
                     (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
@@ -460,7 +534,7 @@ void app_run(app_context_t *app) {
             nanosleep(&sleep_time, NULL);
             
             // Show render diagnostics periodically
-            if (show_diagnostics && diagnostic_frame_count % 60 == 0 && diagnostic_frame_count > 0) {
+            if (app->show_timing && diagnostic_frame_count % 60 == 0 && diagnostic_frame_count > 0) {
                 double avg_render_time = total_render_time / diagnostic_frame_count;
                 printf("Render timing - Avg render: %.1fms, Total frame: %.1fms\n",
                        avg_render_time * 1000, total_frame_time * 1000);
@@ -468,8 +542,10 @@ void app_run(app_context_t *app) {
             }
         } else {
             // We're running behind - no sleep, but don't make timing worse
-            printf("Frame overrun: %.1fms (target: %.1fms)\n", 
-                   total_frame_time * 1000, adaptive_frame_time * 1000);
+            if (app->show_timing) {
+                printf("Frame overrun: %.1fms (target: %.1fms)\n", 
+                       total_frame_time * 1000, adaptive_frame_time * 1000);
+            }
             
             // FIXED: Only increase timing slightly if consistently overrunning
             static int overrun_count = 0;
@@ -491,10 +567,7 @@ void app_cleanup(app_context_t *app) {
         free(app->input);
     }
     if (app->keystone) {
-        // Save keystone settings on exit
-        if (keystone_save_settings(app->keystone) == 0) {
-            printf("Keystone settings saved on exit\n");
-        }
+        // Don't auto-save on exit - only save when user presses S key
         keystone_cleanup(app->keystone);
         free(app->keystone);
     }

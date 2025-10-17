@@ -22,6 +22,8 @@ typedef struct {
     bool loop_playback;
     const char *video_file;
     bool needs_redraw;       // Flag to indicate frame needs redrawing
+    bool show_timing;        // Flag to show frame timing information
+    bool debug_gamepad;      // Flag to log gamepad button presses
 } app_context_t;
 
 // Main application functions

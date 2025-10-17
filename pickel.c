@@ -51,30 +51,57 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
     
     bool loop_playback = false;
+    bool show_timing = false;
+    bool debug_gamepad = false;
     char *video_file = NULL;
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0) {
             loop_playback = true;
+        } else if (strcmp(argv[i], "--timing") == 0) {
+            show_timing = true;
+        } else if (strcmp(argv[i], "--debug-gamepad") == 0) {
+            debug_gamepad = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
+            fprintf(stderr, "\nOptions:\n");
+            fprintf(stderr, "  -l               Loop video playback\n");
+            fprintf(stderr, "  --timing         Show frame timing information\n");
+            fprintf(stderr, "  --debug-gamepad  Log gamepad button presses\n");
+            fprintf(stderr, "  -h, --help       Show this help message\n");
+            fprintf(stderr, "\nKeyboard Controls:\n");
+            fprintf(stderr, "  q/ESC    Quit\n");
+            fprintf(stderr, "  h        Toggle help overlay\n");
+            fprintf(stderr, "  1-4      Select keystone corners\n");
+            fprintf(stderr, "  arrows   Move selected corner\n");
+            fprintf(stderr, "  r        Reset keystone\n");
+            fprintf(stderr, "  s        Save keystone settings\n");
+            fprintf(stderr, "  c        Toggle corner markers\n");
+            fprintf(stderr, "  b        Toggle border outline\n");
+            fprintf(stderr, "\nGamepad Controls (8BitDo Zero 2):\n");
+            fprintf(stderr, "  X        Cycle through corners\n");
+            fprintf(stderr, "  D-pad/Stick  Move selected corner\n");
+            fprintf(stderr, "  L1/R1    Decrease/Increase step size\n");
+            fprintf(stderr, "  SELECT   Reset keystone\n");
+            fprintf(stderr, "  START    Toggle corner markers\n");
+            fprintf(stderr, "  B        Toggle help overlay\n");
+            fprintf(stderr, "  HOME     Toggle border outline\n");
+            fprintf(stderr, "  START+SELECT (2s)  Quit\n");
+            return 0;
         } else if (argv[i][0] != '-') {
             video_file = argv[i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Use -h or --help for usage information\n");
+            return 1;
         }
     }
     
     if (!video_file) {
-        fprintf(stderr, "Usage: %s [-l] <video_file.mp4>\n", argv[0]);
-        fprintf(stderr, "Options:\n");
-        fprintf(stderr, "  -l    - loop video playback\n");
-        fprintf(stderr, "Controls:\n");
-        fprintf(stderr, "  q/ESC - quit\n");
-        fprintf(stderr, "  h     - toggle help overlay\n");
-        fprintf(stderr, "  1-4   - select keystone corners\n");
-        fprintf(stderr, "  arrows/wasd - move selected corner\n");
-        fprintf(stderr, "  r     - reset keystone\n");
-        fprintf(stderr, "  p     - save keystone settings\n");
-        fprintf(stderr, "  c     - toggle corner highlights\n");
-        fprintf(stderr, "  b     - toggle border highlights\n");
+        fprintf(stderr, "Error: No video file specified\n");
+        fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
+        fprintf(stderr, "Use -h or --help for more information\n");
         return 1;
     }
 
@@ -82,6 +109,8 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
     
     app_context_t app = {0};
+    app.show_timing = show_timing;
+    app.debug_gamepad = debug_gamepad;
     g_app = &app;  // Set global reference for signal handlers
     
     printf("Setting up signal handlers...\n");
