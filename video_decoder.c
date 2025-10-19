@@ -598,6 +598,74 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
     if (v_stride) *v_stride = video->frame->linesize[2];
 }
 
+// NV12: Y plane followed by interleaved U/V plane (UV is half resolution)
+// Layout: [Y data (width*height)] [UV data (width*height/2)]
+// Each U/V pair is adjacent (U0 V0 U1 V1 ...)
+uint8_t* video_get_nv12_data(video_context_t *video) {
+    if (!video || !video->frame) return NULL;
+    
+    // NV12 format: we need to pack U and V planes together
+    // FFmpeg gives us separate Y/U/V planes, so we need to convert
+    static uint8_t *nv12_buffer = NULL;
+    static int nv12_buffer_size = 0;
+    
+    int width = video->width;
+    int height = video->height;
+    int needed_size = (width * height * 3) / 2;  // Y plane + packed UV plane
+    
+    // Allocate or reallocate buffer if needed
+    if (nv12_buffer_size < needed_size) {
+        free(nv12_buffer);
+        nv12_buffer = malloc(needed_size);
+        nv12_buffer_size = needed_size;
+    }
+    
+    if (!nv12_buffer) return NULL;
+    
+    uint8_t *y_data = video->frame->data[0];
+    uint8_t *u_data = video->frame->data[1];
+    uint8_t *v_data = video->frame->data[2];
+    int y_stride = video->frame->linesize[0];
+    int u_stride = video->frame->linesize[1];
+    int v_stride = video->frame->linesize[2];
+    
+    if (!y_data) return NULL;
+    
+    // Copy Y plane (full resolution)
+    uint8_t *dst = nv12_buffer;
+    uint8_t *src = y_data;
+    for (int row = 0; row < height; row++) {
+        memcpy(dst, src, width);
+        dst += width;
+        src += y_stride;
+    }
+    
+    // Copy interleaved UV plane (half resolution)
+    int uv_width = width / 2;
+    int uv_height = height / 2;
+    
+    if (u_data && v_data) {
+        // Interleave U and V into UV plane
+        for (int row = 0; row < uv_height; row++) {
+            uint8_t *u_row = u_data + (row * u_stride);
+            uint8_t *v_row = v_data + (row * v_stride);
+            
+            for (int col = 0; col < uv_width; col++) {
+                *dst++ = u_row[col];  // U
+                *dst++ = v_row[col];  // V
+            }
+        }
+    }
+    
+    return nv12_buffer;
+}
+
+int video_get_nv12_stride(video_context_t *video) {
+    if (!video) return 0;
+    // NV12 stride is just the width (no padding for the packed format we create)
+    return video->width;
+}
+
 void video_set_loop(video_context_t *video, bool loop) {
     if (video) {
         video->loop_playback = loop;

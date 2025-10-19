@@ -443,18 +443,34 @@ void app_run(app_context_t *app) {
                 //        app->keystone->selected_corner);
             }
                     static int slow_decode_count = 0;
-                    if (decode_time > adaptive_frame_time * 2.0) { // More generous threshold
+                    static int frames_skipped = 0;
+                    
+                    // OPTIMIZED: More aggressive frame skipping when needed
+                    // Skip frames if decode time exceeds 50% over budget
+                    if (decode_time > adaptive_frame_time * 1.5) {
                         slow_decode_count++;
-                        if (slow_decode_count == 1) {
-                            printf("Slow decode detected (%.1fms), enabling frame skipping\n", decode_time * 1000);
-                        }
                         
-                        // Only skip 1 frame, and only every 3rd slow decode
-                        if (slow_decode_count % 3 == 0) {
-                            video_decode_frame(app->video); // Skip just 1 frame
+                        // Skip frames more frequently - every slow frame after first 2
+                        if (slow_decode_count > 2) {
+                            // Skip the next 1-2 frames depending on how slow
+                            int skip_count = (decode_time > adaptive_frame_time * 3.0) ? 2 : 1;
+                            for (int i = 0; i < skip_count && i < 2; i++) {
+                                video_decode_frame(app->video);
+                                frames_skipped++;
+                            }
+                            
+                            if (frames_skipped % 10 == 0) {
+                                printf("Frame skipping: %.1fms decode (budget %.1fms), skipped %d frames total\n", 
+                                       decode_time * 1000, adaptive_frame_time * 1000, frames_skipped);
+                            }
                         }
                     } else {
-                        slow_decode_count = 0; // Reset when decode is fast again
+                        // Decode is fast - reset counter
+                        if (slow_decode_count > 0 && frames_skipped > 0) {
+                            printf("Decode performance recovered, skipped %d frames total\n", frames_skipped);
+                            frames_skipped = 0;
+                        }
+                        slow_decode_count = 0;
                     }
                     
                     // Successful decode - gradually speed up timing
@@ -521,15 +537,25 @@ void app_run(app_context_t *app) {
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
         
-        // Only render if we have valid YUV data
-        if (y_data && u_data && v_data) {
-            // Render with YUV data (GPU will do YUV→RGB conversion)
-            gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                          y_stride, u_stride, v_stride, app->drm, app->keystone);
+        // Use NV12 format for optimized rendering
+        uint8_t *nv12_data = video_get_nv12_data(app->video);
+        int nv12_stride = video_get_nv12_stride(app->video);
+        
+        // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
+        if (false && nv12_data) {
+            // Render with NV12 packed format (faster - single texture upload)
+            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone);
         } else {
-            // Render a blank frame or keep the last frame displayed
-            gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                          0, 0, 0, app->drm, app->keystone);
+            // Fallback to original YUV rendering (for compatibility)
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+            
+            if (y_data && u_data && v_data) {
+                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                              y_stride, u_stride, v_stride, app->drm, app->keystone);
+            } else {
+                gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
+                              0, 0, 0, app->drm, app->keystone);
+            }
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);

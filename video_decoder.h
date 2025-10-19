@@ -58,6 +58,8 @@ int video_get_u_stride(video_context_t *video);
 int video_get_v_stride(video_context_t *video);
 void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_t **v, 
                        int *y_stride, int *u_stride, int *v_stride);  // New YUV output
+uint8_t* video_get_nv12_data(video_context_t *video);  // NV12 packed format
+int video_get_nv12_stride(video_context_t *video);
 double video_get_frame_time(video_context_t *video);
 bool video_is_eof(video_context_t *video);
 void video_seek(video_context_t *video, int64_t timestamp);

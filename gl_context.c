@@ -6,6 +6,44 @@
 #include <string.h>
 #include <math.h>
 
+// NEON SIMD optimization for stride copying on ARM
+#ifdef __ARM_NEON__
+    #include <arm_neon.h>
+    #define HAS_NEON 1
+#else
+    #define HAS_NEON 0
+#endif
+
+// OPTIMIZED: NEON-accelerated stride copy for YUV planes
+// Copies 'rows' rows of 'width' bytes from source to destination with strides
+static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src, 
+                                         int width, int height, 
+                                         int dst_stride, int src_stride) {
+    #if HAS_NEON
+    // Use NEON 128-bit vectors for 16-byte copies (2 NEON registers per iteration)
+    int width_16 = (width / 16) * 16;  // Process 16 bytes at a time
+    
+    for (int row = 0; row < height; row++) {
+        // NEON fast path for 16-byte aligned chunks
+        uint8_t *s = (uint8_t *)src + (row * src_stride);
+        uint8_t *d = dst + (row * dst_stride);
+        
+        for (int col = 0; col < width_16; col += 16) {
+            uint8x16_t data = vld1q_u8(s + col);
+            vst1q_u8(d + col, data);
+        }
+        
+        // Scalar copy for remaining bytes
+        memcpy(d + width_16, s + width_16, width - width_16);
+    }
+    #else
+    // Fallback to standard memcpy loop for non-ARM platforms
+    for (int row = 0; row < height; row++) {
+        memcpy(dst + (row * dst_stride), src + (row * src_stride), width);
+    }
+    #endif
+}
+
 // Forward declarations
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size);
 static void draw_text_simple(float *vertices, int *vertex_count, const char *text, float x, float y, float size);
@@ -18,7 +56,57 @@ static void draw_text_simple(float *vertices, int *vertex_count, const char *tex
 #define GL_RED 0x1903
 #endif
 
+// Pre-allocated YUV temp buffers for stride handling (avoids malloc/free each frame)
+typedef struct {
+    uint8_t *y_temp_buffer;
+    uint8_t *u_temp_buffer;
+    uint8_t *v_temp_buffer;
+    int allocated_size;  // Size each buffer is allocated for
+} yuv_temp_buffers_t;
+
+// Global persistent buffers - allocated once, reused
+static yuv_temp_buffers_t g_yuv_buffers = {NULL, NULL, NULL, 0};
+
+static void allocate_yuv_buffers(int needed_size) {
+    // Only allocate if needed or size changed
+    if (g_yuv_buffers.allocated_size < needed_size) {
+        // Free old buffers if they exist
+        free(g_yuv_buffers.y_temp_buffer);
+        free(g_yuv_buffers.u_temp_buffer);
+        free(g_yuv_buffers.v_temp_buffer);
+        
+        // Allocate new buffers - allocate slightly larger to reduce reallocations
+        int alloc_size = needed_size * 1.2;  // 20% headroom
+        g_yuv_buffers.y_temp_buffer = malloc(alloc_size);
+        g_yuv_buffers.u_temp_buffer = malloc(alloc_size / 4);  // U/V are half size
+        g_yuv_buffers.v_temp_buffer = malloc(alloc_size / 4);
+        g_yuv_buffers.allocated_size = alloc_size;
+        
+        if (g_yuv_buffers.y_temp_buffer && g_yuv_buffers.u_temp_buffer && g_yuv_buffers.v_temp_buffer) {
+            // printf("DEBUG: Pre-allocated YUV buffers: Y=%p U=%p V=%p (size %d)\n",
+            //        g_yuv_buffers.y_temp_buffer, g_yuv_buffers.u_temp_buffer, g_yuv_buffers.v_temp_buffer, alloc_size);
+        }
+    }
+}
+
+static void free_yuv_buffers(void) {
+    if (g_yuv_buffers.y_temp_buffer) {
+        free(g_yuv_buffers.y_temp_buffer);
+        g_yuv_buffers.y_temp_buffer = NULL;
+    }
+    if (g_yuv_buffers.u_temp_buffer) {
+        free(g_yuv_buffers.u_temp_buffer);
+        g_yuv_buffers.u_temp_buffer = NULL;
+    }
+    if (g_yuv_buffers.v_temp_buffer) {
+        free(g_yuv_buffers.v_temp_buffer);
+        g_yuv_buffers.v_temp_buffer = NULL;
+    }
+    g_yuv_buffers.allocated_size = 0;
+}
+
 // Modern vertex shader for keystone correction and video rendering (OpenGL ES 3.1)
+// OPTIMIZATION: Use highp for geometry (precision needed for matrix math)
 const char *vertex_shader_source = 
     "#version 310 es\n"
     "precision highp float;\n"
@@ -44,10 +132,11 @@ const char *vertex_shader_source =
     "    v_texcoord = a_texcoord;\n"
     "}\n";
 
-// Hybrid fragment shader for YUV→RGB conversion (OpenGL ES 3.1 with legacy fallback)
+// Optimized YUV→RGB conversion fragment shader (OpenGL ES 3.1)
+// Keep highp precision for color accuracy (mediump causes color shift)
 const char *fragment_shader_source = 
     "#version 310 es\n"
-    "precision highp float;\n"
+    "precision highp float;\n"  // KEEP highp for color accuracy
     "in vec2 v_texcoord;\n"
     "\n"
     "// Legacy uniform samplers (for compatibility)\n"
@@ -58,7 +147,7 @@ const char *fragment_shader_source =
     "out vec4 fragColor;\n"
     "\n"
     "void main() {\n"
-    "    // Sample YUV values\n"
+    "    // Sample YUV values from separate planes\n"
     "    float y = texture(u_texture_y, v_texcoord).r;\n"
     "    float u = texture(u_texture_u, v_texcoord).r;\n"
     "    float v = texture(u_texture_v, v_texcoord).r;\n"
@@ -82,9 +171,10 @@ const char *fragment_shader_source =
     "    fragColor = vec4(r, g, b, 1.0);\n"
     "}\n";
 
-// Corner highlight shaders (OpenGL ES 3.1)
+// Corner highlight shaders (OpenGL ES 3.1) - OPTIMIZED
 const char *corner_vertex_shader_source = 
     "#version 310 es\n"
+    "precision mediump float;\n"  // OPTIMIZED: mediump for overlay geometry
     "layout(location = 0) in vec2 a_position;\n"
     "layout(location = 1) in vec4 a_color;\n"
     "uniform mat4 u_mvp_matrix;\n"
@@ -96,7 +186,7 @@ const char *corner_vertex_shader_source =
 
 const char *corner_fragment_shader_source = 
     "#version 310 es\n"
-    "precision mediump float;\n"
+    "precision mediump float;\n"  // OPTIMIZED: mediump for overlay colors
     "in vec4 v_color;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
@@ -158,6 +248,7 @@ static int create_program(gl_context_t *gl) {
     gl->u_texture_y = glGetUniformLocation(gl->program, "u_texture_y");
     gl->u_texture_u = glGetUniformLocation(gl->program, "u_texture_u");
     gl->u_texture_v = glGetUniformLocation(gl->program, "u_texture_v");
+    gl->u_texture_nv12 = glGetUniformLocation(gl->program, "u_texture_nv12");
     gl->u_keystone_matrix = glGetUniformLocation(gl->program, "u_keystone_matrix");
     gl->a_position = glGetAttribLocation(gl->program, "a_position");
     gl->a_texcoord = glGetAttribLocation(gl->program, "a_texcoord");
@@ -340,6 +431,7 @@ void gl_setup_buffers(gl_context_t *gl) {
     glGenTextures(1, &gl->texture_y);
     glGenTextures(1, &gl->texture_u);
     glGenTextures(1, &gl->texture_v);
+    glGenTextures(1, &gl->texture_nv12);
     
     // Setup Y texture
     glBindTexture(GL_TEXTURE_2D, gl->texture_y);
@@ -362,6 +454,18 @@ void gl_setup_buffers(gl_context_t *gl) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
+    // Setup NV12 texture (combined Y + interleaved UV at 1.5x height)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
     // Setup corner highlight VBO - will be updated with actual corner positions
     glGenBuffers(1, &gl->corner_vbo);
     
@@ -373,6 +477,121 @@ void gl_setup_buffers(gl_context_t *gl) {
     
     // Modern ES 3.1 UBO setup (disabled for compatibility)
     // setup_uniform_buffers(gl);
+}
+
+// Helper function to upload NV12 data to GPU
+void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
+                    display_ctx_t *drm, keystone_context_t *keystone) {
+    static int frame_rendered = 0;
+    static int last_width = 0, last_height = 0;
+    static bool gl_state_set = false;
+    
+    // Set black clear color for video background
+    if (frame_rendered == 0) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    // Set up OpenGL state only once or when needed
+    if (!gl_state_set) {
+        glViewport(0, 0, drm->width, drm->height);
+        gl_state_set = true;
+    }
+    
+    // CRITICAL: Complete buffer unbinding before state restoration
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glUseProgram(0);
+    
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    
+    // Now set up the correct state for video rendering
+    glUseProgram(gl->program);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+    
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    // Texture coordinate attribute  
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    // Set MVP matrix
+    float mvp_matrix[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+    
+    // Explicitly disable blending and depth test
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    
+    // Set keystone matrix
+    const float *keystone_matrix = keystone_get_matrix(keystone);
+    glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
+    
+    // Bind NV12 texture to texture unit 0
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Disable other texture units so shader uses only NV12
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    
+    // Set sampler uniforms
+    glUniform1i(gl->u_texture_nv12, 0);  // NV12 on unit 0
+    glUniform1i(gl->u_texture_y, 1);     // Unused (should help shader detect NV12 mode)
+    glUniform1i(gl->u_texture_u, 2);     // Unused
+    glUniform1i(gl->u_texture_v, 3);     // Unused
+    
+    // Upload NV12 data
+    if (nv12_data) {
+        bool size_changed = (width != last_width || height != last_height || frame_rendered == 0);
+        
+        // NV12 is Y plane + interleaved UV plane = 1.5x height
+        int nv12_height = (height * 3) / 2;
+        
+        if (size_changed) {
+            // Need full glTexImage2D for size change
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, nv12_height, 0, GL_RED, GL_UNSIGNED_BYTE, nv12_data);
+            printf("NV12 texture uploaded: %dx%d (NV12 height %d)\n", width, height, nv12_height);
+        } else {
+            // Use glTexSubImage2D for faster updates
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, nv12_height, GL_RED, GL_UNSIGNED_BYTE, nv12_data);
+        }
+        
+        last_width = width;
+        last_height = height;
+        frame_rendered++;
+    }
+    
+    // Check for OpenGL errors
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        printf("OpenGL error (NV12): 0x%x\n", error);
+    }
+    
+    // Draw quad
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    
+    error = glGetError();
+    if (error != GL_NO_ERROR) {
+        printf("OpenGL error after NV12 draw: 0x%x\n", error);
+    }
 }
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
@@ -503,25 +722,17 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
             }
         } else {
-            // Only use stride copying when absolutely necessary
-            static uint8_t *y_temp_buffer = NULL;
-            static int y_temp_size = 0;
+            // Only use stride copying when absolutely necessary - use pre-allocated buffers
+            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = width * height;
-            if (y_temp_size < needed_size) {
-                free(y_temp_buffer);
-                y_temp_buffer = malloc(needed_size);
-                y_temp_size = needed_size;
-            }
-            uint8_t *src = y_data, *dst = y_temp_buffer;
-            for (int row = 0; row < height; row++) {
-                memcpy(dst, src, width);
-                src += y_stride;
-                dst += width;
-            }
+            allocate_yuv_buffers(needed_size);
+            
+            copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
+            
             if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_temp_buffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
             } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_temp_buffer);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
             }
         }
         // U texture - OPTIMIZED: minimize texture operations  
@@ -534,24 +745,17 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
             }
         } else {
-            static uint8_t *u_temp_buffer = NULL;
-            static int u_temp_size = 0;
+            // Use pre-allocated buffers for U plane
+            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = uv_width * uv_height;
-            if (u_temp_size < needed_size) {
-                free(u_temp_buffer);
-                u_temp_buffer = malloc(needed_size);
-                u_temp_size = needed_size;
-            }
-            uint8_t *src = u_data, *dst = u_temp_buffer;
-            for (int row = 0; row < uv_height; row++) {
-                memcpy(dst, src, uv_width);
-                src += u_stride;
-                dst += uv_width;
-            }
+            allocate_yuv_buffers(needed_size);
+            
+            copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
+            
             if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_temp_buffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
             } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_temp_buffer);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
             }
         }
         
@@ -565,24 +769,17 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
             }
         } else {
-            static uint8_t *v_temp_buffer = NULL;
-            static int v_temp_size = 0;
+            // Use pre-allocated buffers for V plane
+            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = uv_width * uv_height;
-            if (v_temp_size < needed_size) {
-                free(v_temp_buffer);
-                v_temp_buffer = malloc(needed_size);
-                v_temp_size = needed_size;
-            }
-            uint8_t *src = v_data, *dst = v_temp_buffer;
-            for (int row = 0; row < uv_height; row++) {
-                memcpy(dst, src, uv_width);
-                src += v_stride;
-                dst += uv_width;
-            }
+            allocate_yuv_buffers(needed_size);
+            
+            copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
+            
             if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_temp_buffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
             } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_temp_buffer);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
             }
         }
         
@@ -640,6 +837,21 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         return; // Don't render corners if not visible
     }
     
+    // Pre-allocated static buffer for corners (initialized once)
+    static float corner_vertices[10000];  // Enough for position+color data
+    static GLuint corner_vbo = 0;
+    static bool vbo_initialized = false;
+    static int last_vertex_count = 0;
+    
+    // Initialize VBO once on first call
+    if (!vbo_initialized) {
+        glGenBuffers(1, &corner_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+        // OPTIMIZED: Pre-allocate with GL_DYNAMIC_DRAW on first init only
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices), NULL, GL_DYNAMIC_DRAW);
+        vbo_initialized = true;
+    }
+    
     // Enable blending for transparent overlays
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -651,7 +863,6 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     float corner_size = 0.015f; // 1.5% of screen size (smaller)
     
     // Corner vertices with colors: [x, y, r, g, b, a] per vertex
-    float corner_vertices[10000]; // Large buffer for position+color data and text
     int vertex_count = 0;
     
     // Determine colors for each corner
@@ -721,9 +932,10 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         // Skip text for now - we'll add it back later
     }
     
-    // Update corner VBO with new positions and colors
-    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), corner_vertices, GL_DYNAMIC_DRAW);
+    // OPTIMIZED: Use glBufferSubData instead of glBufferData
+    // glBufferSubData only updates the data, much faster than reallocating
+    glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
     
     // Use corner shader program
     glUseProgram(gl->corner_program);
@@ -1143,6 +1355,7 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
     if (gl->texture_v) glDeleteTextures(1, &gl->texture_v);
+    if (gl->texture_nv12) glDeleteTextures(1, &gl->texture_nv12);
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);
     if (gl->ebo) glDeleteBuffers(1, &gl->ebo);
     if (gl->corner_vbo) glDeleteBuffers(1, &gl->corner_vbo);
@@ -1152,6 +1365,9 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->corner_program) glDeleteProgram(gl->corner_program);
     if (gl->vertex_shader) glDeleteShader(gl->vertex_shader);
     if (gl->fragment_shader) glDeleteShader(gl->fragment_shader);
+    
+    // Clean up pre-allocated YUV buffers
+    free_yuv_buffers();
     
     if (gl->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(gl->egl_display, gl->egl_surface);

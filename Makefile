@@ -2,7 +2,10 @@
 
 # Compiler and flags
 CC = gcc
+# OPTIMIZED: Enable ARM NEON SIMD when available
 CFLAGS = -Wall -Wextra -std=c99 -O2 -g
+ARCH_FLAGS = $(shell uname -m | grep -q 'arm' && echo '-mfpu=neon -ftree-vectorize')
+CFLAGS += $(ARCH_FLAGS)
 TARGET = pickle
 SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c keystone.c input_handler.c v4l2_utils.c
 OBJECTS = $(SOURCES:.c=.o)
