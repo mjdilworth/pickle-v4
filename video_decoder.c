@@ -308,9 +308,13 @@ int video_decode_frame(video_context_t *video) {
 
     // SIMPLIFIED DECODE LOOP (Option A - from simple_decode_test.c)
     // Keep reading and queueing packets until we get a frame
-    // This approach is proven to work 100% reliably
+    // This approach is proven to work 100% reliably for most files
+    // Add safety limit to prevent infinite loops with problematic files
     
-    while (1) {
+    int packets_sent_this_call = 0;
+    const int MAX_PACKETS_PER_CALL = 50;  // Reduced from 500 - safety exit
+    
+    while (packets_sent_this_call < MAX_PACKETS_PER_CALL) {
         // First, try to get any frame the decoder has buffered
         int receive_result = avcodec_receive_frame(video->codec_ctx, video->frame);
         
@@ -352,11 +356,23 @@ int video_decode_frame(video_context_t *video) {
         // Read next packet and send it
         
         int read_result = av_read_frame(video->format_ctx, video->packet);
+        
         if (read_result < 0) {
             if (read_result == AVERROR_EOF) {
-                // No more packets, flush decoder
+                // No more packets in file
+                // Flush decoder to get any remaining buffered frames
                 avcodec_send_packet(video->codec_ctx, NULL);
-                continue;  // Loop again to get any remaining frames
+                
+                // Try one more receive to get any buffered frames
+                int flush_result = avcodec_receive_frame(video->codec_ctx, video->frame);
+                if (flush_result == 0) {
+                    // Got a frame from flush
+                    return 0;
+                }
+                
+                // No more frames available
+                video->eof_reached = true;
+                return -1;
             } else {
                 printf("Error reading packet: %s\n", av_err2str(read_result));
                 return -1;
@@ -379,10 +395,12 @@ int video_decode_frame(video_context_t *video) {
         }
         
         // Loop continues automatically - will try to receive frame next iteration
+        packets_sent_this_call++;
     }
     
-    // Try falling back to software decoding if we're currently using hardware
+    // If we hit the safety limit without getting a frame, fallback to software
     if (video->use_hardware_decode) {
+        printf("[WARN] Hardware decoder: Sent %d packets without output, trying software fallback\n", packets_sent_this_call);
         printf("\n=================== HARDWARE DECODE FAILURE DIAGNOSTIC ===================\n");
         printf("* Advanced diagnostics: %s\n", video->advanced_diagnostics ? "ENABLED" : "disabled");
         printf("* Hardware decoder type: %s\n", 
