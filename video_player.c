@@ -76,10 +76,18 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
     
+    // Save important flags before clearing
+    bool show_timing = app->show_timing;
+    bool debug_gamepad = app->debug_gamepad;
+    
     memset(app, 0, sizeof(*app));
+    
+    // Restore flags
     app->video_file = video_file;
     app->running = true;
     app->loop_playback = loop_playback;
+    app->show_timing = show_timing;
+    app->debug_gamepad = debug_gamepad;
 
     // Allocate contexts
     app->drm = calloc(1, sizeof(display_ctx_t));
@@ -155,11 +163,30 @@ void app_run(app_context_t *app) {
     struct timespec current_time, last_time;
     clock_gettime(CLOCK_MONOTONIC, &last_time);
 
+    // Print app configuration to verify settings
+    printf("App configuration - Loop: %d, Show timing: %d, Debug gamepad: %d\n",
+           app->loop_playback ? 1 : 0, 
+           app->show_timing ? 1 : 0, 
+           app->debug_gamepad ? 1 : 0);
+    
+    // Force timing display for debugging if needed
+    if (!app->show_timing) {
+        char *env_timing = getenv("PICKLE_SHOW_TIMING");
+        if (env_timing && (strcmp(env_timing, "1") == 0 || 
+                          strcmp(env_timing, "yes") == 0 || 
+                          strcmp(env_timing, "true") == 0)) {
+            app->show_timing = true;
+            printf("[FORCE] Timing display enabled via PICKLE_SHOW_TIMING environment variable\n");
+        }
+    }
+    fflush(stdout);
+
     double target_frame_time = 1.0 / 60.0; // 60 FPS target
     if (app->video && app->video->fps > 0) {
         target_frame_time = 1.0 / app->video->fps;
         printf("Video FPS: %.2f, Target frame time: %.3fms\n", 
                app->video->fps, target_frame_time * 1000);
+        fflush(stdout);
     }
     
     // IMPROVED: Simpler, more stable frame timing
@@ -176,6 +203,37 @@ void app_run(app_context_t *app) {
     struct timespec decode_start, decode_end, render_start, render_end;
     double total_decode_time = 0, total_render_time = 0;
     int diagnostic_frame_count = 0;
+    
+    // Add a timer to ensure we print timing data periodically regardless of frame counts
+    struct timespec last_timing_report;
+    clock_gettime(CLOCK_MONOTONIC, &last_timing_report);
+    
+    // Initialize timing metrics display
+    if (app->show_timing) {
+        printf("\n[TIMING] Timing display is enabled. Will show metrics every 30 frames.\n");
+        printf("[TIMING] Video FPS: %.2f, Target frame time: %.3fms\n", 
+               app->video->fps, target_frame_time * 1000);
+        printf("[TIMING] Hardware decode: %s, Resolution: %dx%d\n", 
+               video_is_hardware_decoded(app->video) ? "YES" : "NO",
+               app->video->width, app->video->height);
+               
+        // Start a background timer to ensure timing info is displayed
+        // regardless of frame decode success
+        printf("[TIMING] Starting timing display timer\n");
+        
+        // Write directly to a file as a backup method for timing data
+        FILE *timing_log = fopen("timing_log.txt", "w");
+        if (timing_log) {
+            fprintf(timing_log, "Pickle timing log started\n");
+            fprintf(timing_log, "Video FPS: %.2f, Target frame time: %.3fms\n", 
+                   app->video->fps, target_frame_time * 1000);
+            fprintf(timing_log, "Hardware decode: %s, Resolution: %dx%d\n", 
+                   video_is_hardware_decoded(app->video) ? "YES" : "NO",
+                   app->video->width, app->video->height);
+            fclose(timing_log);
+        }
+        fflush(stdout);
+    }
 
     // Main loop starting
     double startup_time = (double)last_time.tv_sec + last_time.tv_nsec / 1e9;
@@ -338,19 +396,38 @@ void app_run(app_context_t *app) {
                         printf("First frame decoded successfully\n");
                         fflush(stdout);
                     }
-                    video_data = video_get_rgb_data(app->video);
-                    last_video_data = video_data;
-                    frame_count++;
                     
-                    // Update diagnostics
-                    total_decode_time += decode_time;
-                    diagnostic_frame_count++;
+                    // Get YUV data since RGB is deprecated
+                    uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                    int y_stride = 0, u_stride = 0, v_stride = 0;
+                    video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                    
+                    // Check if we actually have frame data
+                    if (y_data != NULL) {
+                        video_data = y_data; // Just use Y plane for tracking if we have data
+                        last_video_data = video_data;
+                        frame_count++;
+                        
+                        // Update diagnostics
+                        total_decode_time += decode_time;
+                        diagnostic_frame_count++;
+                        
+                        // Force timing output on regular intervals regardless of frame count
+                        if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
+                            printf("DEBUG: Frame %d decoded (%.1fms), diagnostic_frame_count=%d\n", 
+                                   frame_count, decode_time * 1000, diagnostic_frame_count);
+                            fflush(stdout);
+                        }
+                    } else {
+                        printf("WARNING: Frame %d returned NULL Y-plane data\n", frame_count);
+                        fflush(stdout);
+                    }
                     
                     // Show diagnostic info periodically
-                    if (app->show_timing && diagnostic_frame_count % 60 == 0) {
+                    if (app->show_timing && diagnostic_frame_count % 30 == 0) {
                         double avg_decode_time = total_decode_time / diagnostic_frame_count;
-                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms\n",
-                               avg_decode_time * 1000, target_frame_time * 1000);
+                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms, Frame count: %d\n",
+                               avg_decode_time * 1000, target_frame_time * 1000, diagnostic_frame_count);
                         fflush(stdout);
                     }
                     
@@ -510,13 +587,42 @@ void app_run(app_context_t *app) {
                              (overlay_end.tv_nsec - overlay_start.tv_nsec) / 1e9;
         double swap_time = (swap_end.tv_sec - swap_start.tv_sec) + 
                           (swap_end.tv_nsec - swap_start.tv_nsec) / 1e9;
+                          
+        // Check if we should do a time-based timing report (every 2 seconds)
+        if (app->show_timing) {
+            struct timespec current_report_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_report_time);
+            double time_since_report = (current_report_time.tv_sec - last_timing_report.tv_sec) + 
+                                      (current_report_time.tv_nsec - last_timing_report.tv_nsec) / 1e9;
+                                      
+            if (time_since_report >= 2.0) {  // Every 2 seconds
+                printf("\n[TIME-BASED] Frames decoded: %d, Diagnostic frames: %d\n",
+                       frame_count, diagnostic_frame_count);
+                printf("[TIME-BASED] Last decode: %.1fms, Last render: %.1fms, Swap: %.1fms\n",
+                       decode_time * 1000, render_time * 1000, swap_time * 1000);
+                       
+                // Log to file as well
+                FILE *timing_log = fopen("timing_log.txt", "a");
+                if (timing_log) {
+                    fprintf(timing_log, "[%d] Frames: %d, Decode: %.1fms, Render: %.1fms\n",
+                           (int)current_report_time.tv_sec, frame_count, 
+                           decode_time * 1000, render_time * 1000);
+                    fclose(timing_log);
+                }
+                
+                // Reset the timer
+                last_timing_report = current_report_time;
+                fflush(stdout);
+            }
+        }
         
         // Report detailed timing for long frames
         if (app->show_timing) {
             static int detailed_timing_count = 0;
-            if (swap_time > 0.050 || (detailed_timing_count++ % 120 == 0)) { // Every 2 seconds or if swap > 50ms
+            if (swap_time > 0.050 || (detailed_timing_count++ % 60 == 0)) { // Every second or if swap > 50ms
                 printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
                        gl_time * 1000, overlay_time * 1000, swap_time * 1000);
+                fflush(stdout);
             }
         }
         render_time = (render_end.tv_sec - render_start.tv_sec) +
@@ -539,10 +645,10 @@ void app_run(app_context_t *app) {
             nanosleep(&sleep_time, NULL);
             
             // Show render diagnostics periodically
-            if (app->show_timing && diagnostic_frame_count % 60 == 0 && diagnostic_frame_count > 0) {
+            if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0) {
                 double avg_render_time = total_render_time / diagnostic_frame_count;
-                printf("Render timing - Avg render: %.1fms, Total frame: %.1fms\n",
-                       avg_render_time * 1000, total_frame_time * 1000);
+                printf("Render timing - Avg render: %.1fms, Total frame: %.1fms, Frames: %d\n",
+                       avg_render_time * 1000, total_frame_time * 1000, diagnostic_frame_count);
                 fflush(stdout);
             }
         } else {
@@ -550,6 +656,7 @@ void app_run(app_context_t *app) {
             if (app->show_timing) {
                 printf("Frame overrun: %.1fms (target: %.1fms)\n", 
                        total_frame_time * 1000, adaptive_frame_time * 1000);
+                fflush(stdout);
             }
             
             // FIXED: Only increase timing slightly if consistently overrunning
