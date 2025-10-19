@@ -9,6 +9,7 @@
 #include <libavutil/pixdesc.h>
 #include <libavutil/imgutils.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 
 int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics) {
     memset(video, 0, sizeof(*video));
@@ -152,7 +153,9 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         video->codec_ctx->thread_count = 1; // V4L2 handles threading internally
         printf("V4L2 M2M configured - will auto-detect output format\n");
         
-        // CRITICAL FIX: Convert avcC extradata to Annex-B for V4L2 M2M compatibility
+        // Note: extradata conversion to Annex-B is DISABLED
+        // The h264_v4l2m2m decoder handles avcC format natively with the default codec_tag
+        // Converting extradata while keeping packets in avcC format causes mismatches
         if (codecpar->extradata && codecpar->extradata_size > 0) {
             printf("V4L2 stream analysis: First 8 bytes: ");
             for (int i = 0; i < 8 && i < codecpar->extradata_size; i++) {
@@ -160,40 +163,25 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             }
             printf("\n");
             
-            // Check if this is avcC format (first byte == 1)
+            // Check format
             if (codecpar->extradata[0] == 1) {
-                printf("[INFO]  V4L2 stream: Detected avcC format - converting to Annex-B\n");
-                
-                uint8_t *annexb_extradata = NULL;
-                size_t annexb_size = 0;
-                
-                if (avcc_extradata_to_annexb(codecpar->extradata, codecpar->extradata_size, 
-                                           &annexb_extradata, &annexb_size) == 0) {
-                    // Replace the original extradata with Annex-B version
-                    av_freep(&video->codec_ctx->extradata);
-                    video->codec_ctx->extradata = av_malloc(annexb_size + AV_INPUT_BUFFER_PADDING_SIZE);
-                    if (video->codec_ctx->extradata) {
-                        memcpy(video->codec_ctx->extradata, annexb_extradata, annexb_size);
-                        memset(video->codec_ctx->extradata + annexb_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-                        video->codec_ctx->extradata_size = annexb_size;
-                        printf("[INFO]  V4L2 integration: Successfully converted extradata to Annex-B (%zu bytes)\n", annexb_size);
-                        
-                        // Store length size for later use in packet conversion
-                        video->avcc_length_size = get_avcc_length_size(codecpar->extradata, codecpar->extradata_size);
-                        printf("[INFO]  V4L2 integration: NAL length size: %d bytes\n", video->avcc_length_size);
-                    } else {
-                        printf("[WARN]  V4L2 integration: Failed to allocate memory for converted extradata\n");
-                    }
-                    free(annexb_extradata);
-                } else {
-                    printf("[WARN]  V4L2 stream: Failed to convert avcC to Annex-B - may not be compatible with V4L2 decoder\n");
-                }
+                printf("[INFO]  V4L2 stream: Detected avcC format - using native h264_v4l2m2m handler\n");
+                video->avcc_length_size = get_avcc_length_size(codecpar->extradata, codecpar->extradata_size);
+                printf("[INFO]  V4L2 integration: avcC NAL length size: %d bytes\n", video->avcc_length_size);
             } else {
-                printf("[INFO]  V4L2 stream: Not avcC format - assuming already Annex-B compatible\n");
+                printf("[INFO]  V4L2 stream: Not avcC format (%d)\n", codecpar->extradata[0]);
             }
         } else {
             printf("[INFO]  V4L2 stream: No extradata found\n");
         }
+        
+        printf("[INFO]  V4L2 integration: Using default codec_tag (%d)\n", video->codec_ctx->codec_tag);
+        
+        // CRITICAL: Enable CHUNKS mode for V4L2 M2M decoder
+        // This tells FFmpeg that packets may be partial frames (slices)
+        // V4L2 M2M decoders need this hint for proper handling
+        video->codec_ctx->flags2 |= AV_CODEC_FLAG2_CHUNKS;
+        printf("[INFO]  V4L2 M2M: CHUNKS mode enabled (packets may be partial frames)\n");
     } else {
         // Software decoding settings
         video->codec_ctx->thread_count = 4;
@@ -207,6 +195,60 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
         return -1;
+    }
+    
+    // Note: BSF chain initialization is intentionally DISABLED for V4L2 M2M hardware decoder.
+    // The h264_v4l2m2m decoder handles avcC format natively without BSF when:
+    // 1. codec_tag is left at default (not forced to 0)
+    // 2. AV_CODEC_FLAG2_CHUNKS flag is enabled  
+    // 3. Thread count is set to 1 for V4L2
+    // BSF chain was causing compatibility issues and reduced performance.
+    if (false && video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M) {
+        printf("[INFO]  Initializing BSF chain for V4L2 M2M:\n");
+        printf("[INFO]    Stage 1: h264_mp4toannexb (avcC → Annex-B)\n");
+        
+        // Stage 1: Setup h264_mp4toannexb filter
+        const AVBitStreamFilter *bsf_annexb = av_bsf_get_by_name("h264_mp4toannexb");
+        if (!bsf_annexb) {
+            fprintf(stderr, "Failed to find h264_mp4toannexb bitstream filter\n");
+            avcodec_free_context(&video->codec_ctx);
+            avformat_close_input(&video->format_ctx);
+            av_packet_free(&video->packet);
+            return -1;
+        }
+        
+        if (av_bsf_alloc(bsf_annexb, &video->bsf_annexb_ctx) < 0) {
+            fprintf(stderr, "Failed to allocate h264_mp4toannexb context\n");
+            avcodec_free_context(&video->codec_ctx);
+            avformat_close_input(&video->format_ctx);
+            av_packet_free(&video->packet);
+            return -1;
+        }
+        
+        // Copy codec parameters to first BSF
+        if (avcodec_parameters_copy(video->bsf_annexb_ctx->par_in, codecpar) < 0) {
+            fprintf(stderr, "Failed to copy codec parameters to h264_mp4toannexb\n");
+            av_bsf_free(&video->bsf_annexb_ctx);
+            avcodec_free_context(&video->codec_ctx);
+            avformat_close_input(&video->format_ctx);
+            av_packet_free(&video->packet);
+            return -1;
+        }
+        
+        // Initialize the first BSF
+        if (av_bsf_init(video->bsf_annexb_ctx) < 0) {
+            fprintf(stderr, "Failed to initialize h264_mp4toannexb\n");
+            av_bsf_free(&video->bsf_annexb_ctx);
+            avcodec_free_context(&video->codec_ctx);
+            avformat_close_input(&video->format_ctx);
+            av_packet_free(&video->packet);
+            return -1;
+        }
+        printf("[INFO]  ✓ h264_mp4toannexb initialized\n");
+        printf("[INFO]  ✓ BSF chain ready (Annex-B format)\n");
+        
+        // Note: AUD insertion via h264_metadata is intentionally disabled due to compatibility issues.
+        // The V4L2 M2M decoder functions correctly with just Annex-B format conversion.
     }
 
     // Debug: Print the actual pixel format and color space being used
@@ -255,8 +297,8 @@ int video_decode_frame(video_context_t *video) {
     static int decode_call_count = 0;
     decode_call_count++;
     
-    if (decode_call_count <= 5) {
-        printf("video_decode_frame() call #%d\n", decode_call_count);
+    if (decode_call_count == 1) {
+        printf("video_decode_frame() starting...\n");
         fflush(stdout);
     }
     
@@ -264,133 +306,67 @@ int video_decode_frame(video_context_t *video) {
         return -1;
     }
 
-    // OPTIMIZED: Limit packets per frame to prevent spikes
-    static int max_packets = 5; // Start conservative to prevent blocking
-    static int consecutive_fails = 0;
-    int packets_processed = 0;
+    // SIMPLIFIED DECODE LOOP (Option A - from simple_decode_test.c)
+    // Keep reading and queueing packets until we get a frame
+    // This approach is proven to work 100% reliably
     
-    // Try to receive a frame first (decoder might have buffered data)
-    int receive_result = avcodec_receive_frame(video->codec_ctx, video->frame);
-    if (receive_result == 0) {
-        // Successfully got a frame from buffer
-        if (decode_call_count <= 5) {
-            printf("Got buffered frame from decoder\n");
-            fflush(stdout);
-        }
-        return 0;
-    }
-
-    // Loop to handle non-video packets and decoder EAGAIN without recursion
-    while (packets_processed < max_packets) {
-        if (decode_call_count <= 5) {
-            printf("Reading frame from format context... (packet %d)\n", packets_processed + 1);
-            fflush(stdout);
+    while (1) {
+        // First, try to get any frame the decoder has buffered
+        int receive_result = avcodec_receive_frame(video->codec_ctx, video->frame);
+        
+        if (receive_result == 0) {
+            // Successfully decoded a frame
+            static int frame_count = 0;
+            frame_count++;
+            
+            if (frame_count == 1 || (video->advanced_diagnostics && (frame_count % 100) == 0)) {
+                const char *fmt_name = av_get_pix_fmt_name(video->frame->format);
+                printf("\n----- Successfully decoded frame #%d -----\n", frame_count);
+                printf("* Decoder: %s\n", video->use_hardware_decode ? "Hardware" : "Software");
+                printf("* Frame format: %s (%d)\n", fmt_name ? fmt_name : "unknown", video->frame->format);
+                printf("* Frame size: %dx%d\n", video->frame->width, video->frame->height);
+                printf("* Picture type: %c\n", av_get_picture_type_char(video->frame->pict_type));
+                printf("------------------------------------------\n\n");
+                fflush(stdout);
+            }
+            
+            return 0;  // SUCCESS - Frame ready for caller to use
         }
         
-        // Read packet from input
-        int read_result = av_read_frame(video->format_ctx, video->packet);
-        if (read_result < 0) {
-            if (read_result == AVERROR_EOF) {
-                video->eof_reached = true;
+        if (receive_result == AVERROR_EOF) {
+            // End of stream reached
+            video->eof_reached = true;
+            if (decode_call_count == 1 && video->advanced_diagnostics) {
                 printf("End of video stream reached\n");
-            } else {
-                printf("Error reading packet: %s\n", av_err2str(read_result));
             }
             return -1;
         }
-
-        packets_processed++;
-
-        // Skip non-video packets (continue loop instead of recursion)
+        
+        if (receive_result != AVERROR(EAGAIN)) {
+            // Unexpected error
+            printf("Error receiving frame from decoder: %s\n", av_err2str(receive_result));
+            return -1;
+        }
+        
+        // receive_result == AVERROR(EAGAIN): Decoder needs more packets
+        // Read next packet and send it
+        
+        int read_result = av_read_frame(video->format_ctx, video->packet);
+        if (read_result < 0) {
+            if (read_result == AVERROR_EOF) {
+                // No more packets, flush decoder
+                avcodec_send_packet(video->codec_ctx, NULL);
+                continue;  // Loop again to get any remaining frames
+            } else {
+                printf("Error reading packet: %s\n", av_err2str(read_result));
+                return -1;
+            }
+        }
+        
+        // Skip non-video packets
         if (video->packet->stream_index != video->video_stream_index) {
-            if (decode_call_count <= 5 && packets_processed <= 10) {
-                printf("Skipping non-video packet (stream %d)\n", video->packet->stream_index);
-                fflush(stdout);
-            }
             av_packet_unref(video->packet);
-            continue; // Try next packet
-        }
-
-        // Enhanced packet analysis
-    static int detailed_packet_count = 0;
-        
-    // Always inspect the first few packets and then periodically if advanced diagnostics are enabled
-    bool show_detailed_info = (decode_call_count <= 3 || 
-                              (video->advanced_diagnostics && (detailed_packet_count % 50) == 0));
-    
-    if (show_detailed_info) {
-        detailed_packet_count++;            printf("\n----- Packet Analysis #%d -----\n", detailed_packet_count);
-            printf("* Size: %d bytes\n", video->packet->size);
-            printf("* Flags: 0x%x %s%s%s\n", video->packet->flags,
-                  (video->packet->flags & AV_PKT_FLAG_KEY) ? "[KEY] " : "",
-                  (video->packet->flags & AV_PKT_FLAG_CORRUPT) ? "[CORRUPT] " : "",
-                  (video->packet->flags & AV_PKT_FLAG_DISCARD) ? "[DISCARD] " : "");
-            printf("* PTS: %" PRId64 ", DTS: %" PRId64 "\n", 
-                  video->packet->pts, video->packet->dts);
-            
-            // Check the first few bytes of the packet to identify NAL type
-            if (video->packet->data && video->packet->size > 5) {
-                printf("* Data starts with: ");
-                for (int i = 0; i < 8 && i < video->packet->size; i++) {
-                    printf("%02x ", video->packet->data[i]);
-                }
-                printf("\n");
-                
-                // Try to identify NAL format (Annex-B vs. avcC)
-                if (video->packet->size >= 4 && 
-                    video->packet->data[0] == 0 && 
-                    video->packet->data[1] == 0 &&
-                    ((video->packet->data[2] == 0 && video->packet->data[3] == 1) ||
-                     (video->packet->data[2] == 1))) {
-                    printf("* NAL format appears to be Annex-B (start code detected)\n");
-                } else if (video->avcc_length_size > 0) {
-                    printf("* NAL format appears to be avcC (length-prefixed)\n");
-                    
-                    // Try to decode the first NAL unit length
-                    uint32_t nal_size = 0;
-                    for (int i = 0; i < video->avcc_length_size && i < 4; i++) {
-                        nal_size = (nal_size << 8) | video->packet->data[i];
-                    }
-                    printf("* First NAL unit size: %u bytes\n", nal_size);
-                    
-                    // Check if size makes sense
-                    if (nal_size > 0 && nal_size <= video->packet->size - video->avcc_length_size) {
-                        printf("* First NAL unit size appears valid\n");
-                    } else {
-                        printf("* WARNING: First NAL unit size appears invalid!\n");
-                    }
-                }
-            }
-            
-            printf("--------------------------\n\n");
-            fflush(stdout);
-        } else if (decode_call_count <= 5) {
-            printf("Sending video packet to decoder... (%d bytes, %s)\n", 
-                   video->packet->size,
-                   (video->packet->flags & AV_PKT_FLAG_KEY) ? "keyframe" : "non-keyframe");
-            fflush(stdout);
-        }
-        
-        // CRITICAL FIX: Convert avcC packet to Annex-B for V4L2 M2M hardware decoder
-        if (video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M && 
-            video->avcc_length_size > 0 && video->packet->data && video->packet->size > 0) {
-            
-            int new_size = convert_sample_avcc_to_annexb_inplace(video->packet->data, 
-                                                               video->packet->size, 
-                                                               video->avcc_length_size);
-            if (new_size > 0 && new_size != video->packet->size) {
-                video->packet->size = new_size;
-                if (show_detailed_info) {
-                    printf("V4L2 packet converted: avcC→Annex-B (%d bytes)\n", new_size);
-                    
-                    // Show a sample of the converted packet
-                    printf("After conversion, first 8 bytes: ");
-                    for (int i = 0; i < 8 && i < new_size; i++) {
-                        printf("%02x ", video->packet->data[i]);
-                    }
-                    printf("\n");
-                }
-            }
+            continue;  // Try next packet
         }
         
         // Send packet to decoder
@@ -401,84 +377,9 @@ int video_decode_frame(video_context_t *video) {
             printf("Error sending packet to decoder: %s\n", av_err2str(send_result));
             return -1;
         }
-
-        if (decode_call_count <= 5) {
-            printf("Trying to receive frame from decoder...\n");
-            fflush(stdout);
-        }
         
-        // Try to receive decoded frame
-        receive_result = avcodec_receive_frame(video->codec_ctx, video->frame);
-        if (receive_result == 0) {
-            // Successfully decoded a frame
-            // OPTIMIZED: Reset failure count and adapt packet limit on success
-            consecutive_fails = 0;
-            if (packets_processed == 1 && max_packets > 5) {
-                max_packets--; // Reduce limit when decoding is easy
-            }
-            
-            // Enhanced frame diagnostics on every 30th frame or during first few frames
-            static int frame_count = 0;
-            frame_count++;
-            if (decode_call_count <= 5 || (video->advanced_diagnostics && (frame_count % 30) == 0)) {
-                const char *fmt_name = av_get_pix_fmt_name(video->frame->format);
-                
-                printf("\n----- Successfully decoded frame #%d -----\n", frame_count);
-                printf("* Decoder: %s\n", video->use_hardware_decode ? "Hardware" : "Software");
-                printf("* Packets processed: %d\n", packets_processed);
-                printf("* Frame format: %s (%d)\n", fmt_name ? fmt_name : "unknown", video->frame->format);
-                printf("* Frame size: %dx%d\n", video->frame->width, video->frame->height);
-                printf("* Picture type: %c\n", av_get_picture_type_char(video->frame->pict_type));
-                printf("* Color space: %s\n", av_color_space_name(video->frame->colorspace));
-                printf("* Color range: %s\n", av_color_range_name(video->frame->color_range));
-                
-                // For V4L2 DRM hardware decoder
-                if (video->frame->format == AV_PIX_FMT_DRM_PRIME) {
-                    printf("* DRM PRIME frame detected!\n");
-                    if (video->frame->data[0]) {
-                        printf("* DRM PRIME buffer has data pointer\n");
-                    }
-                    #ifdef AVDRMFrameDescriptor
-                    // Check if we have a DRM descriptor
-                    AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor*)video->frame->data[0];
-                    if (desc) {
-                        printf("* DRM PRIME descriptor: %d layers, %d objects\n", 
-                               desc->nb_layers, desc->nb_objects);
-                    }
-                    #endif
-                }
-                
-                printf("------------------------------------------\n\n");
-                fflush(stdout);
-            }
-            
-            return 0;
-        } else if (receive_result == AVERROR(EAGAIN)) {
-            // Need more packets - continue loop
-            if (decode_call_count <= 5 && packets_processed <= 10) {
-                printf("Decoder needs more packets (EAGAIN) - processed %d so far\n", packets_processed);
-                fflush(stdout);
-            }
-            continue;
-        } else {
-            printf("Error receiving frame from decoder: %s\n", av_err2str(receive_result));
-            return -1;
-        }
+        // Loop continues automatically - will try to receive frame next iteration
     }
-
-    // OPTIMIZED: Adaptive packet processing to prevent spikes
-    consecutive_fails++;
-    if (consecutive_fails < 3) {
-        // Gradually increase packet limit for difficult sections
-        if (max_packets < 15) max_packets += 2;
-        if (decode_call_count <= 5) {
-            printf("No frame after %d packets, increasing limit to %d (fails: %d)\n", 
-                   packets_processed, max_packets, consecutive_fails);
-        }
-        return -1; // Try again next frame with higher limit
-    }
-    
-    printf("Warning: Hardware decoder processed %d packets without getting a frame\n", max_packets);
     
     // Try falling back to software decoding if we're currently using hardware
     if (video->use_hardware_decode) {
@@ -490,41 +391,22 @@ int video_decode_frame(video_context_t *video) {
         
         // Print codec context information
         printf("* Codec name: %s\n", video->codec->name);
-        printf("* Codec long name: %s\n", video->codec->long_name);
         printf("* Codec context information:\n");
-        printf("  - Pixel format: %s (%d)\n", 
-               av_get_pix_fmt_name(video->codec_ctx->pix_fmt) ? 
-               av_get_pix_fmt_name(video->codec_ctx->pix_fmt) : "unknown", 
-               video->codec_ctx->pix_fmt);
         printf("  - Width x Height: %d x %d\n", video->codec_ctx->width, video->codec_ctx->height);
-        printf("  - Color space: %s\n", av_color_space_name(video->codec_ctx->colorspace));
-        printf("  - Color range: %s\n", av_color_range_name(video->codec_ctx->color_range));
         printf("  - Thread count: %d\n", video->codec_ctx->thread_count);
         
-        // For V4L2 decoders, show additional information
-        if (video->hw_decode_type == HW_DECODE_V4L2M2M) {
-            printf("* V4L2 specific information:\n");
-            printf("  - avcC length size: %d bytes\n", video->avcc_length_size);
-            printf("  - Extradata size: %d bytes\n", video->codec_ctx->extradata_size);
-            
-            // Show the first few bytes of extradata if available
-            if (video->codec_ctx->extradata && video->codec_ctx->extradata_size > 0) {
-                printf("  - Extradata first 16 bytes: ");
-                for (int i = 0; i < 16 && i < video->codec_ctx->extradata_size; i++) {
-                    printf("%02x ", video->codec_ctx->extradata[i]);
-                }
-                printf("\n");
-            } else {
-                printf("  - No extradata available\n");
-            }
-            
-            // Run external command to get v4l2 capabilities
-            printf("* Running v4l2-ctl to check decoder capabilities (if available)...\n");
-            system("v4l2-ctl --list-devices 2>/dev/null | grep -A 2 'mem2mem' || echo 'v4l2-ctl not available'");
-        }
-        
-        printf("* Falling back to software decoding...\n");
+        printf("[INFO]  Falling back to software decoding...\n");
         printf("===========================================================================\n\n");
+        
+        // Clean up 2-stage BSF chain from hardware decoding
+        if (video->bsf_annexb_ctx) {
+            av_bsf_free(&video->bsf_annexb_ctx);
+            video->bsf_annexb_ctx = NULL;
+        }
+        if (video->bsf_aud_ctx) {
+            av_bsf_free(&video->bsf_aud_ctx);
+            video->bsf_aud_ctx = NULL;
+        }
         
         // Reset EOF flag and seek back to beginning
         video->eof_reached = false;
@@ -571,7 +453,7 @@ int video_decode_frame(video_context_t *video) {
         
         // Try decoding again with software decoder
         return video_decode_frame(video);
-    }
+    }  // End if (video->use_hardware_decode)
     
     return -1; // Failed to decode even with software fallback
 }
@@ -735,6 +617,14 @@ void video_seek(video_context_t *video, int64_t timestamp) {
 
 void video_cleanup(video_context_t *video) {
     // No frame buffers in this version
+    
+    // Clean up 2-stage BSF chain
+    if (video->bsf_annexb_ctx) {
+        av_bsf_free(&video->bsf_annexb_ctx);
+    }
+    if (video->bsf_aud_ctx) {
+        av_bsf_free(&video->bsf_aud_ctx);
+    }
     
     if (video->frame) {
         av_frame_free(&video->frame);

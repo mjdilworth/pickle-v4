@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
@@ -38,6 +39,10 @@ typedef struct {
     bool loop_playback;
     bool using_drm_prime;
     bool advanced_diagnostics; // Flag for detailed diagnostics output
+    
+    // 2-stage Bitstream filter chain for V4L2 M2M: avcC→Annex-B + AUD insertion
+    AVBSFContext *bsf_annexb_ctx;    // Stage 1: h264_mp4toannexb (avcC to Annex-B conversion)
+    AVBSFContext *bsf_aud_ctx;       // Stage 2: h264_metadata (AUD insertion)
 } video_context_t;
 
 // Video decoder functions
