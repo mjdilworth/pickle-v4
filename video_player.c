@@ -72,22 +72,20 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     return true;
 }
 
-int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
+int app_init(app_context_t *app, const char *video_file, bool loop_playback, 
+            bool show_timing, bool debug_gamepad, bool advanced_diagnostics) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
     
-    // Save important flags before clearing
-    bool show_timing = app->show_timing;
-    bool debug_gamepad = app->debug_gamepad;
-    
     memset(app, 0, sizeof(*app));
     
-    // Restore flags
+    // Set all flags
     app->video_file = video_file;
     app->running = true;
     app->loop_playback = loop_playback;
     app->show_timing = show_timing;
     app->debug_gamepad = debug_gamepad;
+    app->advanced_diagnostics = advanced_diagnostics;
 
     // Allocate contexts
     app->drm = calloc(1, sizeof(display_ctx_t));
@@ -120,7 +118,7 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
     }
 
     // Initialize video decoder
-    if (video_init(app->video, video_file) != 0) {
+    if (video_init(app->video, video_file, app->advanced_diagnostics) != 0) {
         fprintf(stderr, "Failed to initialize video decoder\n");
         app_cleanup(app);
         return -1;

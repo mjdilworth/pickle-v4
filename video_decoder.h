@@ -20,47 +20,28 @@ typedef enum {
 
 typedef struct {
     AVFormatContext *format_ctx;
+    AVCodec *codec;
     AVCodecContext *codec_ctx;
-    const AVCodec *codec;
-    AVFrame *frame;
-    AVFrame *hw_frame;        // For hardware decoded frames
     AVPacket *packet;
-    struct SwsContext *sws_ctx; // Fallback only
-    
+    AVFrame *frame;
     int video_stream_index;
-    uint32_t width;
-    uint32_t height;
+    int width;
+    int height;
     double fps;
     int64_t duration;
     
-    // Hardware decoding support
+    bool initialized;
     bool use_hardware_decode;
     hw_decode_type_t hw_decode_type;
-    enum AVPixelFormat hw_pix_fmt;
-    AVBufferRef *hw_device_ctx;
-    
-    // avcC to Annex-B conversion support
-    int avcc_length_size;       // NAL length size (1-4 bytes) for packet conversion
-    
-    // Frame buffering for smooth playback
-    #define MAX_BUFFERED_FRAMES 4
-    AVFrame *frame_buffer[MAX_BUFFERED_FRAMES];
-    int buffer_write_index;
-    int buffer_read_index;
-    int buffered_frame_count;
-    pthread_mutex_t buffer_mutex;
-    
-    // YUV output (no RGB conversion)
-    uint8_t *y_data, *u_data, *v_data;
-    int y_linesize, u_linesize, v_linesize;
-    
-    bool initialized;
+    int avcc_length_size; // For V4L2 M2M hardware decoder
     bool eof_reached;
-    bool loop_playback;         // Flag to enable looped playback
+    bool loop_playback;
+    bool using_drm_prime;
+    bool advanced_diagnostics; // Flag for detailed diagnostics output
 } video_context_t;
 
 // Video decoder functions
-int video_init(video_context_t *video, const char *filename);
+int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics);
 void video_cleanup(video_context_t *video);
 int video_decode_frame(video_context_t *video);
 uint8_t* video_get_rgb_data(video_context_t *video);  // Legacy - for fallback

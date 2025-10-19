@@ -2,6 +2,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+
+// Declare popen and pclose if not included
+#ifndef _POSIX_C_SOURCE
+FILE *popen(const char *command, const char *type);
+int pclose(FILE *stream);
+#endif
 
 // Convert avcC extradata to Annex-B (SPS/PPS with 0x00000001 prefixes)
 int avcc_extradata_to_annexb(const uint8_t *avcc, size_t avcc_len,
@@ -172,4 +179,89 @@ int get_avcc_length_size(const uint8_t *avcc, size_t avcc_len)
     }
     
     return (avcc[4] & 0x03) + 1;
+}
+
+// Check and print V4L2 hardware decoder capabilities
+int check_v4l2_decoder_capabilities(void) 
+{
+    FILE *fp;
+    char path[1024];
+    char line[1024];
+    int found_decoder = 0;
+    
+    printf("\n===== V4L2 Hardware Decoder Capabilities =====\n");
+    
+    // Run v4l2-ctl to get device list
+    fp = popen("v4l2-ctl --list-devices 2>/dev/null", "r");
+    if (!fp) {
+        printf("Failed to run v4l2-ctl. Make sure it's installed.\n");
+        return -1;
+    }
+    
+    // Look for mem2mem devices (potentially hardware decoders)
+    bool in_mem2mem = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "mem2mem") || strstr(line, "stateless") || strstr(line, "codec")) {
+            in_mem2mem = true;
+            printf("Potential hardware codec found: %s", line);
+        } else if (in_mem2mem && line[0] == '\t') {
+            // This is a device path under a mem2mem device
+            char *device_path = line;
+            while (*device_path == '\t' || *device_path == ' ') {
+                device_path++;
+            }
+            
+            // Remove trailing newline
+            size_t len = strlen(device_path);
+            if (len > 0 && device_path[len-1] == '\n') {
+                device_path[len-1] = '\0';
+            }
+            
+            printf("Device path: %s\n", device_path);
+            
+            // Save path for further inspection
+            snprintf(path, sizeof(path), "%s", device_path);
+        } else {
+            in_mem2mem = false;
+        }
+    }
+    pclose(fp);
+    
+    // Check capabilities of identified devices
+    if (strlen(path) > 0) {
+        char cmd[1500];
+        
+        // Check for codec capabilities
+        snprintf(cmd, sizeof(cmd), "v4l2-ctl --device=%s --list-formats 2>/dev/null", path);
+        printf("\nChecking codec capabilities for %s:\n", path);
+        fp = popen(cmd, "r");
+        if (fp) {
+            while (fgets(line, sizeof(line), fp)) {
+                printf("%s", line);
+                if (strstr(line, "H264") || strstr(line, "h264")) {
+                    found_decoder = 1;
+                }
+            }
+            pclose(fp);
+        }
+        
+        // Check for m2m capabilities
+        snprintf(cmd, sizeof(cmd), "v4l2-ctl --device=%s --all 2>/dev/null | grep -i -e caps -e flags -e codec -e h264 -e hevc", path);
+        printf("\nAdditional codec details:\n");
+        system(cmd);
+    } else {
+        printf("No V4L2 hardware decoder devices found\n");
+    }
+    
+    // Additional diagnostics for V4L2 hardware acceleration
+    printf("\nFFmpeg hardware acceleration support:\n");
+    system("ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -i v4l2 || echo 'No V4L2 hardware acceleration in FFmpeg'");
+    
+    // Check for available V4L2 codecs in FFmpeg
+    printf("\nFFmpeg V4L2 codecs:\n");
+    system("ffmpeg -hide_banner -encoders 2>/dev/null | grep -i v4l2");
+    system("ffmpeg -hide_banner -decoders 2>/dev/null | grep -i v4l2");
+    
+    printf("===============================================\n\n");
+    return found_decoder;
 }

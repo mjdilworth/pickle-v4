@@ -53,6 +53,7 @@ int main(int argc, char *argv[]) {
     bool loop_playback = false;
     bool show_timing = false;
     bool debug_gamepad = false;
+    bool advanced_diagnostics = false;
     char *video_file = NULL;
     
     // Parse command line arguments
@@ -63,12 +64,16 @@ int main(int argc, char *argv[]) {
             show_timing = true;
         } else if (strcmp(argv[i], "--debug-gamepad") == 0) {
             debug_gamepad = true;
+        } else if (strcmp(argv[i], "--hw-debug") == 0) {
+            advanced_diagnostics = true;
+            printf("Advanced hardware decoder diagnostics enabled\n");
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
             fprintf(stderr, "\nOptions:\n");
             fprintf(stderr, "  -l               Loop video playback\n");
             fprintf(stderr, "  --timing         Show frame timing information\n");
             fprintf(stderr, "  --debug-gamepad  Log gamepad button presses\n");
+            fprintf(stderr, "  --hw-debug       Enable detailed hardware decoder diagnostics\n");
             fprintf(stderr, "  -h, --help       Show this help message\n");
             fprintf(stderr, "\nKeyboard Controls:\n");
             fprintf(stderr, "  q/ESC    Quit\n");
@@ -109,8 +114,6 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
     
     app_context_t app = {0};
-    app.show_timing = show_timing;
-    app.debug_gamepad = debug_gamepad;
     g_app = &app;  // Set global reference for signal handlers
     
     printf("Setting up signal handlers...\n");
@@ -120,7 +123,7 @@ int main(int argc, char *argv[]) {
     setup_signal_handlers();
     
     // Initialize and run the video player
-    if (app_init(&app, video_file, loop_playback) != 0) {
+    if (app_init(&app, video_file, loop_playback, show_timing, debug_gamepad, advanced_diagnostics) != 0) {
         fprintf(stderr, "Failed to initialize application\n");
         g_app = NULL;  // Clear global reference
         return 1;
