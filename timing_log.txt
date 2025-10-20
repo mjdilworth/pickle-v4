@@ -1,8 +1,10 @@
 Pickle timing log started
 Video FPS: 59.94, Target frame time: 16.683ms
 Hardware decode: YES, Resolution: 1920x1080
-[265780] Frames: 102, Decode: 0.3ms, Render: 0.0ms
-[265782] Frames: 215, Decode: 0.3ms, Render: 0.0ms
-[265784] Frames: 327, Decode: 0.2ms, Render: 0.0ms
-[265786] Frames: 440, Decode: 0.2ms, Render: 0.0ms
-[265788] Frames: 552, Decode: 0.2ms, Render: 0.0ms
+[32236] Frames: 24, Decode: 0.2ms, Render: 0.0ms
+[32238] Frames: 51, Decode: 0.3ms, Render: 0.0ms
+[32240] Frames: 77, Decode: 0.3ms, Render: 0.0ms
+[32243] Frames: 108, Decode: 20.5ms, Render: 0.0ms
+[32245] Frames: 142, Decode: 0.2ms, Render: 0.0ms
+[32247] Frames: 175, Decode: 0.2ms, Render: 0.0ms
+[32249] Frames: 211, Decode: 0.1ms, Render: 0.0ms
