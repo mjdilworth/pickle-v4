@@ -510,7 +510,7 @@ void app_run(app_context_t *app) {
         }
 
         // Get video dimensions
-        int video_width, video_height;
+        int video_width = 0, video_height = 0;
         video_get_dimensions(app->video, &video_width, &video_height);
         if (video_width == 0) {
             video_width = 256;
