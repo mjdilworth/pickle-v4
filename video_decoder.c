@@ -341,6 +341,11 @@ int video_decode_frame(video_context_t *video) {
         if (read_result < 0) {
             if (read_result == AVERROR_EOF) {
                 // No more packets in file
+                static int eof_count = 0;
+                if (eof_count++ < 3) {
+                    printf("[DEBUG] av_read_frame returned EOF (packets_sent=%d)\n", packets_sent_this_call);
+                }
+                
                 // Flush decoder to get any remaining buffered frames
                 avcodec_send_packet(video->codec_ctx, NULL);
                 
@@ -703,17 +708,33 @@ void video_seek(video_context_t *video, int64_t timestamp) {
         return;
     }
     
-    // Seek to the specified timestamp
-    if (av_seek_frame(video->format_ctx, video->video_stream_index, timestamp, AVSEEK_FLAG_BACKWARD) < 0) {
-        printf("Warning: Failed to seek to timestamp %ld\n", timestamp);
-        return;
+    // Reset EOF flag BEFORE seeking so av_read_frame will work
+    video->eof_reached = false;
+    
+    // For MP4 files, use avformat_seek_file which handles the container better
+    int seek_result = avformat_seek_file(video->format_ctx, video->video_stream_index, 
+                                         INT64_MIN, timestamp, timestamp, 0);
+    if (seek_result < 0) {
+        printf("[SEEK] Warning: avformat_seek_file failed: %s, trying av_seek_frame\n", av_err2str(seek_result));
+        seek_result = av_seek_frame(video->format_ctx, -1, timestamp, AVSEEK_FLAG_BACKWARD);
+        if (seek_result < 0) {
+            printf("[SEEK] Error: Both seek methods failed: %s\n", av_err2str(seek_result));
+            return;
+        }
     }
     
-    // Flush decoder buffers
+    // Unref any existing packet data
+    av_packet_unref(video->packet);
+    
+    // Flush decoder buffers completely
     avcodec_flush_buffers(video->codec_ctx);
     
-    // Reset EOF flag
-    video->eof_reached = false;
+    // Flush BSF buffers if present
+    if (video->bsf_annexb_ctx) {
+        av_bsf_flush(video->bsf_annexb_ctx);
+    }
+    
+    printf("[SEEK] Seeked to timestamp %ld, decoder flushed and ready\n", timestamp);
 }
 
 void video_cleanup(video_context_t *video) {

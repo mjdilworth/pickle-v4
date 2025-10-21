@@ -499,9 +499,20 @@ void app_run(app_context_t *app) {
                             next_frame_ready = true;
                         }
                     } else if (video_is_eof(app->video)) {
-                        printf("Playback finished.\n");
-                        app->running = false;
-                        break;
+                        if (app->loop_playback) {
+                            printf("End of video reached - restarting playback (loop mode)\n");
+                            video_seek(app->video, 0);
+                            next_frame_ready = false;
+                            first_frame_decoded = false;
+                            first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
+                            frame_count = 0;
+                            // Update startup_time to reset the 5-second timeout
+                            clock_gettime(CLOCK_MONOTONIC, &startup_time);
+                        } else {
+                            printf("Playback finished.\n");
+                            app->running = false;
+                            break;
+                        }
                     } else {
                         if (frame_count < 10) {
                             printf("Video decode failed: %d\n", decode_result);
@@ -650,7 +661,7 @@ void app_run(app_context_t *app) {
                     printf("Pre-decoded next frame in %.1fms (during swap/VSync)\n", predecode_time * 1000);
                 }
             } else if (video_is_eof(app->video)) {
-                // Will be handled next iteration
+                // EOF during pre-decode - will be handled in main decode section next iteration
                 next_frame_ready = false;
             } else {
                 next_frame_ready = false;
