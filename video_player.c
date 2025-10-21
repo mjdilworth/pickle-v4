@@ -243,8 +243,6 @@ void app_run(app_context_t *app) {
     double min_frame_time = target_frame_time;  // Minimum frame time (target FPS)
     double adaptive_frame_time = target_frame_time;  // Current adaptive frame time
     
-    int consecutive_decode_failures = 0;
-    
     // Frame timing diagnostics
     struct timespec decode_start, decode_end, render_start, render_end;
     double total_decode_time = 0, total_render_time = 0;
@@ -408,6 +406,11 @@ void app_run(app_context_t *app) {
             }
         }
 
+        // OPTIMIZATION: Pre-decode next frame while rendering current frame
+        // This hides decode latency by overlapping decode with render/swap
+        static bool next_frame_ready = false;
+        static bool first_frame_decoded = false;
+        
         // Decode video frame if enough time has passed
         uint8_t *video_data = NULL;
         static int frame_count = 0;
@@ -429,45 +432,88 @@ void app_run(app_context_t *app) {
                 fflush(stdout);
                 frame_count = 1; // Skip further decode attempts
             } else {
-                // Measure decode time
-                clock_gettime(CLOCK_MONOTONIC, &decode_start);
-                int decode_result = video_decode_frame(app->video);
-                clock_gettime(CLOCK_MONOTONIC, &decode_end);
-                
-                decode_time = (decode_end.tv_sec - decode_start.tv_sec) +
-                            (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
-                
-                if (decode_result == 0) {
-                    if (frame_count == 0) {
-                        printf("First frame decoded successfully\n");
-                        fflush(stdout);
-                    }
+                // OPTIMIZATION: Use pre-decoded frame if available, then decode next
+                if (next_frame_ready && first_frame_decoded) {
+                    // Current frame was already decoded - just use it (zero decode time!)
+                    decode_time = 0.0;
                     
-                    // Get YUV data since RGB is deprecated
+                    // Get YUV data from already-decoded frame
                     uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
                     int y_stride = 0, u_stride = 0, v_stride = 0;
                     video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
                     
-                    // Check if we actually have frame data
                     if (y_data != NULL) {
-                        video_data = y_data; // Just use Y plane for tracking if we have data
+                        video_data = y_data;
                         last_video_data = video_data;
                         frame_count++;
                         
-                        // Update diagnostics
                         total_decode_time += decode_time;
                         diagnostic_frame_count++;
                         
-                        // Force timing output on regular intervals regardless of frame count
                         if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
-                            printf("DEBUG: Frame %d decoded (%.1fms), diagnostic_frame_count=%d\n", 
-                                   frame_count, decode_time * 1000, diagnostic_frame_count);
+                            printf("DEBUG: Frame %d (pre-decoded, 0.0ms), diagnostic_frame_count=%d\n", 
+                                   frame_count, diagnostic_frame_count);
                             fflush(stdout);
                         }
-                    } else {
-                        printf("WARNING: Frame %d returned NULL Y-plane data\n", frame_count);
-                        fflush(stdout);
+                        
+                        // Now decode the NEXT frame (during rendering of current frame)
+                        // This will be ready for next iteration
+                        next_frame_ready = false;
+                        // Actual decode happens after rendering (see below)
                     }
+                } else {
+                    // Normal decode path (first frame or fallback)
+                    clock_gettime(CLOCK_MONOTONIC, &decode_start);
+                    int decode_result = video_decode_frame(app->video);
+                    clock_gettime(CLOCK_MONOTONIC, &decode_end);
+                    
+                    decode_time = (decode_end.tv_sec - decode_start.tv_sec) +
+                                (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
+                    
+                    if (decode_result == 0) {
+                        if (frame_count == 0) {
+                            printf("First frame decoded successfully\n");
+                            first_frame_decoded = true;
+                            fflush(stdout);
+                        }
+                        
+                        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                        int y_stride = 0, u_stride = 0, v_stride = 0;
+                        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                        
+                        if (y_data != NULL) {
+                            video_data = y_data;
+                            last_video_data = video_data;
+                            frame_count++;
+                            
+                            total_decode_time += decode_time;
+                            diagnostic_frame_count++;
+                            
+                            if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
+                                printf("DEBUG: Frame %d decoded (%.1fms), diagnostic_frame_count=%d\n", 
+                                       frame_count, decode_time * 1000, diagnostic_frame_count);
+                                fflush(stdout);
+                            }
+                            
+                            // Mark that we should pre-decode next time
+                            next_frame_ready = true;
+                        }
+                    } else if (video_is_eof(app->video)) {
+                        printf("Playback finished.\n");
+                        app->running = false;
+                        break;
+                    } else {
+                        if (frame_count < 10) {
+                            printf("Video decode failed: %d\n", decode_result);
+                            fflush(stdout);
+                        }
+                        video_data = last_video_data;
+                        next_frame_ready = false;
+                    }
+                }
+                
+                // Measure decode time (removed old code)
+                // clock_gettime(CLOCK_MONOTONIC, &decode_start);
                     
                     // Show diagnostic info periodically
                     if (app->show_timing && diagnostic_frame_count % 30 == 0) {
@@ -485,72 +531,7 @@ void app_run(app_context_t *app) {
                 app->input->keys_pressed[KEY_DOWN] = false;
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
-                // printf("No corner selected, clearing arrow key states\n");
-            } else {
-                // printf("Corner %d selected, preserving arrow key states\n", 
-                //        app->keystone->selected_corner);
             }
-                    static int slow_decode_count = 0;
-                    static int frames_skipped = 0;
-                    
-                    // OPTIMIZED: More aggressive frame skipping when needed
-                    // Skip frames if decode time exceeds 50% over budget
-                    if (decode_time > adaptive_frame_time * 1.5) {
-                        slow_decode_count++;
-                        
-                        // Skip frames more frequently - every slow frame after first 2
-                        if (slow_decode_count > 2) {
-                            // Skip the next 1-2 frames depending on how slow
-                            int skip_count = (decode_time > adaptive_frame_time * 3.0) ? 2 : 1;
-                            for (int i = 0; i < skip_count && i < 2; i++) {
-                                video_decode_frame(app->video);
-                                frames_skipped++;
-                            }
-                            
-                            if (frames_skipped % 10 == 0) {
-                                printf("Frame skipping: %.1fms decode (budget %.1fms), skipped %d frames total\n", 
-                                       decode_time * 1000, adaptive_frame_time * 1000, frames_skipped);
-                            }
-                        }
-                    } else {
-                        // Decode is fast - reset counter
-                        if (slow_decode_count > 0 && frames_skipped > 0) {
-                            printf("Decode performance recovered, skipped %d frames total\n", frames_skipped);
-                            frames_skipped = 0;
-                        }
-                        slow_decode_count = 0;
-                    }
-                    
-                    // Successful decode - gradually speed up timing
-                    consecutive_decode_failures = 0;
-                    if (adaptive_frame_time > min_frame_time * 1.1) {
-                        adaptive_frame_time = adaptive_frame_time * 0.98; // Gradually faster
-                        if (adaptive_frame_time < min_frame_time * 1.1) {
-                            adaptive_frame_time = min_frame_time * 1.1; // Keep slightly slower than target
-                        }
-                    }
-                } else if (video_is_eof(app->video)) {
-                    printf("Playback finished.\n");
-                    app->running = false;
-                    break;
-                } else {
-                    if (frame_count < 10) {  // Only show first few decode errors
-                        printf("Video decode failed: %d\n", decode_result);
-                        fflush(stdout);
-                    }
-                    // Use last good frame if decode fails
-                    video_data = last_video_data;
-                    
-                    // Failed decode - slow down timing to give decoder more time
-                    consecutive_decode_failures++;
-                    if (consecutive_decode_failures >= 1) {
-                        adaptive_frame_time = adaptive_frame_time * 1.8; // Slow down more aggressively
-                        if (adaptive_frame_time > min_frame_time * 8) {
-                            adaptive_frame_time = min_frame_time * 8; // Cap at 8x slower
-                        }
-                        consecutive_decode_failures = 0; // Reset counter
-                    }
-                }
             }
         } else {
             // Use the last decoded frame for rendering
@@ -650,6 +631,32 @@ void app_run(app_context_t *app) {
         gl_swap_buffers(app->gl, app->drm);
         
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
+        
+        // OPTIMIZATION: Pre-decode next frame while GPU presents current frame
+        // This overlaps decode with VSync wait, hiding decode latency
+        if (first_frame_decoded && !next_frame_ready && frame_count > 0) {
+            struct timespec predecode_start, predecode_end;
+            clock_gettime(CLOCK_MONOTONIC, &predecode_start);
+            
+            int predecode_result = video_decode_frame(app->video);
+            
+            clock_gettime(CLOCK_MONOTONIC, &predecode_end);
+            double predecode_time = (predecode_end.tv_sec - predecode_start.tv_sec) +
+                                   (predecode_end.tv_nsec - predecode_start.tv_nsec) / 1e9;
+            
+            if (predecode_result == 0) {
+                next_frame_ready = true;
+                if (app->show_timing && frame_count < 5) {
+                    printf("Pre-decoded next frame in %.1fms (during swap/VSync)\n", predecode_time * 1000);
+                }
+            } else if (video_is_eof(app->video)) {
+                // Will be handled next iteration
+                next_frame_ready = false;
+            } else {
+                next_frame_ready = false;
+            }
+        }
+        
         clock_gettime(CLOCK_MONOTONIC, &render_end);
         
         // Calculate detailed timing for debugging

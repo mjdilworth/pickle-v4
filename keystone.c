@@ -191,6 +191,7 @@ int keystone_init(keystone_context_t *keystone) {
     keystone->selected_corner = CORNER_TOP_LEFT; // Start with top-left corner selected
     keystone->move_step = 0.010f; // Default movement per key press (1%)
     keystone->matrix_dirty = true;
+    keystone->corners_dirty = true;  // Initial corners need VBO upload
     keystone->show_corners = true;  // Show corners by default
     keystone->show_border = true;   // Show border by default
     keystone->show_help = true;     // Show help by default
@@ -255,6 +256,7 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
             corner->y = prev_y;
         } else {
             keystone->matrix_dirty = true;
+            keystone->corners_dirty = true;  // Mark corners VBO needs update
         }
     }
 }
@@ -282,6 +284,7 @@ void keystone_reset_corners(keystone_context_t *keystone) {
     keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f,  1.0f};
     
     keystone->matrix_dirty = true;
+    keystone->corners_dirty = true;  // Mark corners VBO needs update
 }
 
 void keystone_toggle_corners(keystone_context_t *keystone) {

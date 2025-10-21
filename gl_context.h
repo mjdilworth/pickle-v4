@@ -27,6 +27,10 @@ typedef struct {
     GLuint texture_v;     // V plane texture
     GLuint texture_nv12;  // NV12 packed format texture
     
+    // Pixel Buffer Objects for async DMA transfers
+    GLuint pbo[3];        // PBOs for Y, U, V planes (async upload)
+    bool use_pbo;         // Enable PBO async uploads
+    
     GLuint vbo;
     GLuint ebo;
     GLuint vao;

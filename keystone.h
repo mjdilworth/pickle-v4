@@ -16,6 +16,7 @@ typedef struct {
     
     // Corner highlighting
     bool show_corners;   // Toggle corner visibility
+    bool corners_dirty;  // Corner positions changed, need VBO update
     
     // Border highlighting
     bool show_border;    // Toggle border visibility

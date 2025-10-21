@@ -77,7 +77,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     
     // Try hardware decoder for H.264
     if (codecpar->codec_id == AV_CODEC_ID_H264) {
-        video->codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+        video->codec = (AVCodec*)avcodec_find_decoder_by_name("h264_v4l2m2m");
         if (video->codec) {
             video->use_hardware_decode = true;
             video->hw_decode_type = HW_DECODE_V4L2M2M;
@@ -98,7 +98,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             check_v4l2_decoder_capabilities();
         }
     } else if (codecpar->codec_id == AV_CODEC_ID_HEVC) {
-        video->codec = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+        video->codec = (AVCodec*)avcodec_find_decoder_by_name("hevc_v4l2m2m");
         if (video->codec) {
             video->use_hardware_decode = true;
             video->hw_decode_type = HW_DECODE_V4L2M2M;
@@ -120,7 +120,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     // Fall back to software decoder if hardware not available
     if (!video->codec) {
         printf("Hardware decoder not available, falling back to software\n");
-        video->codec = avcodec_find_decoder(codecpar->codec_id);
+        video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
         if (!video->codec) {
             fprintf(stderr, "Unsupported codec\n");
             avformat_close_input(&video->format_ctx);
@@ -147,35 +147,71 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         return -1;
     }
 
+    // Initialize BSF BEFORE opening codec for hardware decoding (avcC to Annex-B conversion)
+    if (video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M && 
+        codecpar->extradata && codecpar->extradata_size > 0 && codecpar->extradata[0] == 1) {
+        
+        printf("V4L2 stream analysis: First 8 bytes: ");
+        for (int i = 0; i < 8 && i < codecpar->extradata_size; i++) {
+            printf("%02x ", codecpar->extradata[i]);
+        }
+        printf("\n");
+        printf("[INFO]  V4L2 stream: Detected avcC format - will use BSF to convert to Annex-B\n");
+        
+        video->avcc_length_size = get_avcc_length_size(codecpar->extradata, codecpar->extradata_size);
+        printf("[INFO]  V4L2 integration: avcC NAL length size: %d bytes\n", video->avcc_length_size);
+        
+        printf("[INFO]  Initializing h264_mp4toannexb BSF for hardware decode\n");
+        
+        // h264_mp4toannexb (avcC → Annex-B conversion)
+        const AVBitStreamFilter *bsf_annexb = av_bsf_get_by_name("h264_mp4toannexb");
+        if (!bsf_annexb) {
+            fprintf(stderr, "Failed to find h264_mp4toannexb BSF\n");
+            video_cleanup(video);
+            return -1;
+        }
+        
+        if (av_bsf_alloc(bsf_annexb, &video->bsf_annexb_ctx) < 0) {
+            fprintf(stderr, "Failed to allocate h264_mp4toannexb BSF context\n");
+            video_cleanup(video);
+            return -1;
+        }
+        
+        avcodec_parameters_copy(video->bsf_annexb_ctx->par_in, codecpar);
+        
+        if (av_bsf_init(video->bsf_annexb_ctx) < 0) {
+            fprintf(stderr, "Failed to initialize h264_mp4toannexb BSF\n");
+            video_cleanup(video);
+            return -1;
+        }
+        
+        // CRITICAL: Copy the BSF output parameters (with converted Annex-B extradata) to codec context
+        // This ensures the decoder receives Annex-B extradata matching the Annex-B packets
+        if (video->bsf_annexb_ctx->par_out->extradata && video->bsf_annexb_ctx->par_out->extradata_size > 0) {
+            // Free existing extradata
+            if (video->codec_ctx->extradata) {
+                av_freep(&video->codec_ctx->extradata);
+            }
+            // Allocate and copy converted extradata
+            video->codec_ctx->extradata_size = video->bsf_annexb_ctx->par_out->extradata_size;
+            video->codec_ctx->extradata = av_mallocz(video->codec_ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            memcpy(video->codec_ctx->extradata, video->bsf_annexb_ctx->par_out->extradata, video->codec_ctx->extradata_size);
+            printf("[INFO]  BSF converted extradata to Annex-B format (%d bytes)\n", video->codec_ctx->extradata_size);
+        }
+        
+        // CRITICAL: Set codec_tag to 0 for Annex-B format
+        // When using Annex-B format, codec_tag must be 0 (not the MP4/avcC tag)
+        video->codec_ctx->codec_tag = 0;
+        printf("[INFO]  V4L2: Using codec_tag=0 for Annex-B format\n");
+        
+        printf("[INFO]  BSF ready: avcC → Annex-B conversion enabled\n");
+    }
+
     // Configure hardware decoding for V4L2 M2M
     if (video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M) {
         // Don't force pixel format - let the decoder choose the best format
         video->codec_ctx->thread_count = 1; // V4L2 handles threading internally
         printf("V4L2 M2M configured - will auto-detect output format\n");
-        
-        // Note: extradata conversion to Annex-B is DISABLED
-        // The h264_v4l2m2m decoder handles avcC format natively with the default codec_tag
-        // Converting extradata while keeping packets in avcC format causes mismatches
-        if (codecpar->extradata && codecpar->extradata_size > 0) {
-            printf("V4L2 stream analysis: First 8 bytes: ");
-            for (int i = 0; i < 8 && i < codecpar->extradata_size; i++) {
-                printf("%02x ", codecpar->extradata[i]);
-            }
-            printf("\n");
-            
-            // Check format
-            if (codecpar->extradata[0] == 1) {
-                printf("[INFO]  V4L2 stream: Detected avcC format - using native h264_v4l2m2m handler\n");
-                video->avcc_length_size = get_avcc_length_size(codecpar->extradata, codecpar->extradata_size);
-                printf("[INFO]  V4L2 integration: avcC NAL length size: %d bytes\n", video->avcc_length_size);
-            } else {
-                printf("[INFO]  V4L2 stream: Not avcC format (%d)\n", codecpar->extradata[0]);
-            }
-        } else {
-            printf("[INFO]  V4L2 stream: No extradata found\n");
-        }
-        
-        printf("[INFO]  V4L2 integration: Using default codec_tag (%d)\n", video->codec_ctx->codec_tag);
         
         // CRITICAL: Enable CHUNKS mode for V4L2 M2M decoder
         // This tells FFmpeg that packets may be partial frames (slices)
@@ -195,60 +231,6 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
         return -1;
-    }
-    
-    // Note: BSF chain initialization is intentionally DISABLED for V4L2 M2M hardware decoder.
-    // The h264_v4l2m2m decoder handles avcC format natively without BSF when:
-    // 1. codec_tag is left at default (not forced to 0)
-    // 2. AV_CODEC_FLAG2_CHUNKS flag is enabled  
-    // 3. Thread count is set to 1 for V4L2
-    // BSF chain was causing compatibility issues and reduced performance.
-    if (false && video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M) {
-        printf("[INFO]  Initializing BSF chain for V4L2 M2M:\n");
-        printf("[INFO]    Stage 1: h264_mp4toannexb (avcC → Annex-B)\n");
-        
-        // Stage 1: Setup h264_mp4toannexb filter
-        const AVBitStreamFilter *bsf_annexb = av_bsf_get_by_name("h264_mp4toannexb");
-        if (!bsf_annexb) {
-            fprintf(stderr, "Failed to find h264_mp4toannexb bitstream filter\n");
-            avcodec_free_context(&video->codec_ctx);
-            avformat_close_input(&video->format_ctx);
-            av_packet_free(&video->packet);
-            return -1;
-        }
-        
-        if (av_bsf_alloc(bsf_annexb, &video->bsf_annexb_ctx) < 0) {
-            fprintf(stderr, "Failed to allocate h264_mp4toannexb context\n");
-            avcodec_free_context(&video->codec_ctx);
-            avformat_close_input(&video->format_ctx);
-            av_packet_free(&video->packet);
-            return -1;
-        }
-        
-        // Copy codec parameters to first BSF
-        if (avcodec_parameters_copy(video->bsf_annexb_ctx->par_in, codecpar) < 0) {
-            fprintf(stderr, "Failed to copy codec parameters to h264_mp4toannexb\n");
-            av_bsf_free(&video->bsf_annexb_ctx);
-            avcodec_free_context(&video->codec_ctx);
-            avformat_close_input(&video->format_ctx);
-            av_packet_free(&video->packet);
-            return -1;
-        }
-        
-        // Initialize the first BSF
-        if (av_bsf_init(video->bsf_annexb_ctx) < 0) {
-            fprintf(stderr, "Failed to initialize h264_mp4toannexb\n");
-            av_bsf_free(&video->bsf_annexb_ctx);
-            avcodec_free_context(&video->codec_ctx);
-            avformat_close_input(&video->format_ctx);
-            av_packet_free(&video->packet);
-            return -1;
-        }
-        printf("[INFO]  ✓ h264_mp4toannexb initialized\n");
-        printf("[INFO]  ✓ BSF chain ready (Annex-B format)\n");
-        
-        // Note: AUD insertion via h264_metadata is intentionally disabled due to compatibility issues.
-        // The V4L2 M2M decoder functions correctly with just Annex-B format conversion.
     }
 
     // Debug: Print the actual pixel format and color space being used
@@ -286,7 +268,6 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         printf("Hardware decoding to YUV420P enabled, GPU will handle YUV→RGB conversion\n");
     }
 
-    video->initialized = true;
     video->eof_reached = false;
 
     // Video decoder initialization complete
@@ -385,8 +366,42 @@ int video_decode_frame(video_context_t *video) {
             continue;  // Try next packet
         }
         
+        // Process packet through BSF if hardware decoding
+        AVPacket *pkt_to_decode = video->packet;
+        AVPacket *bsf_pkt = NULL;
+        
+        if (video->use_hardware_decode && video->bsf_annexb_ctx) {
+            // Convert avcC to Annex-B
+            if (av_bsf_send_packet(video->bsf_annexb_ctx, video->packet) < 0) {
+                fprintf(stderr, "BSF send failed\n");
+                av_packet_unref(video->packet);
+                continue;
+            }
+            
+            bsf_pkt = av_packet_alloc();
+            int ret = av_bsf_receive_packet(video->bsf_annexb_ctx, bsf_pkt);
+            if (ret == AVERROR(EAGAIN)) {
+                // BSF needs more packets
+                av_packet_free(&bsf_pkt);
+                av_packet_unref(video->packet);
+                continue;
+            } else if (ret < 0) {
+                fprintf(stderr, "BSF receive failed: %s\n", av_err2str(ret));
+                av_packet_free(&bsf_pkt);
+                av_packet_unref(video->packet);
+                continue;
+            }
+            
+            pkt_to_decode = bsf_pkt;
+        }
+        
         // Send packet to decoder
-        int send_result = avcodec_send_packet(video->codec_ctx, video->packet);
+        int send_result = avcodec_send_packet(video->codec_ctx, pkt_to_decode);
+        
+        // Cleanup packets
+        if (bsf_pkt) {
+            av_packet_free(&bsf_pkt);
+        }
         av_packet_unref(video->packet);
         
         if (send_result < 0) {
@@ -435,7 +450,7 @@ int video_decode_frame(video_context_t *video) {
         
         // Find software decoder
         AVCodecParameters *codecpar = video->format_ctx->streams[video->video_stream_index]->codecpar;
-        video->codec = avcodec_find_decoder(codecpar->codec_id);
+        video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
         if (!video->codec) {
             fprintf(stderr, "No software decoder available\n");
             return -1;

@@ -21,7 +21,7 @@ typedef enum {
 
 typedef struct {
     AVFormatContext *format_ctx;
-    AVCodec *codec;
+    const AVCodec *codec;
     AVCodecContext *codec_ctx;
     AVPacket *packet;
     AVFrame *frame;

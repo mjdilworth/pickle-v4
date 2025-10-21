@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 #include "gl_context.h"
 #include "drm_display.h"
 #include "keystone.h"
@@ -5,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 // NEON SIMD optimization for stride copying on ARM
 #ifdef __ARM_NEON__
@@ -396,6 +398,12 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
+    // Initialize PBO for async texture uploads (OpenGL ES 3.0+)
+    // DISABLED: Direct upload is faster on RPi4 when strides match (5-8ms vs 12-17ms with PBO overhead)
+    gl->use_pbo = false;
+    glGenBuffers(3, gl->pbo);
+    // printf("PBO async texture uploads enabled\n");
+
     // OpenGL ES initialization complete
     return 0;
 }
@@ -482,6 +490,7 @@ void gl_setup_buffers(gl_context_t *gl) {
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
                     display_ctx_t *drm, keystone_context_t *keystone) {
+    (void)stride; // Unused parameter - kept for API consistency
     static int frame_rendered = 0;
     static int last_width = 0, last_height = 0;
     static bool gl_state_set = false;
@@ -712,18 +721,43 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             printf("Direct upload: Y=%s U=%s V=%s\n", y_direct?"YES":"NO", u_direct?"YES":"NO", v_direct?"YES":"NO");
         }
         
-        // Y texture - OPTIMIZED: minimize texture operations
+        // Y texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gl->texture_y);
-        if (y_direct) {
+        
+        if (gl->use_pbo && y_direct) {
+            // PBO async upload path (fastest for direct data)
+            int y_size = width * height;
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[0]);
+            
+            if (size_changed) {
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, y_size, NULL, GL_STREAM_DRAW);
+            }
+            
+            // Map buffer and copy data
+            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, y_size, 
+                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (pbo_mem) {
+                memcpy(pbo_mem, y_data, y_size);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                
+                // Upload from PBO (async DMA)
+                if (size_changed) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
+                } else {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, 0);
+                }
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        } else if (y_direct) {
+            // Direct upload (no PBO)
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_data);
             } else {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
             }
         } else {
-            // Only use stride copying when absolutely necessary - use pre-allocated buffers
-            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
+            // Stride copy path (no PBO for non-direct data)
             int needed_size = width * height;
             allocate_yuv_buffers(needed_size);
             
@@ -735,10 +769,33 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
             }
         }
-        // U texture - OPTIMIZED: minimize texture operations  
+        // U texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, gl->texture_u);
-        if (u_direct) {
+        
+        if (gl->use_pbo && u_direct) {
+            // PBO async upload path
+            int u_size = uv_width * uv_height;
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[1]);
+            
+            if (size_changed) {
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, u_size, NULL, GL_STREAM_DRAW);
+            }
+            
+            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, u_size,
+                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (pbo_mem) {
+                memcpy(pbo_mem, u_data, u_size);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                
+                if (size_changed) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
+                } else {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
+                }
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        } else if (u_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_data);
             } else {
@@ -759,10 +816,33 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             }
         }
         
-        // V texture - OPTIMIZED: minimize texture operations
+        // V texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, gl->texture_v);
-        if (v_direct) {
+        
+        if (gl->use_pbo && v_direct) {
+            // PBO async upload path
+            int v_size = uv_width * uv_height;
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[2]);
+            
+            if (size_changed) {
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, v_size, NULL, GL_STREAM_DRAW);
+            }
+            
+            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, v_size,
+                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (pbo_mem) {
+                memcpy(pbo_mem, v_data, v_size);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                
+                if (size_changed) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
+                } else {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
+                }
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        } else if (v_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_data);
             } else {
@@ -812,12 +892,29 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
     static int swap_count = 0;
+    static struct timespec last_swap_time = {0, 0};
+    struct timespec t1, t2;
     
-    // EGL swap buffers (this makes the rendered frame available)
+    // Measure swap time for diagnostics
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    
+    // EGL swap buffers (this makes the rendered frame available and blocks on VSync)
     EGLBoolean swap_result = eglSwapBuffers(gl->egl_display, gl->egl_surface);
     if (!swap_result && swap_count < 5) {
         printf("EGL swap failed: 0x%x\n", eglGetError());
+        clock_gettime(CLOCK_MONOTONIC, &last_swap_time);
         return;
+    }
+    
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    
+    // Calculate swap time (includes VSync wait)
+    double swap_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + 
+                     (t2.tv_nsec - t1.tv_nsec) / 1000000.0;
+    
+    // Warn on long swaps (indicates late arrival to VBlank)
+    if (swap_ms > 20.0 && swap_count > 10) {
+        printf("PERF: Long swap: %.1fms (late frame, missed VBlank window)\n", swap_ms);
     }
     
     // Present to display via DRM
@@ -825,6 +922,7 @@ void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
         printf("DRM swap failed\n");
     }
     
+    last_swap_time = t2;
     swap_count++;
 }
 
@@ -841,7 +939,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     static float corner_vertices[10000];  // Enough for position+color data
     static GLuint corner_vbo = 0;
     static bool vbo_initialized = false;
-    static int last_vertex_count = 0;
+    static int cached_selected_corner = -2;  // Track which corner was selected
     
     // Initialize VBO once on first call
     if (!vbo_initialized) {
@@ -852,36 +950,44 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         vbo_initialized = true;
     }
     
-    // Enable blending for transparent overlays
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // OPTIMIZATION: Only update VBO if corners moved or selection changed
+    bool needs_update = keystone->corners_dirty || 
+                        (cached_selected_corner != keystone->selected_corner);
     
-    // Disable depth testing to ensure overlays are always visible
-    glDisable(GL_DEPTH_TEST);
-    
-    // Create corner positions (small squares)
-    float corner_size = 0.015f; // 1.5% of screen size (smaller)
-    
-    // Corner vertices with colors: [x, y, r, g, b, a] per vertex
-    int vertex_count = 0;
-    
-    // Determine colors for each corner
-    float corner_colors[4][4];
-    for (int i = 0; i < 4; i++) {
-        if (keystone->selected_corner == i) {
-            // Green for selected
-            corner_colors[i][0] = 0.0f;
-            corner_colors[i][1] = 1.0f;
-            corner_colors[i][2] = 0.0f;
-            corner_colors[i][3] = 1.0f;
-        } else {
-            // White for unselected
-            corner_colors[i][0] = 1.0f;
-            corner_colors[i][1] = 1.0f;
-            corner_colors[i][2] = 1.0f;
-            corner_colors[i][3] = 1.0f;
+    if (needs_update) {
+        cached_selected_corner = keystone->selected_corner;
+        keystone->corners_dirty = false;  // Clear dirty flag
+        
+        // Enable blending for transparent overlays
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        // Disable depth testing to ensure overlays are always visible
+        glDisable(GL_DEPTH_TEST);
+        
+        // Create corner positions (small squares)
+        float corner_size = 0.015f; // 1.5% of screen size (smaller)
+        
+        // Corner vertices with colors: [x, y, r, g, b, a] per vertex
+        int vertex_count = 0;
+        
+        // Determine colors for each corner
+        float corner_colors[4][4];
+        for (int i = 0; i < 4; i++) {
+            if (keystone->selected_corner == i) {
+                // Green for selected
+                corner_colors[i][0] = 0.0f;
+                corner_colors[i][1] = 1.0f;
+                corner_colors[i][2] = 0.0f;
+                corner_colors[i][3] = 1.0f;
+            } else {
+                // White for unselected
+                corner_colors[i][0] = 1.0f;
+                corner_colors[i][1] = 1.0f;
+                corner_colors[i][2] = 1.0f;
+                corner_colors[i][3] = 1.0f;
+            }
         }
-    }
     
     // Render corner indicators at the keystone corner positions
     for (int i = 0; i < 4; i++) {
@@ -918,24 +1024,26 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
             corner_vertices[vertex_count*6 + 4] = color[2];
             corner_vertices[vertex_count*6 + 5] = color[3];
             vertex_count++;
-            
-            // Top-left
-            corner_vertices[vertex_count*6 + 0] = tx - corner_size;
-            corner_vertices[vertex_count*6 + 1] = ty + corner_size;
-            corner_vertices[vertex_count*6 + 2] = color[0];
-            corner_vertices[vertex_count*6 + 3] = color[1];
-            corner_vertices[vertex_count*6 + 4] = color[2];
-            corner_vertices[vertex_count*6 + 5] = color[3];
-            vertex_count++;
         }
         
         // Skip text for now - we'll add it back later
     }
     
-    // OPTIMIZED: Use glBufferSubData instead of glBufferData
-    // glBufferSubData only updates the data, much faster than reallocating
+        // OPTIMIZED: Use glBufferSubData instead of glBufferData
+        // glBufferSubData only updates the data, much faster than reallocating
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
+    }  // End needs_update block
+    
+    // Always bind and render (even if not updated)
     glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
+    
+    // Enable blending for transparent overlays
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Disable depth testing to ensure overlays are always visible
+    glDisable(GL_DEPTH_TEST);
     
     // Use corner shader program
     glUseProgram(gl->corner_program);
@@ -1356,6 +1464,12 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
     if (gl->texture_v) glDeleteTextures(1, &gl->texture_v);
     if (gl->texture_nv12) glDeleteTextures(1, &gl->texture_nv12);
+    
+    // Clean up PBOs
+    if (gl->use_pbo) {
+        glDeleteBuffers(3, gl->pbo);
+    }
+    
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);
     if (gl->ebo) glDeleteBuffers(1, &gl->ebo);
     if (gl->corner_vbo) glDeleteBuffers(1, &gl->corner_vbo);
