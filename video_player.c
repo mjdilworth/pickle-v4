@@ -7,6 +7,38 @@
 #include <unistd.h>
 #include <time.h>
 #include <linux/input.h>
+#include <sys/stat.h>
+#include "production_config.h"
+
+// Validate video file before processing
+static int validate_video_file(const char *filename) {
+    if (!filename) {
+        fprintf(stderr, "Error: No video file specified\n");
+        return -1;
+    }
+    
+    // Check if file exists and get size
+    struct stat st;
+    if (stat(filename, &st) != 0) {
+        fprintf(stderr, "Error: Cannot access video file: %s\n", filename);
+        return -1;
+    }
+    
+    // Check file size limits
+    if (st.st_size > MAX_VIDEO_FILE_SIZE) {
+        fprintf(stderr, "Error: Video file too large (%lld bytes, limit: %lld bytes)\n",
+                (long long)st.st_size, (long long)MAX_VIDEO_FILE_SIZE);
+        return -1;
+    }
+    
+    if (st.st_size < 1024) {  // Minimum 1KB for valid video
+        fprintf(stderr, "Error: Video file too small (%lld bytes)\n", (long long)st.st_size);
+        return -1;
+    }
+    
+    printf("Video file validation passed: %s (%lld bytes)\n", filename, (long long)st.st_size);
+    return 0;
+}
 
 static bool process_keystone_movement(app_context_t *app, double delta_time, double target_frame_time) {
     if (!app || !app->keystone || !app->input) {
@@ -77,6 +109,12 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
     
+    // Validate video file before proceeding
+    if (validate_video_file(video_file) != 0) {
+        fprintf(stderr, "Failed to validate video file\n");
+        return -1;
+    }
+    
     memset(app, 0, sizeof(*app));
     
     // Set all flags
@@ -123,6 +161,16 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         app_cleanup(app);
         return -1;
     }
+    
+    // Validate video dimensions after decoder opens file
+    if (app->video->width > MAX_VIDEO_WIDTH || app->video->height > MAX_VIDEO_HEIGHT) {
+        fprintf(stderr, "Error: Video dimensions %dx%d exceed limits (%dx%d max)\n",
+                app->video->width, app->video->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
+        app_cleanup(app);
+        return -1;
+    }
+    
+    printf("Video dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
     
     // Set loop playback if requested
     video_set_loop(app->video, loop_playback);

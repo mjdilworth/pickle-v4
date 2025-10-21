@@ -9,40 +9,43 @@
 
 // Global app context for signal handlers
 static app_context_t *g_app = NULL;
+static volatile sig_atomic_t g_signal_received = 0;
 
 static void signal_handler(int sig) {
-    printf("\nReceived signal %d, cleaning up...\n", sig);
+    // CRITICAL: Only async-signal-safe operations here!
+    // Do NOT call printf, malloc, free, pthread functions, etc.
+    g_signal_received = sig;
     
-    // Always try to restore terminal first
-    input_restore_terminal_global();
-    
-    if (g_app) {
-        // Clean up application resources
-        app_cleanup(g_app);
-    }
-    
-    // Exit gracefully
-    exit(0);
+    // Re-raise to get default behavior (but allow atexit to run)
+    signal(sig, SIG_DFL);
 }
 
 static void cleanup_on_exit(void) {
     printf("\nRestoring terminal state...\n");
+    fflush(stdout);
+    
     input_restore_terminal_global();
     
     if (g_app) {
         app_cleanup(g_app);
         g_app = NULL;
     }
+    
+    if (g_signal_received != 0) {
+        printf("Exiting after signal %d\n", g_signal_received);
+        fflush(stdout);
+    }
 }
 
 static void setup_signal_handlers(void) {
+    // Register signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);   // Ctrl+C
     signal(SIGTERM, signal_handler);  // Termination signal
     signal(SIGHUP, signal_handler);   // Hangup (SSH disconnect)
     signal(SIGABRT, signal_handler);  // Abort signal
     signal(SIGSEGV, signal_handler);  // Segmentation fault
     
-    // Register atexit handler as backup
+    // Register atexit handler for safe cleanup
     atexit(cleanup_on_exit);
 }
 

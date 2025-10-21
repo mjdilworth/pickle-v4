@@ -99,25 +99,6 @@ show-flags:
 	@echo "ARCH_FLAGS: $(ARCH_FLAGS)"
 	@echo "System: $$(uname -m)"
 
-# Help target
-help:
-	@echo "Pickle Video Player - RPi4 Makefile"
-	@echo ""
-	@echo "Targets:"
-	@echo "  make          - Build the executable (default)"
-	@echo "  make rebuild  - Clean and rebuild"
-	@echo "  make clean    - Remove build artifacts"
-	@echo "  make strip    - Strip binary for smaller size"
-	@echo "  make install  - Install required packages"
-	@echo "  make show-flags - Display build optimization flags"
-	@echo ""
-	@echo "RPi4 Optimizations enabled:"
-	@echo "  ✓ ARM NEON SIMD (-mfpu=neon)"
-	@echo "  ✓ ARM v7 architecture (-march=armv7-a)"
-	@echo "  ✓ Fast math (-ffast-math)"
-	@echo "  ✓ Link-time optimization (-flto=auto)"
-	@echo "  ✓ Linker garbage collection (--gc-sections)"
-
 # Release build with maximum optimization
 release: CFLAGS = -Wall -Wextra -std=c99 -O3 -DNDEBUG
 release: CFLAGS += $(ARCH_FLAGS) $(RPi4_FLAGS)
@@ -143,6 +124,8 @@ info:
 
 # Help target
 help:
+	@echo "Pickle Video Player - RPi4 Makefile"
+	@echo ""
 	@echo "Available targets:"
 	@echo "  all          - Build the video player (default, -O2 optimization)"
 	@echo "  release      - Build with maximum optimization (-O3 -flto, stripped)"
@@ -152,6 +135,7 @@ help:
 	@echo "  install-deps - Install required system dependencies"
 	@echo "  test         - Run with test.mp4 if available"
 	@echo "  info         - Show build configuration"
+	@echo "  show-flags   - Display compiler optimization flags"
 	@echo "  help         - Show this help"
 	@echo ""
 	@echo "Usage: sudo ./$(TARGET) <video_file.mp4>"
