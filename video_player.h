@@ -22,10 +22,13 @@ typedef struct {
     bool loop_playback;
     const char *video_file;
     bool needs_redraw;       // Flag to indicate frame needs redrawing
+    bool show_timing;        // Flag to show frame timing information
+    bool debug_gamepad;      // Flag to log gamepad button presses
+    bool advanced_diagnostics; // Flag to enable detailed hardware decoder diagnostics
 } app_context_t;
 
 // Main application functions
-int app_init(app_context_t *app, const char *video_file, bool loop_playback);
+int app_init(app_context_t *app, const char *video_file, bool loop_playback, bool show_timing, bool debug_gamepad, bool advanced_diagnostics);
 void app_run(app_context_t *app);
 void app_cleanup(app_context_t *app);
 

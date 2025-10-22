@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 #include "gl_context.h"
 #include "drm_display.h"
 #include "keystone.h"
@@ -5,6 +6,45 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+
+// NEON SIMD optimization for stride copying on ARM
+#ifdef __ARM_NEON__
+    #include <arm_neon.h>
+    #define HAS_NEON 1
+#else
+    #define HAS_NEON 0
+#endif
+
+// OPTIMIZED: NEON-accelerated stride copy for YUV planes
+// Copies 'rows' rows of 'width' bytes from source to destination with strides
+static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src, 
+                                         int width, int height, 
+                                         int dst_stride, int src_stride) {
+    #if HAS_NEON
+    // Use NEON 128-bit vectors for 16-byte copies (2 NEON registers per iteration)
+    int width_16 = (width / 16) * 16;  // Process 16 bytes at a time
+    
+    for (int row = 0; row < height; row++) {
+        // NEON fast path for 16-byte aligned chunks
+        uint8_t *s = (uint8_t *)src + (row * src_stride);
+        uint8_t *d = dst + (row * dst_stride);
+        
+        for (int col = 0; col < width_16; col += 16) {
+            uint8x16_t data = vld1q_u8(s + col);
+            vst1q_u8(d + col, data);
+        }
+        
+        // Scalar copy for remaining bytes
+        memcpy(d + width_16, s + width_16, width - width_16);
+    }
+    #else
+    // Fallback to standard memcpy loop for non-ARM platforms
+    for (int row = 0; row < height; row++) {
+        memcpy(dst + (row * dst_stride), src + (row * src_stride), width);
+    }
+    #endif
+}
 
 // Forward declarations
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size);
@@ -18,7 +58,57 @@ static void draw_text_simple(float *vertices, int *vertex_count, const char *tex
 #define GL_RED 0x1903
 #endif
 
+// Pre-allocated YUV temp buffers for stride handling (avoids malloc/free each frame)
+typedef struct {
+    uint8_t *y_temp_buffer;
+    uint8_t *u_temp_buffer;
+    uint8_t *v_temp_buffer;
+    int allocated_size;  // Size each buffer is allocated for
+} yuv_temp_buffers_t;
+
+// Global persistent buffers - allocated once, reused
+static yuv_temp_buffers_t g_yuv_buffers = {NULL, NULL, NULL, 0};
+
+static void allocate_yuv_buffers(int needed_size) {
+    // Only allocate if needed or size changed
+    if (g_yuv_buffers.allocated_size < needed_size) {
+        // Free old buffers if they exist
+        free(g_yuv_buffers.y_temp_buffer);
+        free(g_yuv_buffers.u_temp_buffer);
+        free(g_yuv_buffers.v_temp_buffer);
+        
+        // Allocate new buffers - allocate slightly larger to reduce reallocations
+        int alloc_size = needed_size * 1.2;  // 20% headroom
+        g_yuv_buffers.y_temp_buffer = malloc(alloc_size);
+        g_yuv_buffers.u_temp_buffer = malloc(alloc_size / 4);  // U/V are half size
+        g_yuv_buffers.v_temp_buffer = malloc(alloc_size / 4);
+        g_yuv_buffers.allocated_size = alloc_size;
+        
+        if (g_yuv_buffers.y_temp_buffer && g_yuv_buffers.u_temp_buffer && g_yuv_buffers.v_temp_buffer) {
+            // printf("DEBUG: Pre-allocated YUV buffers: Y=%p U=%p V=%p (size %d)\n",
+            //        g_yuv_buffers.y_temp_buffer, g_yuv_buffers.u_temp_buffer, g_yuv_buffers.v_temp_buffer, alloc_size);
+        }
+    }
+}
+
+static void free_yuv_buffers(void) {
+    if (g_yuv_buffers.y_temp_buffer) {
+        free(g_yuv_buffers.y_temp_buffer);
+        g_yuv_buffers.y_temp_buffer = NULL;
+    }
+    if (g_yuv_buffers.u_temp_buffer) {
+        free(g_yuv_buffers.u_temp_buffer);
+        g_yuv_buffers.u_temp_buffer = NULL;
+    }
+    if (g_yuv_buffers.v_temp_buffer) {
+        free(g_yuv_buffers.v_temp_buffer);
+        g_yuv_buffers.v_temp_buffer = NULL;
+    }
+    g_yuv_buffers.allocated_size = 0;
+}
+
 // Modern vertex shader for keystone correction and video rendering (OpenGL ES 3.1)
+// OPTIMIZATION: Use highp for geometry (precision needed for matrix math)
 const char *vertex_shader_source = 
     "#version 310 es\n"
     "precision highp float;\n"
@@ -44,10 +134,11 @@ const char *vertex_shader_source =
     "    v_texcoord = a_texcoord;\n"
     "}\n";
 
-// Hybrid fragment shader for YUV→RGB conversion (OpenGL ES 3.1 with legacy fallback)
+// Optimized YUV→RGB conversion fragment shader (OpenGL ES 3.1)
+// Keep highp precision for color accuracy (mediump causes color shift)
 const char *fragment_shader_source = 
     "#version 310 es\n"
-    "precision highp float;\n"
+    "precision highp float;\n"  // KEEP highp for color accuracy
     "in vec2 v_texcoord;\n"
     "\n"
     "// Legacy uniform samplers (for compatibility)\n"
@@ -58,7 +149,7 @@ const char *fragment_shader_source =
     "out vec4 fragColor;\n"
     "\n"
     "void main() {\n"
-    "    // Sample YUV values\n"
+    "    // Sample YUV values from separate planes\n"
     "    float y = texture(u_texture_y, v_texcoord).r;\n"
     "    float u = texture(u_texture_u, v_texcoord).r;\n"
     "    float v = texture(u_texture_v, v_texcoord).r;\n"
@@ -82,22 +173,26 @@ const char *fragment_shader_source =
     "    fragColor = vec4(r, g, b, 1.0);\n"
     "}\n";
 
-// Corner highlight shaders (OpenGL ES 3.1)
+// Corner highlight shaders (OpenGL ES 3.1) - OPTIMIZED
 const char *corner_vertex_shader_source = 
     "#version 310 es\n"
+    "precision mediump float;\n"  // OPTIMIZED: mediump for overlay geometry
     "layout(location = 0) in vec2 a_position;\n"
+    "layout(location = 1) in vec4 a_color;\n"
     "uniform mat4 u_mvp_matrix;\n"
+    "out vec4 v_color;\n"
     "void main() {\n"
     "    gl_Position = u_mvp_matrix * vec4(a_position, 0.0, 1.0);\n"
+    "    v_color = a_color;\n"
     "}\n";
 
 const char *corner_fragment_shader_source = 
     "#version 310 es\n"
-    "precision mediump float;\n"
-    "uniform vec4 u_color;\n"
+    "precision mediump float;\n"  // OPTIMIZED: mediump for overlay colors
+    "in vec4 v_color;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
-    "    fragColor = u_color;\n"
+    "    fragColor = v_color;\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *source) {
@@ -155,6 +250,7 @@ static int create_program(gl_context_t *gl) {
     gl->u_texture_y = glGetUniformLocation(gl->program, "u_texture_y");
     gl->u_texture_u = glGetUniformLocation(gl->program, "u_texture_u");
     gl->u_texture_v = glGetUniformLocation(gl->program, "u_texture_v");
+    gl->u_texture_nv12 = glGetUniformLocation(gl->program, "u_texture_nv12");
     gl->u_keystone_matrix = glGetUniformLocation(gl->program, "u_keystone_matrix");
     gl->a_position = glGetAttribLocation(gl->program, "a_position");
     gl->a_texcoord = glGetAttribLocation(gl->program, "a_texcoord");
@@ -302,6 +398,12 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
+    // Initialize PBO for async texture uploads (OpenGL ES 3.0+)
+    // DISABLED: Direct upload is faster on RPi4 when strides match (5-8ms vs 12-17ms with PBO overhead)
+    gl->use_pbo = false;
+    glGenBuffers(3, gl->pbo);
+    // printf("PBO async texture uploads enabled\n");
+
     // OpenGL ES initialization complete
     return 0;
 }
@@ -309,11 +411,11 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
 void gl_setup_buffers(gl_context_t *gl) {
     // Quad vertices (position + texture coordinates)  
     float vertices[] = {
-        // Position  // TexCoord (V flipped: 1.0 at top, 0.0 at bottom)
-        -1.0f, -1.0f, 0.0f, 1.0f,  // Bottom-left
-         1.0f, -1.0f, 1.0f, 1.0f,  // Bottom-right
-         1.0f,  1.0f, 1.0f, 0.0f,  // Top-right
-        -1.0f,  1.0f, 0.0f, 0.0f   // Top-left
+        // Position  // TexCoord (standard orientation)
+        -1.0f, -1.0f, 0.0f, 0.0f,  // Bottom-left
+         1.0f, -1.0f, 1.0f, 0.0f,  // Bottom-right
+         1.0f,  1.0f, 1.0f, 1.0f,  // Top-right
+        -1.0f,  1.0f, 0.0f, 1.0f   // Top-left
     };
 
     GLuint indices[] = {
@@ -337,6 +439,7 @@ void gl_setup_buffers(gl_context_t *gl) {
     glGenTextures(1, &gl->texture_y);
     glGenTextures(1, &gl->texture_u);
     glGenTextures(1, &gl->texture_v);
+    glGenTextures(1, &gl->texture_nv12);
     
     // Setup Y texture
     glBindTexture(GL_TEXTURE_2D, gl->texture_y);
@@ -359,6 +462,18 @@ void gl_setup_buffers(gl_context_t *gl) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
+    // Setup NV12 texture (combined Y + interleaved UV at 1.5x height)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
     // Setup corner highlight VBO - will be updated with actual corner positions
     glGenBuffers(1, &gl->corner_vbo);
     
@@ -370,6 +485,122 @@ void gl_setup_buffers(gl_context_t *gl) {
     
     // Modern ES 3.1 UBO setup (disabled for compatibility)
     // setup_uniform_buffers(gl);
+}
+
+// Helper function to upload NV12 data to GPU
+void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
+                    display_ctx_t *drm, keystone_context_t *keystone) {
+    (void)stride; // Unused parameter - kept for API consistency
+    static int frame_rendered = 0;
+    static int last_width = 0, last_height = 0;
+    static bool gl_state_set = false;
+    
+    // Set black clear color for video background
+    if (frame_rendered == 0) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    // Set up OpenGL state only once or when needed
+    if (!gl_state_set) {
+        glViewport(0, 0, drm->width, drm->height);
+        gl_state_set = true;
+    }
+    
+    // CRITICAL: Complete buffer unbinding before state restoration
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glUseProgram(0);
+    
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    
+    // Now set up the correct state for video rendering
+    glUseProgram(gl->program);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+    
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    // Texture coordinate attribute  
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    // Set MVP matrix
+    float mvp_matrix[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+    
+    // Explicitly disable blending and depth test
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    
+    // Set keystone matrix
+    const float *keystone_matrix = keystone_get_matrix(keystone);
+    glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
+    
+    // Bind NV12 texture to texture unit 0
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Disable other texture units so shader uses only NV12
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    
+    // Set sampler uniforms
+    glUniform1i(gl->u_texture_nv12, 0);  // NV12 on unit 0
+    glUniform1i(gl->u_texture_y, 1);     // Unused (should help shader detect NV12 mode)
+    glUniform1i(gl->u_texture_u, 2);     // Unused
+    glUniform1i(gl->u_texture_v, 3);     // Unused
+    
+    // Upload NV12 data
+    if (nv12_data) {
+        bool size_changed = (width != last_width || height != last_height || frame_rendered == 0);
+        
+        // NV12 is Y plane + interleaved UV plane = 1.5x height
+        int nv12_height = (height * 3) / 2;
+        
+        if (size_changed) {
+            // Need full glTexImage2D for size change
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, nv12_height, 0, GL_RED, GL_UNSIGNED_BYTE, nv12_data);
+            printf("NV12 texture uploaded: %dx%d (NV12 height %d)\n", width, height, nv12_height);
+        } else {
+            // Use glTexSubImage2D for faster updates
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, nv12_height, GL_RED, GL_UNSIGNED_BYTE, nv12_data);
+        }
+        
+        last_width = width;
+        last_height = height;
+        frame_rendered++;
+    }
+    
+    // Check for OpenGL errors
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        printf("OpenGL error (NV12): 0x%x\n", error);
+    }
+    
+    // Draw quad
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    
+    error = glGetError();
+    if (error != GL_NO_ERROR) {
+        printf("OpenGL error after NV12 draw: 0x%x\n", error);
+    }
 }
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
@@ -490,96 +721,145 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             printf("Direct upload: Y=%s U=%s V=%s\n", y_direct?"YES":"NO", u_direct?"YES":"NO", v_direct?"YES":"NO");
         }
         
-        // Y texture - OPTIMIZED: minimize texture operations
+        // Y texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gl->texture_y);
-        if (y_direct) {
+        
+        if (gl->use_pbo && y_direct) {
+            // PBO async upload path (fastest for direct data)
+            int y_size = width * height;
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[0]);
+            
+            if (size_changed) {
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, y_size, NULL, GL_STREAM_DRAW);
+            }
+            
+            // Map buffer and copy data
+            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, y_size, 
+                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (pbo_mem) {
+                memcpy(pbo_mem, y_data, y_size);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                
+                // Upload from PBO (async DMA)
+                if (size_changed) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
+                } else {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, 0);
+                }
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        } else if (y_direct) {
+            // Direct upload (no PBO)
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_data);
             } else {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
             }
         } else {
-            // Only use stride copying when absolutely necessary
-            static uint8_t *y_temp_buffer = NULL;
-            static int y_temp_size = 0;
+            // Stride copy path (no PBO for non-direct data)
             int needed_size = width * height;
-            if (y_temp_size < needed_size) {
-                free(y_temp_buffer);
-                y_temp_buffer = malloc(needed_size);
-                y_temp_size = needed_size;
-            }
-            uint8_t *src = y_data, *dst = y_temp_buffer;
-            for (int row = 0; row < height; row++) {
-                memcpy(dst, src, width);
-                src += y_stride;
-                dst += width;
-            }
+            allocate_yuv_buffers(needed_size);
+            
+            copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
+            
             if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_temp_buffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
             } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_temp_buffer);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
             }
         }
-        // U texture - OPTIMIZED: minimize texture operations  
+        // U texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, gl->texture_u);
-        if (u_direct) {
+        
+        if (gl->use_pbo && u_direct) {
+            // PBO async upload path
+            int u_size = uv_width * uv_height;
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[1]);
+            
+            if (size_changed) {
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, u_size, NULL, GL_STREAM_DRAW);
+            }
+            
+            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, u_size,
+                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (pbo_mem) {
+                memcpy(pbo_mem, u_data, u_size);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                
+                if (size_changed) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
+                } else {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
+                }
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        } else if (u_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_data);
             } else {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
             }
         } else {
-            static uint8_t *u_temp_buffer = NULL;
-            static int u_temp_size = 0;
+            // Use pre-allocated buffers for U plane
+            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = uv_width * uv_height;
-            if (u_temp_size < needed_size) {
-                free(u_temp_buffer);
-                u_temp_buffer = malloc(needed_size);
-                u_temp_size = needed_size;
-            }
-            uint8_t *src = u_data, *dst = u_temp_buffer;
-            for (int row = 0; row < uv_height; row++) {
-                memcpy(dst, src, uv_width);
-                src += u_stride;
-                dst += uv_width;
-            }
+            allocate_yuv_buffers(needed_size);
+            
+            copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
+            
             if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_temp_buffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
             } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_temp_buffer);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
             }
         }
         
-        // V texture - OPTIMIZED: minimize texture operations
+        // V texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, gl->texture_v);
-        if (v_direct) {
+        
+        if (gl->use_pbo && v_direct) {
+            // PBO async upload path
+            int v_size = uv_width * uv_height;
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[2]);
+            
+            if (size_changed) {
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, v_size, NULL, GL_STREAM_DRAW);
+            }
+            
+            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, v_size,
+                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (pbo_mem) {
+                memcpy(pbo_mem, v_data, v_size);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                
+                if (size_changed) {
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
+                } else {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
+                }
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        } else if (v_direct) {
             if (size_changed) {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_data);
             } else {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
             }
         } else {
-            static uint8_t *v_temp_buffer = NULL;
-            static int v_temp_size = 0;
+            // Use pre-allocated buffers for V plane
+            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = uv_width * uv_height;
-            if (v_temp_size < needed_size) {
-                free(v_temp_buffer);
-                v_temp_buffer = malloc(needed_size);
-                v_temp_size = needed_size;
-            }
-            uint8_t *src = v_data, *dst = v_temp_buffer;
-            for (int row = 0; row < uv_height; row++) {
-                memcpy(dst, src, uv_width);
-                src += v_stride;
-                dst += uv_width;
-            }
+            allocate_yuv_buffers(needed_size);
+            
+            copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
+            
             if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_temp_buffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
             } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_temp_buffer);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
             }
         }
         
@@ -612,12 +892,29 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
     static int swap_count = 0;
+    static struct timespec last_swap_time = {0, 0};
+    struct timespec t1, t2;
     
-    // EGL swap buffers (this makes the rendered frame available)
+    // Measure swap time for diagnostics
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    
+    // EGL swap buffers (this makes the rendered frame available and blocks on VSync)
     EGLBoolean swap_result = eglSwapBuffers(gl->egl_display, gl->egl_surface);
     if (!swap_result && swap_count < 5) {
         printf("EGL swap failed: 0x%x\n", eglGetError());
+        clock_gettime(CLOCK_MONOTONIC, &last_swap_time);
         return;
+    }
+    
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    
+    // Calculate swap time (includes VSync wait)
+    double swap_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + 
+                     (t2.tv_nsec - t1.tv_nsec) / 1000000.0;
+    
+    // Warn on long swaps (indicates late arrival to VBlank)
+    if (swap_ms > 20.0 && swap_count > 10) {
+        printf("PERF: Long swap: %.1fms (late frame, missed VBlank window)\n", swap_ms);
     }
     
     // Present to display via DRM
@@ -625,6 +922,7 @@ void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
         printf("DRM swap failed\n");
     }
     
+    last_swap_time = t2;
     swap_count++;
 }
 
@@ -637,6 +935,109 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         return; // Don't render corners if not visible
     }
     
+    // Pre-allocated static buffer for corners (initialized once)
+    static float corner_vertices[10000];  // Enough for position+color data
+    static GLuint corner_vbo = 0;
+    static bool vbo_initialized = false;
+    static int cached_selected_corner = -2;  // Track which corner was selected
+    
+    // Initialize VBO once on first call
+    if (!vbo_initialized) {
+        glGenBuffers(1, &corner_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+        // OPTIMIZED: Pre-allocate with GL_DYNAMIC_DRAW on first init only
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices), NULL, GL_DYNAMIC_DRAW);
+        vbo_initialized = true;
+    }
+    
+    // OPTIMIZATION: Only update VBO if corners moved or selection changed
+    bool needs_update = keystone->corners_dirty || 
+                        (cached_selected_corner != keystone->selected_corner);
+    
+    // Always prepare corner colors (outside needs_update so available for rendering)
+    float corner_colors[4][4];
+    for (int i = 0; i < 4; i++) {
+        if (keystone->selected_corner == i) {
+            // Green for selected
+            corner_colors[i][0] = 0.0f;
+            corner_colors[i][1] = 1.0f;
+            corner_colors[i][2] = 0.0f;
+            corner_colors[i][3] = 1.0f;
+        } else {
+            // White for unselected
+            corner_colors[i][0] = 1.0f;
+            corner_colors[i][1] = 1.0f;
+            corner_colors[i][2] = 1.0f;
+            corner_colors[i][3] = 1.0f;
+        }
+    }
+    
+    if (needs_update) {
+        cached_selected_corner = keystone->selected_corner;
+        keystone->corners_dirty = false;  // Clear dirty flag
+        
+        // Create corner positions (small squares)
+        float corner_size = 0.015f; // 1.5% of screen size (smaller)
+        
+        // Corner vertices with colors: [x, y, r, g, b, a] per vertex
+        int vertex_count = 0;
+        
+        // Render corner indicators at the keystone corner positions
+        for (int i = 0; i < 4; i++) {
+            // Get the keystone corner position
+            float tx = keystone->corners[i].x;
+            float ty = keystone->corners[i].y;
+            float *color = corner_colors[i];
+            
+            // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
+            if (vertex_count + 4 <= 1600) { // Leave room for text
+                // Bottom-left
+                corner_vertices[vertex_count*6 + 0] = tx - corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty - corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+                
+                // Bottom-right
+                corner_vertices[vertex_count*6 + 0] = tx + corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty - corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+                
+                // Top-right
+                corner_vertices[vertex_count*6 + 0] = tx + corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty + corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+                
+                // Top-left
+                corner_vertices[vertex_count*6 + 0] = tx - corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty + corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+            }
+        }
+        
+        // OPTIMIZED: Use glBufferSubData instead of glBufferData
+        // glBufferSubData only updates the data, much faster than reallocating
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
+    }  // End needs_update block
+    
+    // Always bind and render (even if not updated)
+    glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+    
     // Enable blending for transparent overlays
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -644,68 +1045,17 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
     
-    // Create corner positions (small squares)
-    float corner_size = 0.015f; // 1.5% of screen size (smaller)
-    
-    // Corner vertices for 4 small squares plus text
-    float corner_vertices[4000]; // Large buffer for squares and text
-    int vertex_count = 0;
-    
-    // Render corner indicators at the keystone corner positions
-    // Since the video quad is transformed TO these positions, the overlays should be here too
-    for (int i = 0; i < 4; i++) {
-        // Get the keystone corner position (where this video corner appears on screen)
-        float tx = keystone->corners[i].x;
-        float ty = keystone->corners[i].y;
-        
-        // Create a small square centered at transformed corner position
-        if (vertex_count + 4 <= 3900) { // Leave room for text
-            corner_vertices[vertex_count*2 + 0] = tx - corner_size; // Bottom-left
-            corner_vertices[vertex_count*2 + 1] = ty - corner_size;
-            vertex_count++;
-            corner_vertices[vertex_count*2 + 0] = tx + corner_size; // Bottom-right
-            corner_vertices[vertex_count*2 + 1] = ty - corner_size;
-            vertex_count++;
-            corner_vertices[vertex_count*2 + 0] = tx + corner_size; // Top-right
-            corner_vertices[vertex_count*2 + 1] = ty + corner_size;
-            vertex_count++;
-            corner_vertices[vertex_count*2 + 0] = tx - corner_size; // Top-left
-            corner_vertices[vertex_count*2 + 1] = ty + corner_size;
-            vertex_count++;
-        }
-        
-        // Add corner number text - fix swapped positions
-        char corner_number[2];
-        // User reports: 1 is where 4 should be, 4 is where 1 should be, 
-        // 2 is where 3 should be, 3 is where 2 should be
-        // So we need to swap the mappings completely:
-        int display_number;
-        if (i == 0) display_number = 4;      // CORNER_TOP_LEFT → show "4" (was showing "1")
-        else if (i == 1) display_number = 3; // CORNER_TOP_RIGHT → show "3" (was showing "2")
-        else if (i == 2) display_number = 2; // CORNER_BOTTOM_RIGHT → show "2" (was showing "3")  
-        else display_number = 1;             // CORNER_BOTTOM_LEFT → show "1" (was showing "4")
-        
-        corner_number[0] = '0' + display_number;
-        corner_number[1] = '\0';
-        
-        // Position text slightly offset from corner center
-        float text_x = tx + corner_size * 1.5f;
-        float text_y = ty + corner_size * 0.5f;
-        float text_size = 0.02f; // Small text size
-        
-        draw_text_simple(corner_vertices, &vertex_count, corner_number, text_x, text_y, text_size);
-    }
-    
-    // Update corner VBO with new positions
-    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 2 * sizeof(float), corner_vertices, GL_DYNAMIC_DRAW);
-    
     // Use corner shader program
     glUseProgram(gl->corner_program);
     
-    // Set up vertex attributes
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    // Set up vertex attributes - interleaved position (2) + color (4)
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Enable color attribute (location 1)
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
     
     // Set identity matrix for MVP (corners in normalized coordinates)
     float identity[16] = {
@@ -716,37 +1066,22 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Render each corner square with different colors
+    // Render all 4 corner squares - colors are now in vertex data
+    static int last_selected = -999;
+    
+    // Debug when selection changes
+    if (keystone->selected_corner != last_selected) {
+        printf("[RENDER] Selected corner changed: %d -> %d\n", last_selected, keystone->selected_corner);
+        last_selected = keystone->selected_corner;
+    }
+    
+    // Draw all corner squares in one call - each corner is 4 vertices
     for (int i = 0; i < 4; i++) {
-        // Set color based on corner (and selection state)
-        float color[4];
-        if (keystone->selected_corner == i) {
-            // Highlight selected corner in bright green (solid)
-            color[0] = 0.0f; color[1] = 1.0f; color[2] = 0.0f; color[3] = 1.0f;
-        } else {
-            // Regular corners in bright red (solid for testing)
-            color[0] = 1.0f; color[1] = 0.0f; color[2] = 0.0f; color[3] = 1.0f;
-        }
-        glUniform4fv(gl->corner_u_color, 1, color);
-        
-        // Draw corner as triangle fan (4 vertices forming a square)
         glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
     }
     
-    // Render corner number text in white
-    if (vertex_count > 16) { // If we have text vertices
-        float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // White text
-        glUniform4fv(gl->corner_u_color, 1, text_color);
-        
-        // Draw all text pixels (each character pixel is a 4-vertex rectangle)
-        int text_start = 16; // Skip the 16 corner square vertices
-        int text_pixels = (vertex_count - 16) / 4; // Number of character pixels
-        for (int i = 0; i < text_pixels; i++) {
-            glDrawArrays(GL_TRIANGLE_FAN, text_start + i * 4, 4);
-        }
-    }
-    
     glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1); // Disable color attribute
     
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
@@ -768,8 +1103,12 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
     
-    // Create border line vertices (4 lines connecting the corners)
-    float border_vertices[16]; // 4 lines * 2 vertices * 2 coords = 16 floats
+    // Create border line vertices with color (4 lines connecting the corners)
+    // Each vertex: x, y, r, g, b, a (6 floats per vertex)
+    float border_vertices[48]; // 8 vertices * 6 floats = 48 floats
+    
+    // Yellow color for all border vertices
+    float r = 1.0f, g = 1.0f, b = 0.0f, a = 1.0f;
     
     // Show the control point positions (where user has positioned corners)
     point_t *corners = keystone->corners;
@@ -777,26 +1116,34 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Line 1: Top-left to top-right (use direct Y coordinates)
     border_vertices[0] = corners[CORNER_TOP_LEFT].x;
     border_vertices[1] = corners[CORNER_TOP_LEFT].y;
-    border_vertices[2] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[3] = corners[CORNER_TOP_RIGHT].y;
+    border_vertices[2] = r; border_vertices[3] = g; border_vertices[4] = b; border_vertices[5] = a;
+    border_vertices[6] = corners[CORNER_TOP_RIGHT].x;
+    border_vertices[7] = corners[CORNER_TOP_RIGHT].y;
+    border_vertices[8] = r; border_vertices[9] = g; border_vertices[10] = b; border_vertices[11] = a;
     
     // Line 2: Top-right to bottom-right
-    border_vertices[4] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[5] = corners[CORNER_TOP_RIGHT].y;
-    border_vertices[6] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[7] = corners[CORNER_BOTTOM_RIGHT].y;
+    border_vertices[12] = corners[CORNER_TOP_RIGHT].x;
+    border_vertices[13] = corners[CORNER_TOP_RIGHT].y;
+    border_vertices[14] = r; border_vertices[15] = g; border_vertices[16] = b; border_vertices[17] = a;
+    border_vertices[18] = corners[CORNER_BOTTOM_RIGHT].x;
+    border_vertices[19] = corners[CORNER_BOTTOM_RIGHT].y;
+    border_vertices[20] = r; border_vertices[21] = g; border_vertices[22] = b; border_vertices[23] = a;
     
     // Line 3: Bottom-right to bottom-left
-    border_vertices[8] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[9] = corners[CORNER_BOTTOM_RIGHT].y;
-    border_vertices[10] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[11] = corners[CORNER_BOTTOM_LEFT].y;
+    border_vertices[24] = corners[CORNER_BOTTOM_RIGHT].x;
+    border_vertices[25] = corners[CORNER_BOTTOM_RIGHT].y;
+    border_vertices[26] = r; border_vertices[27] = g; border_vertices[28] = b; border_vertices[29] = a;
+    border_vertices[30] = corners[CORNER_BOTTOM_LEFT].x;
+    border_vertices[31] = corners[CORNER_BOTTOM_LEFT].y;
+    border_vertices[32] = r; border_vertices[33] = g; border_vertices[34] = b; border_vertices[35] = a;
     
     // Line 4: Bottom-left to top-left
-    border_vertices[12] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[13] = corners[CORNER_BOTTOM_LEFT].y;
-    border_vertices[14] = corners[CORNER_TOP_LEFT].x;
-    border_vertices[15] = corners[CORNER_TOP_LEFT].y;
+    border_vertices[36] = corners[CORNER_BOTTOM_LEFT].x;
+    border_vertices[37] = corners[CORNER_BOTTOM_LEFT].y;
+    border_vertices[38] = r; border_vertices[39] = g; border_vertices[40] = b; border_vertices[41] = a;
+    border_vertices[42] = corners[CORNER_TOP_LEFT].x;
+    border_vertices[43] = corners[CORNER_TOP_LEFT].y;
+    border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
     
     // Update border VBO with new positions
     glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
@@ -805,9 +1152,14 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Use corner shader program (same as corners, just different geometry)
     glUseProgram(gl->corner_program);
     
-    // Set up vertex attributes
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float); // x, y, r, g, b, a
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
     
     // Set identity matrix for MVP (border in normalized coordinates)
     float identity[16] = {
@@ -818,20 +1170,17 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Set border color (bright yellow for better visibility)
-    float border_color[4] = {1.0f, 1.0f, 0.0f, 1.0f}; // Bright yellow
-    glUniform4fv(gl->corner_u_color, 1, border_color);
-    
     // Set line width for better visibility
     glLineWidth(3.0f);
     
-    // Draw border as 4 separate lines
+    // Draw border as 4 separate lines (8 vertices with colors from vertex data)
     glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
     
     // Reset line width
     glLineWidth(1.0f);
     
     glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
     
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
@@ -840,81 +1189,120 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // NOTE: Don't unbind buffers here - video_player.c handles complete state restoration
 }
 
-// Simple 5x7 bitmap font data
-static const unsigned char font_5x7[][7] = {
+// Complete 5x7 bitmap font data - each byte represents one row, 5 bits used
+static const unsigned char font_5x7[128][7] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-    ['A'] = {0x20, 0x50, 0x88, 0xF8, 0x88, 0x88, 0x00},
+    ['!'] = {0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00},
+    ['/'] = {0x08, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00},
+    [':'] = {0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00},
+    ['-'] = {0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00},
+    ['('] = {0x10, 0x20, 0x20, 0x20, 0x20, 0x10, 0x00},
+    [')'] = {0x20, 0x10, 0x10, 0x10, 0x10, 0x20, 0x00},
+    ['0'] = {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x70, 0x00},
+    ['1'] = {0x20, 0x60, 0x20, 0x20, 0x20, 0x70, 0x00},
+    ['2'] = {0x70, 0x88, 0x08, 0x30, 0x40, 0xF8, 0x00},
+    ['3'] = {0x70, 0x88, 0x30, 0x08, 0x88, 0x70, 0x00},
+    ['4'] = {0x10, 0x30, 0x50, 0x90, 0xF8, 0x10, 0x00},
+    ['5'] = {0xF8, 0x80, 0xF0, 0x08, 0x88, 0x70, 0x00},
+    ['6'] = {0x30, 0x40, 0x80, 0xF0, 0x88, 0x70, 0x00},
+    ['7'] = {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00},
+    ['8'] = {0x70, 0x88, 0x70, 0x88, 0x88, 0x70, 0x00},
+    ['9'] = {0x70, 0x88, 0x78, 0x08, 0x10, 0x60, 0x00},
+    ['A'] = {0x20, 0x50, 0x88, 0x88, 0xF8, 0x88, 0x00},
     ['B'] = {0xF0, 0x88, 0xF0, 0x88, 0x88, 0xF0, 0x00},
     ['C'] = {0x70, 0x88, 0x80, 0x80, 0x88, 0x70, 0x00},
     ['D'] = {0xF0, 0x88, 0x88, 0x88, 0x88, 0xF0, 0x00},
     ['E'] = {0xF8, 0x80, 0xF0, 0x80, 0x80, 0xF8, 0x00},
     ['F'] = {0xF8, 0x80, 0xF0, 0x80, 0x80, 0x80, 0x00},
-    ['G'] = {0x70, 0x88, 0x80, 0x98, 0x88, 0x70, 0x00},
+    ['G'] = {0x70, 0x88, 0x80, 0xB8, 0x88, 0x78, 0x00},
     ['H'] = {0x88, 0x88, 0xF8, 0x88, 0x88, 0x88, 0x00},
     ['I'] = {0x70, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00},
     ['J'] = {0x38, 0x10, 0x10, 0x10, 0x90, 0x60, 0x00},
-    ['K'] = {0x88, 0x90, 0xA0, 0xC0, 0xA0, 0x98, 0x00},
+    ['K'] = {0x88, 0x90, 0xA0, 0xC0, 0xA0, 0x90, 0x00},
     ['L'] = {0x80, 0x80, 0x80, 0x80, 0x80, 0xF8, 0x00},
-    ['M'] = {0x88, 0xD8, 0xA8, 0x88, 0x88, 0x88, 0x00},
+    ['M'] = {0x88, 0xD8, 0xA8, 0xA8, 0x88, 0x88, 0x00},
     ['N'] = {0x88, 0xC8, 0xA8, 0x98, 0x88, 0x88, 0x00},
     ['O'] = {0x70, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00},
     ['P'] = {0xF0, 0x88, 0x88, 0xF0, 0x80, 0x80, 0x00},
     ['Q'] = {0x70, 0x88, 0x88, 0xA8, 0x90, 0x68, 0x00},
-    ['R'] = {0xF0, 0x88, 0x88, 0xF0, 0xA0, 0x98, 0x00},
-    ['S'] = {0x70, 0x88, 0x60, 0x18, 0x88, 0x70, 0x00},
+    ['R'] = {0xF0, 0x88, 0x88, 0xF0, 0xA0, 0x90, 0x00},
+    ['S'] = {0x70, 0x88, 0x60, 0x10, 0x88, 0x70, 0x00},
     ['T'] = {0xF8, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00},
     ['U'] = {0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00},
     ['V'] = {0x88, 0x88, 0x88, 0x50, 0x50, 0x20, 0x00},
-    ['W'] = {0x88, 0x88, 0x88, 0xA8, 0xD8, 0x88, 0x00},
+    ['W'] = {0x88, 0x88, 0xA8, 0xA8, 0xD8, 0x88, 0x00},
     ['X'] = {0x88, 0x50, 0x20, 0x20, 0x50, 0x88, 0x00},
     ['Y'] = {0x88, 0x88, 0x50, 0x20, 0x20, 0x20, 0x00},
     ['Z'] = {0xF8, 0x08, 0x10, 0x20, 0x40, 0xF8, 0x00},
-    ['0'] = {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x70, 0x00},
-    ['1'] = {0x20, 0x60, 0x20, 0x20, 0x20, 0x70, 0x00},
-    ['2'] = {0x70, 0x88, 0x08, 0x70, 0x80, 0xF8, 0x00},
-    ['3'] = {0x70, 0x88, 0x30, 0x08, 0x88, 0x70, 0x00},
-    ['4'] = {0x90, 0x90, 0x90, 0xF8, 0x10, 0x10, 0x00},
-    ['5'] = {0xF8, 0x80, 0xF0, 0x08, 0x88, 0x70, 0x00},
-    ['6'] = {0x70, 0x80, 0xF0, 0x88, 0x88, 0x70, 0x00},
-    ['7'] = {0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00},
-    ['8'] = {0x70, 0x88, 0x70, 0x88, 0x88, 0x70, 0x00},
-    ['9'] = {0x70, 0x88, 0x78, 0x08, 0x08, 0x70, 0x00},
-    [':'] = {0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00},
-    ['='] = {0x00, 0x00, 0xF8, 0x00, 0xF8, 0x00, 0x00},
-    ['-'] = {0x00, 0x00, 0x00, 0xF8, 0x00, 0x00, 0x00},
-    ['h'] = {0x80, 0x80, 0xF0, 0x88, 0x88, 0x88, 0x00},
-    ['e'] = {0x00, 0x70, 0x88, 0xF8, 0x80, 0x70, 0x00},
-    ['l'] = {0x60, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00},
+    ['a'] = {0x00, 0x00, 0x70, 0x08, 0x78, 0x88, 0x78},
+    ['b'] = {0x80, 0x80, 0xF0, 0x88, 0x88, 0x88, 0xF0},
+    ['c'] = {0x00, 0x00, 0x70, 0x88, 0x80, 0x88, 0x70},
+    ['d'] = {0x08, 0x08, 0x78, 0x88, 0x88, 0x88, 0x78},
+    ['e'] = {0x00, 0x00, 0x70, 0x88, 0xF8, 0x80, 0x70},
+    ['f'] = {0x30, 0x48, 0x40, 0xF0, 0x40, 0x40, 0x40},
+    ['g'] = {0x00, 0x78, 0x88, 0x88, 0x78, 0x08, 0x70},
+    ['h'] = {0x80, 0x80, 0xF0, 0x88, 0x88, 0x88, 0x88},
+    ['i'] = {0x20, 0x00, 0x60, 0x20, 0x20, 0x20, 0x70},
+    ['j'] = {0x10, 0x00, 0x30, 0x10, 0x10, 0x90, 0x60},
+    ['k'] = {0x80, 0x80, 0x90, 0xA0, 0xC0, 0xA0, 0x90},
+    ['l'] = {0x60, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70},
+    ['m'] = {0x00, 0x00, 0xD0, 0xA8, 0xA8, 0xA8, 0xA8},
+    ['n'] = {0x00, 0x00, 0xF0, 0x88, 0x88, 0x88, 0x88},
+    ['o'] = {0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x70},
     ['p'] = {0x00, 0xF0, 0x88, 0x88, 0xF0, 0x80, 0x80},
+    ['q'] = {0x00, 0x78, 0x88, 0x88, 0x78, 0x08, 0x08},
+    ['r'] = {0x00, 0x00, 0xB0, 0xC8, 0x80, 0x80, 0x80},
+    ['s'] = {0x00, 0x00, 0x78, 0x80, 0x70, 0x08, 0xF0},
+    ['t'] = {0x40, 0x40, 0xF0, 0x40, 0x40, 0x48, 0x30},
+    ['u'] = {0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0x78},
+    ['v'] = {0x00, 0x00, 0x88, 0x88, 0x88, 0x50, 0x20},
+    ['w'] = {0x00, 0x00, 0x88, 0xA8, 0xA8, 0xA8, 0x50},
+    ['x'] = {0x00, 0x00, 0x88, 0x50, 0x20, 0x50, 0x88},
+    ['y'] = {0x00, 0x88, 0x88, 0x88, 0x78, 0x08, 0x70},
+    ['z'] = {0x00, 0x00, 0xF8, 0x10, 0x20, 0x40, 0xF8},
 };
 
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size) {
-    if (*vertex_count >= 1800) return; // Safety limit
+    if (*vertex_count >= 15000) return; // Safety limit - increased for longer help text
     
-    // Check bounds - handle both signed and unsigned char
-    if ((unsigned char)c > 127) return;
+    // Check bounds and handle unknown characters
+    unsigned char uc = (unsigned char)c;
+    if (uc > 127) return;
     
-    const unsigned char *char_data = font_5x7[(int)c];
-    if (!char_data) return;
+    const unsigned char *char_data = font_5x7[uc];
     
-    float pixel_size = size / 8.0f;
+    // Check if character has any data (handle sparse array)
+    bool has_data = false;
+    for (int i = 0; i < 7; i++) {
+        if (char_data[i] != 0) {
+            has_data = true;
+            break;
+        }
+    }
+    if (!has_data && c != ' ') return; // Skip undefined chars except space
+    
+    float pixel_size = size / 7.0f;  // 5x7 font, divide by 7 for height
     
     for (int row = 0; row < 7; row++) {
         unsigned char row_data = char_data[row];
-        for (int col = 0; col < 5; col++) {
-            if ((row_data >> (7-col)) & 1) { // Check if pixel is set
-                if (*vertex_count + 4 <= 1800) {
+        for (int col = 0; col < 8; col++) {  // Check all 8 bits
+            if ((row_data >> (7-col)) & 1) { // Check if pixel is set (MSB first)
+                if (*vertex_count + 4 <= 15000) {
                     float px = x + col * pixel_size;
-                    float py = y + (6-row) * pixel_size; // Flip Y
+                    float py = y - (row * pixel_size); // Top to bottom
                     
                     // Add rectangle for this pixel
-                    vertices[(*vertex_count)*2] = px; vertices[(*vertex_count)*2+1] = py;
+                    vertices[(*vertex_count)*2] = px; 
+                    vertices[(*vertex_count)*2+1] = py;
                     (*vertex_count)++;
-                    vertices[(*vertex_count)*2] = px + pixel_size; vertices[(*vertex_count)*2+1] = py;
+                    vertices[(*vertex_count)*2] = px + pixel_size; 
+                    vertices[(*vertex_count)*2+1] = py;
                     (*vertex_count)++;
-                    vertices[(*vertex_count)*2] = px + pixel_size; vertices[(*vertex_count)*2+1] = py + pixel_size;
+                    vertices[(*vertex_count)*2] = px + pixel_size; 
+                    vertices[(*vertex_count)*2+1] = py - pixel_size;
                     (*vertex_count)++;
-                    vertices[(*vertex_count)*2] = px; vertices[(*vertex_count)*2+1] = py + pixel_size;
+                    vertices[(*vertex_count)*2] = px; 
+                    vertices[(*vertex_count)*2+1] = py - pixel_size;
                     (*vertex_count)++;
                 }
             }
@@ -923,12 +1311,12 @@ static void draw_char_simple(float *vertices, int *vertex_count, char c, float x
 }
 
 static void draw_text_simple(float *vertices, int *vertex_count, const char *text, float x, float y, float size) {
-    float char_width = size * 0.7f;
-    float line_height = size * 1.2f;
+    float char_width = size * 1.2f;    // Character width including spacing
+    float line_height = size * 1.3f;   // Tighter line spacing to fit more text
     float current_x = x;
     float current_y = y;
     
-    while (*text && *vertex_count < 1700) {
+    while (*text && *vertex_count < 15000) {
         if (*text == '\n') {
             current_x = x;
             current_y -= line_height;
@@ -945,43 +1333,65 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
         return; // Don't render help overlay if not visible
     }
     
-    // Create help overlay with text
-    float help_vertices[4000]; // Buffer for text vertices
+    // Create help overlay with text - using vertex colors (x, y, r, g, b, a)
+    float help_vertices[60000]; // Large buffer for text vertices with color
     int vertex_count = 0;
     
-    // Background rectangle
-    help_vertices[0] = -0.95f; help_vertices[1] = -0.95f;  // Bottom-left
-    help_vertices[2] =  0.95f; help_vertices[3] = -0.95f;  // Bottom-right  
-    help_vertices[4] =  0.95f; help_vertices[5] =  0.95f;  // Top-right
-    help_vertices[6] = -0.95f; help_vertices[7] =  0.95f;  // Top-left
+    // Large centered background with semi-transparent black color
+    // Bottom-left
+    help_vertices[0] = -0.9f; help_vertices[1] = -0.7f;
+    help_vertices[2] = 0.0f; help_vertices[3] = 0.0f; help_vertices[4] = 0.0f; help_vertices[5] = 0.8f;
+    // Bottom-right
+    help_vertices[6] = 0.9f; help_vertices[7] = -0.7f;
+    help_vertices[8] = 0.0f; help_vertices[9] = 0.0f; help_vertices[10] = 0.0f; help_vertices[11] = 0.8f;
+    // Top-right
+    help_vertices[12] = 0.9f; help_vertices[13] = 0.7f;
+    help_vertices[14] = 0.0f; help_vertices[15] = 0.0f; help_vertices[16] = 0.0f; help_vertices[17] = 0.8f;
+    // Top-left
+    help_vertices[18] = -0.9f; help_vertices[19] = 0.7f;
+    help_vertices[20] = 0.0f; help_vertices[21] = 0.0f; help_vertices[22] = 0.0f; help_vertices[23] = 0.8f;
     vertex_count = 4;
     
-    // Add help text
+    // Compact help text - keyboard and gamepad controls
     const char* help_text = 
-        "KEYSTONE CONTROLS\n"
+        "PICKLE KEYSTONE\n"
         "\n"
-        "Q/ESC = QUIT\n"
-        "H = HELP\n"
-        "C = CORNERS\n"
-        "B = BORDER\n"
-        "R = RESET\n"
-        "P = SAVE\n"
+        "KEYBOARD\n"
+        "1234   Corner Select\n"
+        "Arrows Move Corner\n"
+        "S      Save\n"
+        "R      Reset\n"
+        "C      Toggle Corners\n"
+        "B      Toggle Border\n"
+        "H      Toggle Help\n"
+        "Q      Quit\n"
         "\n"
-        "1-4 = SELECT CORNER\n"
-        "ARROWS = MOVE CORNER";
+        "GAMEPAD\n"
+        "X      Cycle Corner\n"
+        "DPAD   Move Corner\n"
+        "A      Show Corners\n"
+        "B      Show Border\n"
+        "Y      Show Help\n"
+        "L1     Step Down\n"
+        "R1     Step Up\n"
+        "START  Save\n"
+        "SELECT Reset";
     
-    draw_text_simple(help_vertices, &vertex_count, help_text, -0.9f, 0.8f, 0.03f);
-    
-    // Update help VBO with text geometry
+    // Update help VBO with background geometry
     glBindBuffer(GL_ARRAY_BUFFER, gl->help_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 2 * sizeof(float), help_vertices, GL_DYNAMIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), help_vertices, GL_DYNAMIC_DRAW);
     
     // Use corner shader program for help overlay rendering
     glUseProgram(gl->corner_program);
     
-    // Set up vertex attributes
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float); // x, y, r, g, b, a
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
     
     // Set identity matrix for MVP
     float identity[16] = {
@@ -999,20 +1409,42 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
     
-    // Draw help overlay background (semi-transparent black)
-    float bg_color[4] = {0.0f, 0.0f, 0.0f, 0.8f}; // Dark with 80% opacity
-    glUniform4fv(gl->corner_u_color, 1, bg_color);
+    // Draw help overlay background (semi-transparent black from vertex colors)
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4); // Background rectangle
     
-    // Draw text in white
-    float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // White text
-    glUniform4fv(gl->corner_u_color, 1, text_color);
+    // Now render text with better formatting
+    float text_vertices[30000]; // Increased buffer size for longer help text
+    int text_vertex_count = 0;
+    draw_text_simple(text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
+    
+    // Upload text geometry with 2-float format
+    glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 2 * sizeof(float), text_vertices, GL_DYNAMIC_DRAW);
+    
+    // Update vertex attribute for 2-float format
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glDisableVertexAttribArray(1); // Disable color attribute
+    
+    // Create cyan/white color vertices for text (manually set color for each vertex)
+    float colored_vertices[180000]; // Large buffer with colors (30000 * 6)
+    for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
+        colored_vertices[i * 6 + 0] = text_vertices[i * 2 + 0]; // x
+        colored_vertices[i * 6 + 1] = text_vertices[i * 2 + 1]; // y
+        colored_vertices[i * 6 + 2] = 0.0f; // r - cyan color
+        colored_vertices[i * 6 + 3] = 1.0f; // g
+        colored_vertices[i * 6 + 4] = 1.0f; // b
+        colored_vertices[i * 6 + 5] = 1.0f; // a
+    }
+    
+    // Upload text with colors
+    glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 6 * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
     
     // Draw all text pixels (each character pixel is a 4-vertex rectangle)
-    int text_start = 4; // Skip background rectangle
-    int text_pixels = (vertex_count - 4) / 4; // Number of character pixels
+    int text_pixels = text_vertex_count / 4; // Number of character pixels
     for (int i = 0; i < text_pixels; i++) {
-        glDrawArrays(GL_TRIANGLE_FAN, text_start + i * 4, 4);
+        glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
     }
     
     // Disable blending and restore depth testing
@@ -1020,6 +1452,7 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     glEnable(GL_DEPTH_TEST);
     
     glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
     
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -1030,6 +1463,13 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
     if (gl->texture_v) glDeleteTextures(1, &gl->texture_v);
+    if (gl->texture_nv12) glDeleteTextures(1, &gl->texture_nv12);
+    
+    // Clean up PBOs
+    if (gl->use_pbo) {
+        glDeleteBuffers(3, gl->pbo);
+    }
+    
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);
     if (gl->ebo) glDeleteBuffers(1, &gl->ebo);
     if (gl->corner_vbo) glDeleteBuffers(1, &gl->corner_vbo);
@@ -1039,6 +1479,9 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->corner_program) glDeleteProgram(gl->corner_program);
     if (gl->vertex_shader) glDeleteShader(gl->vertex_shader);
     if (gl->fragment_shader) glDeleteShader(gl->fragment_shader);
+    
+    // Clean up pre-allocated YUV buffers
+    free_yuv_buffers();
     
     if (gl->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(gl->egl_display, gl->egl_surface);

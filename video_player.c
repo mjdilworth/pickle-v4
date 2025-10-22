@@ -7,6 +7,38 @@
 #include <unistd.h>
 #include <time.h>
 #include <linux/input.h>
+#include <sys/stat.h>
+#include "production_config.h"
+
+// Validate video file before processing
+static int validate_video_file(const char *filename) {
+    if (!filename) {
+        fprintf(stderr, "Error: No video file specified\n");
+        return -1;
+    }
+    
+    // Check if file exists and get size
+    struct stat st;
+    if (stat(filename, &st) != 0) {
+        fprintf(stderr, "Error: Cannot access video file: %s\n", filename);
+        return -1;
+    }
+    
+    // Check file size limits
+    if (st.st_size > MAX_VIDEO_FILE_SIZE) {
+        fprintf(stderr, "Error: Video file too large (%lld bytes, limit: %lld bytes)\n",
+                (long long)st.st_size, (long long)MAX_VIDEO_FILE_SIZE);
+        return -1;
+    }
+    
+    if (st.st_size < 1024) {  // Minimum 1KB for valid video
+        fprintf(stderr, "Error: Video file too small (%lld bytes)\n", (long long)st.st_size);
+        return -1;
+    }
+    
+    printf("Video file validation passed: %s (%lld bytes)\n", filename, (long long)st.st_size);
+    return 0;
+}
 
 static bool process_keystone_movement(app_context_t *app, double delta_time, double target_frame_time) {
     if (!app || !app->keystone || !app->input) {
@@ -24,6 +56,22 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         up = up || input_is_key_just_pressed(app->input, KEY_UP);
         down = down || input_is_key_just_pressed(app->input, KEY_DOWN);
     }
+    
+    // Add gamepad input (D-pad and left analog stick)
+    if (app->input->gamepad_enabled) {
+        // D-pad input
+        if (app->input->gamepad_dpad_x < 0) left = true;
+        if (app->input->gamepad_dpad_x > 0) right = true;
+        if (app->input->gamepad_dpad_y < 0) up = true;
+        if (app->input->gamepad_dpad_y > 0) down = true;
+        
+        // Analog stick input (with deadzone)
+        const int16_t deadzone = 8000; // ~25% deadzone
+        if (app->input->gamepad_axis_x < -deadzone) left = true;
+        if (app->input->gamepad_axis_x > deadzone) right = true;
+        if (app->input->gamepad_axis_y < -deadzone) up = true;
+        if (app->input->gamepad_axis_y > deadzone) down = true;
+    }
 
     float move_x = 0.0f;
     float move_y = 0.0f;
@@ -36,6 +84,11 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     }
 
     if (app->keystone->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
+        return false;
+    }
+    
+    // Only allow movement if border or corners are visible
+    if (!app->keystone->show_border && !app->keystone->show_corners) {
         return false;
     }
 
@@ -51,14 +104,26 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     return true;
 }
 
-int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
+int app_init(app_context_t *app, const char *video_file, bool loop_playback, 
+            bool show_timing, bool debug_gamepad, bool advanced_diagnostics) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
     
+    // Validate video file before proceeding
+    if (validate_video_file(video_file) != 0) {
+        fprintf(stderr, "Failed to validate video file\n");
+        return -1;
+    }
+    
     memset(app, 0, sizeof(*app));
+    
+    // Set all flags
     app->video_file = video_file;
     app->running = true;
     app->loop_playback = loop_playback;
+    app->show_timing = show_timing;
+    app->debug_gamepad = debug_gamepad;
+    app->advanced_diagnostics = advanced_diagnostics;
 
     // Allocate contexts
     app->drm = calloc(1, sizeof(display_ctx_t));
@@ -91,11 +156,21 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
     }
 
     // Initialize video decoder
-    if (video_init(app->video, video_file) != 0) {
+    if (video_init(app->video, video_file, app->advanced_diagnostics) != 0) {
         fprintf(stderr, "Failed to initialize video decoder\n");
         app_cleanup(app);
         return -1;
     }
+    
+    // Validate video dimensions after decoder opens file
+    if (app->video->width > MAX_VIDEO_WIDTH || app->video->height > MAX_VIDEO_HEIGHT) {
+        fprintf(stderr, "Error: Video dimensions %dx%d exceed limits (%dx%d max)\n",
+                app->video->width, app->video->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
+        app_cleanup(app);
+        return -1;
+    }
+    
+    printf("Video dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
     
     // Set loop playback if requested
     video_set_loop(app->video, loop_playback);
@@ -120,6 +195,9 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback) {
         app_cleanup(app);
         return -1;
     }
+    
+    // Pass debug flag to input handler
+    app->input->debug_gamepad = app->debug_gamepad;
 
     gl_setup_buffers(app->gl);
 
@@ -131,11 +209,30 @@ void app_run(app_context_t *app) {
     struct timespec current_time, last_time;
     clock_gettime(CLOCK_MONOTONIC, &last_time);
 
+    // Print app configuration to verify settings
+    printf("App configuration - Loop: %d, Show timing: %d, Debug gamepad: %d\n",
+           app->loop_playback ? 1 : 0, 
+           app->show_timing ? 1 : 0, 
+           app->debug_gamepad ? 1 : 0);
+    
+    // Force timing display for debugging if needed
+    if (!app->show_timing) {
+        char *env_timing = getenv("PICKLE_SHOW_TIMING");
+        if (env_timing && (strcmp(env_timing, "1") == 0 || 
+                          strcmp(env_timing, "yes") == 0 || 
+                          strcmp(env_timing, "true") == 0)) {
+            app->show_timing = true;
+            printf("[FORCE] Timing display enabled via PICKLE_SHOW_TIMING environment variable\n");
+        }
+    }
+    fflush(stdout);
+
     double target_frame_time = 1.0 / 60.0; // 60 FPS target
     if (app->video && app->video->fps > 0) {
         target_frame_time = 1.0 / app->video->fps;
         printf("Video FPS: %.2f, Target frame time: %.3fms\n", 
                app->video->fps, target_frame_time * 1000);
+        fflush(stdout);
     }
     
     // IMPROVED: Simpler, more stable frame timing
@@ -146,13 +243,41 @@ void app_run(app_context_t *app) {
     double min_frame_time = target_frame_time;  // Minimum frame time (target FPS)
     double adaptive_frame_time = target_frame_time;  // Current adaptive frame time
     
-    int consecutive_decode_failures = 0;
-    
     // Frame timing diagnostics
     struct timespec decode_start, decode_end, render_start, render_end;
     double total_decode_time = 0, total_render_time = 0;
     int diagnostic_frame_count = 0;
-    bool show_diagnostics = true;
+    
+    // Add a timer to ensure we print timing data periodically regardless of frame counts
+    struct timespec last_timing_report;
+    clock_gettime(CLOCK_MONOTONIC, &last_timing_report);
+    
+    // Initialize timing metrics display
+    if (app->show_timing) {
+        printf("\n[TIMING] Timing display is enabled. Will show metrics every 30 frames.\n");
+        printf("[TIMING] Video FPS: %.2f, Target frame time: %.3fms\n", 
+               app->video->fps, target_frame_time * 1000);
+        printf("[TIMING] Hardware decode: %s, Resolution: %dx%d\n", 
+               video_is_hardware_decoded(app->video) ? "YES" : "NO",
+               app->video->width, app->video->height);
+               
+        // Start a background timer to ensure timing info is displayed
+        // regardless of frame decode success
+        printf("[TIMING] Starting timing display timer\n");
+        
+        // Write directly to a file as a backup method for timing data
+        FILE *timing_log = fopen("timing_log.txt", "w");
+        if (timing_log) {
+            fprintf(timing_log, "Pickle timing log started\n");
+            fprintf(timing_log, "Video FPS: %.2f, Target frame time: %.3fms\n", 
+                   app->video->fps, target_frame_time * 1000);
+            fprintf(timing_log, "Hardware decode: %s, Resolution: %dx%d\n", 
+                   video_is_hardware_decoded(app->video) ? "YES" : "NO",
+                   app->video->width, app->video->height);
+            fclose(timing_log);
+        }
+        fflush(stdout);
+    }
 
     // Main loop starting
     double startup_time = (double)last_time.tv_sec + last_time.tv_nsec / 1e9;
@@ -218,6 +343,7 @@ void app_run(app_context_t *app) {
         // Toggle border visibility
         if (app->input->toggle_border) {
             keystone_toggle_border(app->keystone);
+            printf("Border toggled: %s\n", app->keystone->show_border ? "ON" : "OFF");
             app->input->toggle_border = false; // Reset flag
         }
         
@@ -226,7 +352,65 @@ void app_run(app_context_t *app) {
             keystone_toggle_help(app->keystone);
             app->input->toggle_help = false; // Reset flag
         }
+        
+        // Gamepad-specific actions
+        if (app->input->gamepad_enabled) {
+            // X button: Cycle through corners
+            if (app->input->gamepad_cycle_corner) {
+                int current = app->keystone->selected_corner;
+                
+                // If no corner selected, start with top-left
+                if (current < 0 || current > 3) {
+                    current = CORNER_TOP_LEFT;
+                    keystone_select_corner(app->keystone, current);
+                    printf("[CYCLE] Starting with index %d (TOP_LEFT)\n", current);
+                } else {
+                    // Cycle: TOP_LEFT(0) -> TOP_RIGHT(1) -> BOTTOM_RIGHT(2) -> BOTTOM_LEFT(3) -> TOP_LEFT
+                    int next;
+                    switch (current) {
+                        case CORNER_TOP_LEFT:     next = CORNER_TOP_RIGHT; break;
+                        case CORNER_TOP_RIGHT:    next = CORNER_BOTTOM_RIGHT; break;
+                        case CORNER_BOTTOM_RIGHT: next = CORNER_BOTTOM_LEFT; break;
+                        case CORNER_BOTTOM_LEFT:  next = CORNER_TOP_LEFT; break;
+                        default:                  next = CORNER_TOP_LEFT; break;
+                    }
+                    keystone_select_corner(app->keystone, next);
+                    const char* names[] = {"TL(0)", "TR(1)", "BR(2)", "BL(3)"};
+                    printf("[CYCLE] %s -> %s (selected_corner is now %d)\n", 
+                           names[current], names[next], app->keystone->selected_corner);
+                }
+                app->input->gamepad_cycle_corner = false;
+            }
+            
+            // L1/R1: Decrease/increase step size
+            if (app->input->gamepad_decrease_step) {
+                keystone_decrease_step_size(app->keystone);
+                app->input->gamepad_decrease_step = false;
+            }
+            if (app->input->gamepad_increase_step) {
+                keystone_increase_step_size(app->keystone);
+                app->input->gamepad_increase_step = false;
+            }
+            
+            // SELECT: Reset keystone
+            if (app->input->gamepad_reset_keystone) {
+                keystone_reset_corners(app->keystone);
+                printf("Keystone reset to defaults (gamepad)\n");
+                app->input->gamepad_reset_keystone = false;
+            }
+            
+            // START: Toggle keystone mode (corners visibility)
+            if (app->input->gamepad_toggle_mode) {
+                keystone_toggle_corners(app->keystone);
+                app->input->gamepad_toggle_mode = false;
+            }
+        }
 
+        // OPTIMIZATION: Pre-decode next frame while rendering current frame
+        // This hides decode latency by overlapping decode with render/swap
+        static bool next_frame_ready = false;
+        static bool first_frame_decoded = false;
+        
         // Decode video frame if enough time has passed
         uint8_t *video_data = NULL;
         static int frame_count = 0;
@@ -248,32 +432,105 @@ void app_run(app_context_t *app) {
                 fflush(stdout);
                 frame_count = 1; // Skip further decode attempts
             } else {
-                // Measure decode time
-                clock_gettime(CLOCK_MONOTONIC, &decode_start);
-                int decode_result = video_decode_frame(app->video);
-                clock_gettime(CLOCK_MONOTONIC, &decode_end);
-                
-                decode_time = (decode_end.tv_sec - decode_start.tv_sec) +
-                            (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
-                
-                if (decode_result == 0) {
-                    if (frame_count == 0) {
-                        printf("First frame decoded successfully\n");
-                        fflush(stdout);
-                    }
-                    video_data = video_get_rgb_data(app->video);
-                    last_video_data = video_data;
-                    frame_count++;
+                // OPTIMIZATION: Use pre-decoded frame if available, then decode next
+                if (next_frame_ready && first_frame_decoded) {
+                    // Current frame was already decoded - just use it (zero decode time!)
+                    decode_time = 0.0;
                     
-                    // Update diagnostics
-                    total_decode_time += decode_time;
-                    diagnostic_frame_count++;
+                    // Get YUV data from already-decoded frame
+                    uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                    int y_stride = 0, u_stride = 0, v_stride = 0;
+                    video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                    
+                    if (y_data != NULL) {
+                        video_data = y_data;
+                        last_video_data = video_data;
+                        frame_count++;
+                        
+                        total_decode_time += decode_time;
+                        diagnostic_frame_count++;
+                        
+                        if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
+                            printf("DEBUG: Frame %d (pre-decoded, 0.0ms), diagnostic_frame_count=%d\n", 
+                                   frame_count, diagnostic_frame_count);
+                            fflush(stdout);
+                        }
+                        
+                        // Now decode the NEXT frame (during rendering of current frame)
+                        // This will be ready for next iteration
+                        next_frame_ready = false;
+                        // Actual decode happens after rendering (see below)
+                    }
+                } else {
+                    // Normal decode path (first frame or fallback)
+                    clock_gettime(CLOCK_MONOTONIC, &decode_start);
+                    int decode_result = video_decode_frame(app->video);
+                    clock_gettime(CLOCK_MONOTONIC, &decode_end);
+                    
+                    decode_time = (decode_end.tv_sec - decode_start.tv_sec) +
+                                (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
+                    
+                    if (decode_result == 0) {
+                        if (frame_count == 0) {
+                            printf("First frame decoded successfully\n");
+                            first_frame_decoded = true;
+                            fflush(stdout);
+                        }
+                        
+                        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                        int y_stride = 0, u_stride = 0, v_stride = 0;
+                        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                        
+                        if (y_data != NULL) {
+                            video_data = y_data;
+                            last_video_data = video_data;
+                            frame_count++;
+                            
+                            total_decode_time += decode_time;
+                            diagnostic_frame_count++;
+                            
+                            if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
+                                printf("DEBUG: Frame %d decoded (%.1fms), diagnostic_frame_count=%d\n", 
+                                       frame_count, decode_time * 1000, diagnostic_frame_count);
+                                fflush(stdout);
+                            }
+                            
+                            // Mark that we should pre-decode next time
+                            next_frame_ready = true;
+                        }
+                    } else if (video_is_eof(app->video)) {
+                        if (app->loop_playback) {
+                            printf("End of video reached - restarting playback (loop mode)\n");
+                            video_seek(app->video, 0);
+                            next_frame_ready = false;
+                            first_frame_decoded = false;
+                            first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
+                            frame_count = 0;
+                            // Update startup_time to reset the 5-second timeout
+                            clock_gettime(CLOCK_MONOTONIC, &startup_time);
+                        } else {
+                            printf("Playback finished.\n");
+                            app->running = false;
+                            break;
+                        }
+                    } else {
+                        if (frame_count < 10) {
+                            printf("Video decode failed: %d\n", decode_result);
+                            fflush(stdout);
+                        }
+                        video_data = last_video_data;
+                        next_frame_ready = false;
+                    }
+                }
+                
+                // Measure decode time (removed old code)
+                // clock_gettime(CLOCK_MONOTONIC, &decode_start);
                     
                     // Show diagnostic info periodically
-                    if (show_diagnostics && diagnostic_frame_count % 60 == 0) {
+                    if (app->show_timing && diagnostic_frame_count % 30 == 0) {
                         double avg_decode_time = total_decode_time / diagnostic_frame_count;
-                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms\n",
-                               avg_decode_time * 1000, target_frame_time * 1000);
+                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms, Frame count: %d\n",
+                               avg_decode_time * 1000, target_frame_time * 1000, diagnostic_frame_count);
                         fflush(stdout);
                     }
                     
@@ -285,56 +542,7 @@ void app_run(app_context_t *app) {
                 app->input->keys_pressed[KEY_DOWN] = false;
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
-                // printf("No corner selected, clearing arrow key states\n");
-            } else {
-                // printf("Corner %d selected, preserving arrow key states\n", 
-                //        app->keystone->selected_corner);
             }
-                    static int slow_decode_count = 0;
-                    if (decode_time > adaptive_frame_time * 2.0) { // More generous threshold
-                        slow_decode_count++;
-                        if (slow_decode_count == 1) {
-                            printf("Slow decode detected (%.1fms), enabling frame skipping\n", decode_time * 1000);
-                        }
-                        
-                        // Only skip 1 frame, and only every 3rd slow decode
-                        if (slow_decode_count % 3 == 0) {
-                            video_decode_frame(app->video); // Skip just 1 frame
-                        }
-                    } else {
-                        slow_decode_count = 0; // Reset when decode is fast again
-                    }
-                    
-                    // Successful decode - gradually speed up timing
-                    consecutive_decode_failures = 0;
-                    if (adaptive_frame_time > min_frame_time * 1.1) {
-                        adaptive_frame_time = adaptive_frame_time * 0.98; // Gradually faster
-                        if (adaptive_frame_time < min_frame_time * 1.1) {
-                            adaptive_frame_time = min_frame_time * 1.1; // Keep slightly slower than target
-                        }
-                    }
-                } else if (video_is_eof(app->video)) {
-                    printf("Playback finished.\n");
-                    app->running = false;
-                    break;
-                } else {
-                    if (frame_count < 10) {  // Only show first few decode errors
-                        printf("Video decode failed: %d\n", decode_result);
-                        fflush(stdout);
-                    }
-                    // Use last good frame if decode fails
-                    video_data = last_video_data;
-                    
-                    // Failed decode - slow down timing to give decoder more time
-                    consecutive_decode_failures++;
-                    if (consecutive_decode_failures >= 1) {
-                        adaptive_frame_time = adaptive_frame_time * 1.8; // Slow down more aggressively
-                        if (adaptive_frame_time > min_frame_time * 8) {
-                            adaptive_frame_time = min_frame_time * 8; // Cap at 8x slower
-                        }
-                        consecutive_decode_failures = 0; // Reset counter
-                    }
-                }
             }
         } else {
             // Use the last decoded frame for rendering
@@ -342,7 +550,7 @@ void app_run(app_context_t *app) {
         }
 
         // Get video dimensions
-        int video_width, video_height;
+        int video_width = 0, video_height = 0;
         video_get_dimensions(app->video, &video_width, &video_height);
         if (video_width == 0) {
             video_width = 256;
@@ -369,15 +577,25 @@ void app_run(app_context_t *app) {
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
         
-        // Only render if we have valid YUV data
-        if (y_data && u_data && v_data) {
-            // Render with YUV data (GPU will do YUV→RGB conversion)
-            gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                          y_stride, u_stride, v_stride, app->drm, app->keystone);
+        // Use NV12 format for optimized rendering
+        uint8_t *nv12_data = video_get_nv12_data(app->video);
+        int nv12_stride = video_get_nv12_stride(app->video);
+        
+        // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
+        if (false && nv12_data) {
+            // Render with NV12 packed format (faster - single texture upload)
+            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone);
         } else {
-            // Render a blank frame or keep the last frame displayed
-            gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                          0, 0, 0, app->drm, app->keystone);
+            // Fallback to original YUV rendering (for compatibility)
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+            
+            if (y_data && u_data && v_data) {
+                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                              y_stride, u_stride, v_stride, app->drm, app->keystone);
+            } else {
+                gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
+                              0, 0, 0, app->drm, app->keystone);
+            }
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
@@ -424,6 +642,32 @@ void app_run(app_context_t *app) {
         gl_swap_buffers(app->gl, app->drm);
         
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
+        
+        // OPTIMIZATION: Pre-decode next frame while GPU presents current frame
+        // This overlaps decode with VSync wait, hiding decode latency
+        if (first_frame_decoded && !next_frame_ready && frame_count > 0) {
+            struct timespec predecode_start, predecode_end;
+            clock_gettime(CLOCK_MONOTONIC, &predecode_start);
+            
+            int predecode_result = video_decode_frame(app->video);
+            
+            clock_gettime(CLOCK_MONOTONIC, &predecode_end);
+            double predecode_time = (predecode_end.tv_sec - predecode_start.tv_sec) +
+                                   (predecode_end.tv_nsec - predecode_start.tv_nsec) / 1e9;
+            
+            if (predecode_result == 0) {
+                next_frame_ready = true;
+                if (app->show_timing && frame_count < 5) {
+                    printf("Pre-decoded next frame in %.1fms (during swap/VSync)\n", predecode_time * 1000);
+                }
+            } else if (video_is_eof(app->video)) {
+                // EOF during pre-decode - will be handled in main decode section next iteration
+                next_frame_ready = false;
+            } else {
+                next_frame_ready = false;
+            }
+        }
+        
         clock_gettime(CLOCK_MONOTONIC, &render_end);
         
         // Calculate detailed timing for debugging
@@ -433,12 +677,43 @@ void app_run(app_context_t *app) {
                              (overlay_end.tv_nsec - overlay_start.tv_nsec) / 1e9;
         double swap_time = (swap_end.tv_sec - swap_start.tv_sec) + 
                           (swap_end.tv_nsec - swap_start.tv_nsec) / 1e9;
+                          
+        // Check if we should do a time-based timing report (every 2 seconds)
+        if (app->show_timing) {
+            struct timespec current_report_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_report_time);
+            double time_since_report = (current_report_time.tv_sec - last_timing_report.tv_sec) + 
+                                      (current_report_time.tv_nsec - last_timing_report.tv_nsec) / 1e9;
+                                      
+            if (time_since_report >= 2.0) {  // Every 2 seconds
+                printf("\n[TIME-BASED] Frames decoded: %d, Diagnostic frames: %d\n",
+                       frame_count, diagnostic_frame_count);
+                printf("[TIME-BASED] Last decode: %.1fms, Last render: %.1fms, Swap: %.1fms\n",
+                       decode_time * 1000, render_time * 1000, swap_time * 1000);
+                       
+                // Log to file as well
+                FILE *timing_log = fopen("timing_log.txt", "a");
+                if (timing_log) {
+                    fprintf(timing_log, "[%d] Frames: %d, Decode: %.1fms, Render: %.1fms\n",
+                           (int)current_report_time.tv_sec, frame_count, 
+                           decode_time * 1000, render_time * 1000);
+                    fclose(timing_log);
+                }
+                
+                // Reset the timer
+                last_timing_report = current_report_time;
+                fflush(stdout);
+            }
+        }
         
         // Report detailed timing for long frames
-        static int detailed_timing_count = 0;
-        if (swap_time > 0.050 || (detailed_timing_count++ % 120 == 0)) { // Every 2 seconds or if swap > 50ms
-            printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
-                   gl_time * 1000, overlay_time * 1000, swap_time * 1000);
+        if (app->show_timing) {
+            static int detailed_timing_count = 0;
+            if (swap_time > 0.050 || (detailed_timing_count++ % 60 == 0)) { // Every second or if swap > 50ms
+                printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
+                       gl_time * 1000, overlay_time * 1000, swap_time * 1000);
+                fflush(stdout);
+            }
         }
         render_time = (render_end.tv_sec - render_start.tv_sec) +
                     (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
@@ -460,16 +735,19 @@ void app_run(app_context_t *app) {
             nanosleep(&sleep_time, NULL);
             
             // Show render diagnostics periodically
-            if (show_diagnostics && diagnostic_frame_count % 60 == 0 && diagnostic_frame_count > 0) {
+            if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0) {
                 double avg_render_time = total_render_time / diagnostic_frame_count;
-                printf("Render timing - Avg render: %.1fms, Total frame: %.1fms\n",
-                       avg_render_time * 1000, total_frame_time * 1000);
+                printf("Render timing - Avg render: %.1fms, Total frame: %.1fms, Frames: %d\n",
+                       avg_render_time * 1000, total_frame_time * 1000, diagnostic_frame_count);
                 fflush(stdout);
             }
         } else {
             // We're running behind - no sleep, but don't make timing worse
-            printf("Frame overrun: %.1fms (target: %.1fms)\n", 
-                   total_frame_time * 1000, adaptive_frame_time * 1000);
+            if (app->show_timing) {
+                printf("Frame overrun: %.1fms (target: %.1fms)\n", 
+                       total_frame_time * 1000, adaptive_frame_time * 1000);
+                fflush(stdout);
+            }
             
             // FIXED: Only increase timing slightly if consistently overrunning
             static int overrun_count = 0;
@@ -491,10 +769,7 @@ void app_cleanup(app_context_t *app) {
         free(app->input);
     }
     if (app->keystone) {
-        // Save keystone settings on exit
-        if (keystone_save_settings(app->keystone) == 0) {
-            printf("Keystone settings saved on exit\n");
-        }
+        // Don't auto-save on exit - only save when user presses S key
         keystone_cleanup(app->keystone);
         free(app->keystone);
     }

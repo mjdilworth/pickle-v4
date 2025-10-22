@@ -2,7 +2,20 @@
 
 # Compiler and flags
 CC = gcc
+
+# OPTIMIZED: RPi4-specific compiler flags
 CFLAGS = -Wall -Wextra -std=c99 -O2 -g
+
+# ARM CPU Detection and NEON SIMD optimization (works for both armv7 and aarch64)
+ARCH_FLAGS = $(shell uname -m | grep -qE 'arm|aarch64' && echo '-ftree-vectorize -ffast-math')
+CFLAGS += $(ARCH_FLAGS)
+
+# Additional RPi4 optimizations
+RPi4_FLAGS = -pipe -fomit-frame-pointer -finline-functions -ffunction-sections -fdata-sections
+CFLAGS += $(RPi4_FLAGS)
+
+# Link-time optimization (reduce binary size, improve performance)
+CFLAGS += -flto=auto
 TARGET = pickle
 SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c keystone.c input_handler.c v4l2_utils.c
 OBJECTS = $(SOURCES:.c=.o)
@@ -29,9 +42,9 @@ endif
 # Default target
 all: $(TARGET)
 
-# Build the executable
+# Build the executable with optimizations
 $(TARGET): $(OBJECTS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LIBS)
+	$(CC) $(CFLAGS) -Wl,--gc-sections -Wl,-O1 -o $(TARGET) $(OBJECTS) $(LIBS)
 
 # Compile source files
 %.o: %.c
@@ -75,6 +88,26 @@ clean:
 # Rebuild (clean + build)
 rebuild: clean all
 
+# Strip binary for smaller size (optional)
+strip:
+	strip $(TARGET)
+
+# Show build flags
+show-flags:
+	@echo "Build flags for this system:"
+	@echo "CFLAGS: $(CFLAGS)"
+	@echo "ARCH_FLAGS: $(ARCH_FLAGS)"
+	@echo "System: $$(uname -m)"
+
+# Release build with maximum optimization
+release: CFLAGS = -Wall -Wextra -std=c99 -O3 -DNDEBUG
+release: CFLAGS += $(ARCH_FLAGS) $(RPi4_FLAGS)
+release: CFLAGS += -flto -fvisibility=hidden -ffunction-sections -fdata-sections
+release: LDFLAGS = -Wl,--gc-sections,-s
+release: clean $(TARGET)
+	@echo "Release build complete: $(TARGET)"
+	@ls -lh $(TARGET)
+
 # Debug build with extra symbols
 debug: CFLAGS += -DDEBUG -ggdb3
 debug: $(TARGET)
@@ -91,14 +124,18 @@ info:
 
 # Help target
 help:
+	@echo "Pickle Video Player - RPi4 Makefile"
+	@echo ""
 	@echo "Available targets:"
-	@echo "  all          - Build the video player (default)"
+	@echo "  all          - Build the video player (default, -O2 optimization)"
+	@echo "  release      - Build with maximum optimization (-O3 -flto, stripped)"
+	@echo "  debug        - Build with debug symbols (-ggdb3)"
 	@echo "  clean        - Remove generated files"
 	@echo "  rebuild      - Clean and build"
-	@echo "  debug        - Build with debug symbols"
 	@echo "  install-deps - Install required system dependencies"
 	@echo "  test         - Run with test.mp4 if available"
 	@echo "  info         - Show build configuration"
+	@echo "  show-flags   - Display compiler optimization flags"
 	@echo "  help         - Show this help"
 	@echo ""
 	@echo "Usage: sudo ./$(TARGET) <video_file.mp4>"
@@ -114,4 +151,4 @@ keystone.o: keystone.c keystone.h
 input_handler.o: input_handler.c input_handler.h
 
 # Phony targets
-.PHONY: all run test clean rebuild debug info help install-deps
+.PHONY: all run test clean rebuild debug release info help install-deps

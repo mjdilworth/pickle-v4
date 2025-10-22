@@ -16,6 +16,7 @@ typedef struct {
     
     // Corner highlighting
     bool show_corners;   // Toggle corner visibility
+    bool corners_dirty;  // Corner positions changed, need VBO update
     
     // Border highlighting
     bool show_border;    // Toggle border visibility
@@ -41,6 +42,9 @@ void keystone_toggle_border(keystone_context_t *keystone);
 bool keystone_border_visible(keystone_context_t *keystone);
 void keystone_toggle_help(keystone_context_t *keystone);
 bool keystone_help_visible(keystone_context_t *keystone);
+void keystone_increase_step_size(keystone_context_t *keystone);
+void keystone_decrease_step_size(keystone_context_t *keystone);
+float keystone_get_step_size(keystone_context_t *keystone);
 int keystone_save_to_file(keystone_context_t *keystone, const char *filename);
 int keystone_load_from_file(keystone_context_t *keystone, const char *filename);
 int keystone_save_settings(keystone_context_t *keystone);

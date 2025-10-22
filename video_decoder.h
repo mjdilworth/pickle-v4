@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
@@ -20,47 +21,32 @@ typedef enum {
 
 typedef struct {
     AVFormatContext *format_ctx;
-    AVCodecContext *codec_ctx;
     const AVCodec *codec;
-    AVFrame *frame;
-    AVFrame *hw_frame;        // For hardware decoded frames
+    AVCodecContext *codec_ctx;
     AVPacket *packet;
-    struct SwsContext *sws_ctx; // Fallback only
-    
+    AVFrame *frame;
     int video_stream_index;
-    uint32_t width;
-    uint32_t height;
+    int width;
+    int height;
     double fps;
     int64_t duration;
     
-    // Hardware decoding support
+    bool initialized;
     bool use_hardware_decode;
     hw_decode_type_t hw_decode_type;
-    enum AVPixelFormat hw_pix_fmt;
-    AVBufferRef *hw_device_ctx;
-    
-    // avcC to Annex-B conversion support
-    int avcc_length_size;       // NAL length size (1-4 bytes) for packet conversion
-    
-    // Frame buffering for smooth playback
-    #define MAX_BUFFERED_FRAMES 4
-    AVFrame *frame_buffer[MAX_BUFFERED_FRAMES];
-    int buffer_write_index;
-    int buffer_read_index;
-    int buffered_frame_count;
-    pthread_mutex_t buffer_mutex;
-    
-    // YUV output (no RGB conversion)
-    uint8_t *y_data, *u_data, *v_data;
-    int y_linesize, u_linesize, v_linesize;
-    
-    bool initialized;
+    int avcc_length_size; // For V4L2 M2M hardware decoder
     bool eof_reached;
-    bool loop_playback;         // Flag to enable looped playback
+    bool loop_playback;
+    bool using_drm_prime;
+    bool advanced_diagnostics; // Flag for detailed diagnostics output
+    
+    // 2-stage Bitstream filter chain for V4L2 M2M: avcC→Annex-B + AUD insertion
+    AVBSFContext *bsf_annexb_ctx;    // Stage 1: h264_mp4toannexb (avcC to Annex-B conversion)
+    AVBSFContext *bsf_aud_ctx;       // Stage 2: h264_metadata (AUD insertion)
 } video_context_t;
 
 // Video decoder functions
-int video_init(video_context_t *video, const char *filename);
+int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics);
 void video_cleanup(video_context_t *video);
 int video_decode_frame(video_context_t *video);
 uint8_t* video_get_rgb_data(video_context_t *video);  // Legacy - for fallback
@@ -72,6 +58,8 @@ int video_get_u_stride(video_context_t *video);
 int video_get_v_stride(video_context_t *video);
 void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_t **v, 
                        int *y_stride, int *u_stride, int *v_stride);  // New YUV output
+uint8_t* video_get_nv12_data(video_context_t *video);  // NV12 packed format
+int video_get_nv12_stride(video_context_t *video);
 double video_get_frame_time(video_context_t *video);
 bool video_is_eof(video_context_t *video);
 void video_seek(video_context_t *video, int64_t timestamp);

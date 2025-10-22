@@ -188,9 +188,10 @@ int keystone_init(keystone_context_t *keystone) {
     keystone->corners[CORNER_BOTTOM_RIGHT] = (point_t){ 1.0f, -1.0f};  // Corner 2 (visual) 
     keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f, -1.0f};  // Corner 1 (visual)
     
-    keystone->selected_corner = CORNER_BOTTOM_LEFT; // Select corner 1 by default
-    keystone->move_step = 0.05f; // Default movement per key press (5%)
+    keystone->selected_corner = CORNER_TOP_LEFT; // Start with top-left corner selected
+    keystone->move_step = 0.010f; // Default movement per key press (1%)
     keystone->matrix_dirty = true;
+    keystone->corners_dirty = true;  // Initial corners need VBO upload
     keystone->show_corners = true;  // Show corners by default
     keystone->show_border = true;   // Show border by default
     keystone->show_help = true;     // Show help by default
@@ -210,10 +211,8 @@ void keystone_cleanup(keystone_context_t *keystone) {
 void keystone_select_corner(keystone_context_t *keystone, int corner) {
     if (corner >= 0 && corner < 4) {
         keystone->selected_corner = corner;
-        printf("Selected corner %d\n", corner + 1);
     } else {
         keystone->selected_corner = -1;
-        printf("Deselected corner\n");
     }
 }
 
@@ -257,6 +256,7 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
             corner->y = prev_y;
         } else {
             keystone->matrix_dirty = true;
+            keystone->corners_dirty = true;  // Mark corners VBO needs update
         }
     }
 }
@@ -284,6 +284,7 @@ void keystone_reset_corners(keystone_context_t *keystone) {
     keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f,  1.0f};
     
     keystone->matrix_dirty = true;
+    keystone->corners_dirty = true;  // Mark corners VBO needs update
 }
 
 void keystone_toggle_corners(keystone_context_t *keystone) {
@@ -308,6 +309,26 @@ void keystone_toggle_help(keystone_context_t *keystone) {
 
 bool keystone_help_visible(keystone_context_t *keystone) {
     return keystone->show_help;
+}
+
+void keystone_increase_step_size(keystone_context_t *keystone) {
+    keystone->move_step += 0.01f;
+    if (keystone->move_step > 0.2f) {
+        keystone->move_step = 0.2f; // Max step size
+    }
+    printf("Keystone step size: %.3f\n", keystone->move_step);
+}
+
+void keystone_decrease_step_size(keystone_context_t *keystone) {
+    keystone->move_step -= 0.01f;
+    if (keystone->move_step < 0.005f) {
+        keystone->move_step = 0.005f; // Min step size
+    }
+    printf("Keystone step size: %.3f\n", keystone->move_step);
+}
+
+float keystone_get_step_size(keystone_context_t *keystone) {
+    return keystone->move_step;
 }
 
 int keystone_save_to_file(keystone_context_t *keystone, const char *filename) {

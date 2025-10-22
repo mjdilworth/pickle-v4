@@ -24,4 +24,8 @@ int convert_sample_avcc_to_annexb_inplace(uint8_t *sample, size_t sample_len, in
 // returns: length size (1-4), or -1 on error
 int get_avcc_length_size(const uint8_t *avcc, size_t avcc_len);
 
+// Check and print V4L2 hardware decoder capabilities
+// Returns 1 if h264 decoding is supported, 0 if not, -1 on error
+int check_v4l2_decoder_capabilities(void);
+
 #endif // V4L2_UTILS_H
