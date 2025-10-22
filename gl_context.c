@@ -954,16 +954,27 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     bool needs_update = keystone->corners_dirty || 
                         (cached_selected_corner != keystone->selected_corner);
     
+    // Always prepare corner colors (outside needs_update so available for rendering)
+    float corner_colors[4][4];
+    for (int i = 0; i < 4; i++) {
+        if (keystone->selected_corner == i) {
+            // Green for selected
+            corner_colors[i][0] = 0.0f;
+            corner_colors[i][1] = 1.0f;
+            corner_colors[i][2] = 0.0f;
+            corner_colors[i][3] = 1.0f;
+        } else {
+            // White for unselected
+            corner_colors[i][0] = 1.0f;
+            corner_colors[i][1] = 1.0f;
+            corner_colors[i][2] = 1.0f;
+            corner_colors[i][3] = 1.0f;
+        }
+    }
+    
     if (needs_update) {
         cached_selected_corner = keystone->selected_corner;
         keystone->corners_dirty = false;  // Clear dirty flag
-        
-        // Enable blending for transparent overlays
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        
-        // Disable depth testing to ensure overlays are always visible
-        glDisable(GL_DEPTH_TEST);
         
         // Create corner positions (small squares)
         float corner_size = 0.015f; // 1.5% of screen size (smaller)
@@ -971,64 +982,53 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         // Corner vertices with colors: [x, y, r, g, b, a] per vertex
         int vertex_count = 0;
         
-        // Determine colors for each corner
-        float corner_colors[4][4];
+        // Render corner indicators at the keystone corner positions
         for (int i = 0; i < 4; i++) {
-            if (keystone->selected_corner == i) {
-                // Green for selected
-                corner_colors[i][0] = 0.0f;
-                corner_colors[i][1] = 1.0f;
-                corner_colors[i][2] = 0.0f;
-                corner_colors[i][3] = 1.0f;
-            } else {
-                // White for unselected
-                corner_colors[i][0] = 1.0f;
-                corner_colors[i][1] = 1.0f;
-                corner_colors[i][2] = 1.0f;
-                corner_colors[i][3] = 1.0f;
+            // Get the keystone corner position
+            float tx = keystone->corners[i].x;
+            float ty = keystone->corners[i].y;
+            float *color = corner_colors[i];
+            
+            // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
+            if (vertex_count + 4 <= 1600) { // Leave room for text
+                // Bottom-left
+                corner_vertices[vertex_count*6 + 0] = tx - corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty - corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+                
+                // Bottom-right
+                corner_vertices[vertex_count*6 + 0] = tx + corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty - corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+                
+                // Top-right
+                corner_vertices[vertex_count*6 + 0] = tx + corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty + corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
+                
+                // Top-left
+                corner_vertices[vertex_count*6 + 0] = tx - corner_size;
+                corner_vertices[vertex_count*6 + 1] = ty + corner_size;
+                corner_vertices[vertex_count*6 + 2] = color[0];
+                corner_vertices[vertex_count*6 + 3] = color[1];
+                corner_vertices[vertex_count*6 + 4] = color[2];
+                corner_vertices[vertex_count*6 + 5] = color[3];
+                vertex_count++;
             }
         }
-    
-    // Render corner indicators at the keystone corner positions
-    for (int i = 0; i < 4; i++) {
-        // Get the keystone corner position
-        float tx = keystone->corners[i].x;
-        float ty = keystone->corners[i].y;
-        float *color = corner_colors[i];
         
-        // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
-        if (vertex_count + 4 <= 1600) { // Leave room for text
-            // Bottom-left
-            corner_vertices[vertex_count*6 + 0] = tx - corner_size;
-            corner_vertices[vertex_count*6 + 1] = ty - corner_size;
-            corner_vertices[vertex_count*6 + 2] = color[0];
-            corner_vertices[vertex_count*6 + 3] = color[1];
-            corner_vertices[vertex_count*6 + 4] = color[2];
-            corner_vertices[vertex_count*6 + 5] = color[3];
-            vertex_count++;
-            
-            // Bottom-right
-            corner_vertices[vertex_count*6 + 0] = tx + corner_size;
-            corner_vertices[vertex_count*6 + 1] = ty - corner_size;
-            corner_vertices[vertex_count*6 + 2] = color[0];
-            corner_vertices[vertex_count*6 + 3] = color[1];
-            corner_vertices[vertex_count*6 + 4] = color[2];
-            corner_vertices[vertex_count*6 + 5] = color[3];
-            vertex_count++;
-            
-            // Top-right
-            corner_vertices[vertex_count*6 + 0] = tx + corner_size;
-            corner_vertices[vertex_count*6 + 1] = ty + corner_size;
-            corner_vertices[vertex_count*6 + 2] = color[0];
-            corner_vertices[vertex_count*6 + 3] = color[1];
-            corner_vertices[vertex_count*6 + 4] = color[2];
-            corner_vertices[vertex_count*6 + 5] = color[3];
-            vertex_count++;
-        }
-        
-        // Skip text for now - we'll add it back later
-    }
-    
         // OPTIMIZED: Use glBufferSubData instead of glBufferData
         // glBufferSubData only updates the data, much faster than reallocating
         glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
