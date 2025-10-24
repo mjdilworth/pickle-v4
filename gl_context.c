@@ -1080,6 +1080,99 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
     }
     
+    // Render mesh points if mesh mode is enabled
+    if (keystone->mesh.mesh_enabled && keystone->show_corners) {
+        static float mesh_vertices[10000];  // Vertices for mesh points
+        static GLuint mesh_vbo = 0;
+        static bool mesh_vbo_init = false;
+        
+        if (!mesh_vbo_init) {
+            glGenBuffers(1, &mesh_vbo);
+            mesh_vbo_init = true;
+        }
+        
+        // Build mesh point vertices
+        float mesh_point_size = 0.010f;  // Slightly smaller than corners
+        int mesh_vertex_count = 0;
+        
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++) {
+                point_t *pt = &keystone->mesh.grid[y][x];
+                float tx = pt->x;
+                float ty = pt->y;
+                
+                // Determine color based on selection
+                float r, g, b, a;
+                if (keystone->mesh_selected_x == x && keystone->mesh_selected_y == y) {
+                    // Green for selected
+                    r = 0.0f; g = 1.0f; b = 0.0f; a = 1.0f;
+                } else {
+                    // Cyan for unselected mesh points
+                    r = 0.0f; g = 1.0f; b = 1.0f; a = 0.7f;
+                }
+                
+                // Create small square (4 vertices per point)
+                if (mesh_vertex_count + 4 <= 1600) {
+                    // Bottom-left
+                    mesh_vertices[mesh_vertex_count*6 + 0] = tx - mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 1] = ty - mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 2] = r;
+                    mesh_vertices[mesh_vertex_count*6 + 3] = g;
+                    mesh_vertices[mesh_vertex_count*6 + 4] = b;
+                    mesh_vertices[mesh_vertex_count*6 + 5] = a;
+                    mesh_vertex_count++;
+                    
+                    // Bottom-right
+                    mesh_vertices[mesh_vertex_count*6 + 0] = tx + mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 1] = ty - mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 2] = r;
+                    mesh_vertices[mesh_vertex_count*6 + 3] = g;
+                    mesh_vertices[mesh_vertex_count*6 + 4] = b;
+                    mesh_vertices[mesh_vertex_count*6 + 5] = a;
+                    mesh_vertex_count++;
+                    
+                    // Top-right
+                    mesh_vertices[mesh_vertex_count*6 + 0] = tx + mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 1] = ty + mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 2] = r;
+                    mesh_vertices[mesh_vertex_count*6 + 3] = g;
+                    mesh_vertices[mesh_vertex_count*6 + 4] = b;
+                    mesh_vertices[mesh_vertex_count*6 + 5] = a;
+                    mesh_vertex_count++;
+                    
+                    // Top-left
+                    mesh_vertices[mesh_vertex_count*6 + 0] = tx - mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 1] = ty + mesh_point_size;
+                    mesh_vertices[mesh_vertex_count*6 + 2] = r;
+                    mesh_vertices[mesh_vertex_count*6 + 3] = g;
+                    mesh_vertices[mesh_vertex_count*6 + 4] = b;
+                    mesh_vertices[mesh_vertex_count*6 + 5] = a;
+                    mesh_vertex_count++;
+                }
+            }
+        }
+        
+        // Upload mesh vertices to separate VBO
+        glBindBuffer(GL_ARRAY_BUFFER, mesh_vbo);
+        glBufferData(GL_ARRAY_BUFFER, mesh_vertex_count * 6 * sizeof(float), mesh_vertices, GL_DYNAMIC_DRAW);
+        
+        // Re-set up vertex attributes for mesh (position + color) 
+        int stride = 6 * sizeof(float);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+        
+        // Draw mesh points
+        for (int i = 0; i < mesh_vertex_count / 4; i++) {
+            glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+        }
+        
+        // Restore corner VBO for any subsequent rendering
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+        int corner_stride = 6 * sizeof(float);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, corner_stride, (void*)0);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, corner_stride, (void*)(2 * sizeof(float)));
+    }
+    
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1); // Disable color attribute
     
@@ -1103,53 +1196,7 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
     
-    // Create border line vertices with color (4 lines connecting the corners)
-    // Each vertex: x, y, r, g, b, a (6 floats per vertex)
-    float border_vertices[48]; // 8 vertices * 6 floats = 48 floats
-    
-    // Yellow color for all border vertices
-    float r = 1.0f, g = 1.0f, b = 0.0f, a = 1.0f;
-    
-    // Show the control point positions (where user has positioned corners)
-    point_t *corners = keystone->corners;
-    
-    // Line 1: Top-left to top-right (use direct Y coordinates)
-    border_vertices[0] = corners[CORNER_TOP_LEFT].x;
-    border_vertices[1] = corners[CORNER_TOP_LEFT].y;
-    border_vertices[2] = r; border_vertices[3] = g; border_vertices[4] = b; border_vertices[5] = a;
-    border_vertices[6] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[7] = corners[CORNER_TOP_RIGHT].y;
-    border_vertices[8] = r; border_vertices[9] = g; border_vertices[10] = b; border_vertices[11] = a;
-    
-    // Line 2: Top-right to bottom-right
-    border_vertices[12] = corners[CORNER_TOP_RIGHT].x;
-    border_vertices[13] = corners[CORNER_TOP_RIGHT].y;
-    border_vertices[14] = r; border_vertices[15] = g; border_vertices[16] = b; border_vertices[17] = a;
-    border_vertices[18] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[19] = corners[CORNER_BOTTOM_RIGHT].y;
-    border_vertices[20] = r; border_vertices[21] = g; border_vertices[22] = b; border_vertices[23] = a;
-    
-    // Line 3: Bottom-right to bottom-left
-    border_vertices[24] = corners[CORNER_BOTTOM_RIGHT].x;
-    border_vertices[25] = corners[CORNER_BOTTOM_RIGHT].y;
-    border_vertices[26] = r; border_vertices[27] = g; border_vertices[28] = b; border_vertices[29] = a;
-    border_vertices[30] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[31] = corners[CORNER_BOTTOM_LEFT].y;
-    border_vertices[32] = r; border_vertices[33] = g; border_vertices[34] = b; border_vertices[35] = a;
-    
-    // Line 4: Bottom-left to top-left
-    border_vertices[36] = corners[CORNER_BOTTOM_LEFT].x;
-    border_vertices[37] = corners[CORNER_BOTTOM_LEFT].y;
-    border_vertices[38] = r; border_vertices[39] = g; border_vertices[40] = b; border_vertices[41] = a;
-    border_vertices[42] = corners[CORNER_TOP_LEFT].x;
-    border_vertices[43] = corners[CORNER_TOP_LEFT].y;
-    border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
-    
-    // Update border VBO with new positions
-    glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(border_vertices), border_vertices, GL_DYNAMIC_DRAW);
-    
-    // Use corner shader program (same as corners, just different geometry)
+    // Use corner shader program
     glUseProgram(gl->corner_program);
     
     // Set up vertex attributes (interleaved position + color)
@@ -1170,14 +1217,128 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Set line width for better visibility
-    glLineWidth(3.0f);
-    
-    // Draw border as 4 separate lines (8 vertices with colors from vertex data)
-    glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
-    
-    // Reset line width
-    glLineWidth(1.0f);
+    if (keystone->mesh.mesh_enabled) {
+        // Render mesh grid lines connecting all 64 mesh points
+        static float mesh_border_vertices[5000];
+        static GLuint mesh_border_vbo = 0;
+        static bool mesh_border_init = false;
+        
+        if (!mesh_border_init) {
+            glGenBuffers(1, &mesh_border_vbo);
+            mesh_border_init = true;
+        }
+        
+        // Build mesh grid lines (cyan for mesh)
+        float r = 0.0f, g = 1.0f, b = 1.0f, a = 0.5f;
+        int vertex_count = 0;
+        
+        // Draw horizontal lines (8 lines across the grid)
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 7; x++) {
+                if (vertex_count + 2 <= 2500) {
+                    // Line from point (x, y) to (x+1, y)
+                    point_t *p1 = &keystone->mesh.grid[y][x];
+                    point_t *p2 = &keystone->mesh.grid[y][x+1];
+                    
+                    mesh_border_vertices[vertex_count*6 + 0] = p1->x;
+                    mesh_border_vertices[vertex_count*6 + 1] = p1->y;
+                    mesh_border_vertices[vertex_count*6 + 2] = r;
+                    mesh_border_vertices[vertex_count*6 + 3] = g;
+                    mesh_border_vertices[vertex_count*6 + 4] = b;
+                    mesh_border_vertices[vertex_count*6 + 5] = a;
+                    vertex_count++;
+                    
+                    mesh_border_vertices[vertex_count*6 + 0] = p2->x;
+                    mesh_border_vertices[vertex_count*6 + 1] = p2->y;
+                    mesh_border_vertices[vertex_count*6 + 2] = r;
+                    mesh_border_vertices[vertex_count*6 + 3] = g;
+                    mesh_border_vertices[vertex_count*6 + 4] = b;
+                    mesh_border_vertices[vertex_count*6 + 5] = a;
+                    vertex_count++;
+                }
+            }
+        }
+        
+        // Draw vertical lines (8 lines down the grid)
+        for (int x = 0; x < 8; x++) {
+            for (int y = 0; y < 7; y++) {
+                if (vertex_count + 2 <= 2500) {
+                    // Line from point (x, y) to (x, y+1)
+                    point_t *p1 = &keystone->mesh.grid[y][x];
+                    point_t *p2 = &keystone->mesh.grid[y+1][x];
+                    
+                    mesh_border_vertices[vertex_count*6 + 0] = p1->x;
+                    mesh_border_vertices[vertex_count*6 + 1] = p1->y;
+                    mesh_border_vertices[vertex_count*6 + 2] = r;
+                    mesh_border_vertices[vertex_count*6 + 3] = g;
+                    mesh_border_vertices[vertex_count*6 + 4] = b;
+                    mesh_border_vertices[vertex_count*6 + 5] = a;
+                    vertex_count++;
+                    
+                    mesh_border_vertices[vertex_count*6 + 0] = p2->x;
+                    mesh_border_vertices[vertex_count*6 + 1] = p2->y;
+                    mesh_border_vertices[vertex_count*6 + 2] = r;
+                    mesh_border_vertices[vertex_count*6 + 3] = g;
+                    mesh_border_vertices[vertex_count*6 + 4] = b;
+                    mesh_border_vertices[vertex_count*6 + 5] = a;
+                    vertex_count++;
+                }
+            }
+        }
+        
+        glBindBuffer(GL_ARRAY_BUFFER, mesh_border_vbo);
+        glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), mesh_border_vertices, GL_DYNAMIC_DRAW);
+        
+        glLineWidth(2.0f);
+        glDrawArrays(GL_LINES, 0, vertex_count);
+        glLineWidth(1.0f);
+        
+    } else {
+        // Render corner border (yellow, 4 lines)
+        float border_vertices[48]; // 8 vertices * 6 floats = 48 floats
+        float r = 1.0f, g = 1.0f, b = 0.0f, a = 1.0f;
+        
+        point_t *corners = keystone->corners;
+        
+        // Line 1: Top-left to top-right
+        border_vertices[0] = corners[CORNER_TOP_LEFT].x;
+        border_vertices[1] = corners[CORNER_TOP_LEFT].y;
+        border_vertices[2] = r; border_vertices[3] = g; border_vertices[4] = b; border_vertices[5] = a;
+        border_vertices[6] = corners[CORNER_TOP_RIGHT].x;
+        border_vertices[7] = corners[CORNER_TOP_RIGHT].y;
+        border_vertices[8] = r; border_vertices[9] = g; border_vertices[10] = b; border_vertices[11] = a;
+        
+        // Line 2: Top-right to bottom-right
+        border_vertices[12] = corners[CORNER_TOP_RIGHT].x;
+        border_vertices[13] = corners[CORNER_TOP_RIGHT].y;
+        border_vertices[14] = r; border_vertices[15] = g; border_vertices[16] = b; border_vertices[17] = a;
+        border_vertices[18] = corners[CORNER_BOTTOM_RIGHT].x;
+        border_vertices[19] = corners[CORNER_BOTTOM_RIGHT].y;
+        border_vertices[20] = r; border_vertices[21] = g; border_vertices[22] = b; border_vertices[23] = a;
+        
+        // Line 3: Bottom-right to bottom-left
+        border_vertices[24] = corners[CORNER_BOTTOM_RIGHT].x;
+        border_vertices[25] = corners[CORNER_BOTTOM_RIGHT].y;
+        border_vertices[26] = r; border_vertices[27] = g; border_vertices[28] = b; border_vertices[29] = a;
+        border_vertices[30] = corners[CORNER_BOTTOM_LEFT].x;
+        border_vertices[31] = corners[CORNER_BOTTOM_LEFT].y;
+        border_vertices[32] = r; border_vertices[33] = g; border_vertices[34] = b; border_vertices[35] = a;
+        
+        // Line 4: Bottom-left to top-left
+        border_vertices[36] = corners[CORNER_BOTTOM_LEFT].x;
+        border_vertices[37] = corners[CORNER_BOTTOM_LEFT].y;
+        border_vertices[38] = r; border_vertices[39] = g; border_vertices[40] = b; border_vertices[41] = a;
+        border_vertices[42] = corners[CORNER_TOP_LEFT].x;
+        border_vertices[43] = corners[CORNER_TOP_LEFT].y;
+        border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
+        
+        glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(border_vertices), border_vertices, GL_DYNAMIC_DRAW);
+        
+        glLineWidth(3.0f);
+        glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
+        glLineWidth(1.0f);
+    }
     
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
@@ -1185,8 +1346,6 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
     glEnable(GL_DEPTH_TEST);
-    
-    // NOTE: Don't unbind buffers here - video_player.c handles complete state restoration
 }
 
 // Complete 5x7 bitmap font data - each byte represents one row, 5 bits used

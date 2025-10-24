@@ -15,6 +15,7 @@ typedef struct {
     bool toggle_corners;
     bool toggle_border;
     bool toggle_help;
+    bool toggle_mesh_warp;        // Toggle mesh warp mode
     bool save_keystone;
     
     // Terminal input fallback
@@ -59,6 +60,7 @@ void input_restore_terminal_global(void);  // Emergency terminal restoration
 #define KEY_CORNER_2     KEY_2
 #define KEY_CORNER_3     KEY_3
 #define KEY_CORNER_4     KEY_4
+#define KEY_MESH_WARP    KEY_M
 
 // Gamepad button mappings for 8BitDo Zero 2 (using joystick API)
 // These match the js_event.number values from /dev/input/js0

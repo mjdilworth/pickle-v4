@@ -83,7 +83,15 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         move_y = up ? 1.0f : -1.0f;
     }
 
-    if (app->keystone->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
+    // Check if we have a point selected (either corner or mesh point)
+    bool has_selection = false;
+    if (app->keystone->mesh.mesh_enabled) {
+        has_selection = (app->keystone->mesh_selected_x >= 0 && app->keystone->mesh_selected_y >= 0);
+    } else {
+        has_selection = (app->keystone->selected_corner >= 0);
+    }
+    
+    if (!has_selection || (move_x == 0.0f && move_y == 0.0f)) {
         return false;
     }
     
@@ -99,7 +107,12 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         if (speed_scale > 3.0f) speed_scale = 3.0f;
     }
 
-    keystone_move_corner(app->keystone, move_x * speed_scale, move_y * speed_scale);
+    // Handle movement for mesh points or corners
+    if (app->keystone->mesh.mesh_enabled) {
+        keystone_mesh_move_point(app->keystone, move_x * speed_scale, move_y * speed_scale);
+    } else {
+        keystone_move_corner(app->keystone, move_x * speed_scale, move_y * speed_scale);
+    }
     app->needs_redraw = true;
     return true;
 }
@@ -304,19 +317,38 @@ void app_run(app_context_t *app) {
             break;
         }
 
-        // Handle keystone corner selection - match visual numbering
-        // Key should select the corner with the matching visual number
-        if (input_is_key_just_pressed(app->input, KEY_1)) {
-            keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);  // Visual "1" (bottom-left)
-        } else if (input_is_key_just_pressed(app->input, KEY_2)) {
-            keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT); // Visual "2" (bottom-right)
-        } else if (input_is_key_just_pressed(app->input, KEY_3)) {
-            keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);    // Visual "3" (top-right)
-        } else if (input_is_key_just_pressed(app->input, KEY_4)) {
-            keystone_select_corner(app->keystone, CORNER_TOP_LEFT);     // Visual "4" (top-left)
+        // Handle keystone corner/mesh selection
+        if (app->keystone->mesh.mesh_enabled) {
+            // In mesh mode: Keys 1-9 select mesh points in a 3x3 grid pattern
+            // 1 2 3
+            // 4 5 6  
+            // 7 8 9 (9 = center)
+            if (input_is_key_just_pressed(app->input, KEY_1)) {
+                keystone_mesh_select_point(app->keystone, 0, 0);  // Top-left
+            } else if (input_is_key_just_pressed(app->input, KEY_2)) {
+                keystone_mesh_select_point(app->keystone, 3, 0);  // Top-center (x=3, y=0)
+            } else if (input_is_key_just_pressed(app->input, KEY_3)) {
+                keystone_mesh_select_point(app->keystone, 7, 0);  // Top-right
+            } else if (input_is_key_just_pressed(app->input, KEY_4)) {
+                keystone_mesh_select_point(app->keystone, 0, 3);  // Middle-left
+            } else if (input_is_key_just_pressed(app->input, KEY_5)) {
+                keystone_mesh_select_point(app->keystone, 3, 3);  // Middle-center (grid center)
+            }
+            // Note: Can extend to KEY_6, KEY_7, KEY_8, KEY_9 for additional points
+        } else {
+            // In corner mode: Keys 1-4 select corners
+            if (input_is_key_just_pressed(app->input, KEY_1)) {
+                keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);  // Visual "1" (bottom-left)
+            } else if (input_is_key_just_pressed(app->input, KEY_2)) {
+                keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT); // Visual "2" (bottom-right)
+            } else if (input_is_key_just_pressed(app->input, KEY_3)) {
+                keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);    // Visual "3" (top-right)
+            } else if (input_is_key_just_pressed(app->input, KEY_4)) {
+                keystone_select_corner(app->keystone, CORNER_TOP_LEFT);     // Visual "4" (top-left)
+            }
         }
         
-        // Check for arrow key input (simply helps the corner movement by triggering input_is_key_pressed)
+        // Check for arrow key input (simply helps the corner/mesh movement by triggering input_is_key_pressed)
 
         // Reset keystone to defaults
         if (input_is_key_just_pressed(app->input, KEY_R)) {
@@ -351,6 +383,12 @@ void app_run(app_context_t *app) {
         if (app->input->toggle_help) {
             keystone_toggle_help(app->keystone);
             app->input->toggle_help = false; // Reset flag
+        }
+        
+        // Toggle mesh warp mode (M key)
+        if (app->input->toggle_mesh_warp) {
+            keystone_toggle_mesh_warp(app->keystone);
+            app->input->toggle_mesh_warp = false; // Reset flag
         }
         
         // Gamepad-specific actions

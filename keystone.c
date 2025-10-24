@@ -199,6 +199,13 @@ int keystone_init(keystone_context_t *keystone) {
     // Initialize identity matrix
     matrix_identity(keystone->matrix);
     
+    // Initialize 8x8 mesh warp grid (default: no warping)
+    keystone->mesh.mesh_enabled = false;
+    keystone->mesh.mesh_dirty = true;
+    keystone->mesh_selected_x = -1;  // No mesh point selected initially
+    keystone->mesh_selected_y = -1;
+    keystone_reset_mesh(keystone);
+    
     // Keystone correction initialization complete
     return 0;
 }
@@ -261,12 +268,34 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
     }
 }
 
+// Calculate perspective matrix from 8x8 mesh grid
+// Uses mesh grid corners to generate perspective transformation
+static void calculate_mesh_perspective_matrix(float *matrix, const mesh_warp_t *mesh) {
+    // Extract 4 corners from the 8x8 mesh grid to use as perspective points
+    // Grid indices: [0][0]=TL, [0][7]=TR, [7][7]=BR, [7][0]=BL
+    point_t mesh_corners[4] = {
+        mesh->grid[0][0],   // Top-left
+        mesh->grid[0][7],   // Top-right
+        mesh->grid[7][7],   // Bottom-right
+        mesh->grid[7][0]    // Bottom-left
+    };
+    
+    // Calculate perspective transformation using these mesh-derived corners
+    calculate_perspective_matrix(matrix, mesh_corners);
+}
+
 void keystone_calculate_matrix(keystone_context_t *keystone) {
     if (!keystone->matrix_dirty) {
         return;
     }
     
-    calculate_perspective_matrix(keystone->matrix, keystone->corners);
+    // Use mesh-based calculation if mesh mode is enabled
+    if (keystone->mesh.mesh_enabled) {
+        calculate_mesh_perspective_matrix(keystone->matrix, &keystone->mesh);
+    } else {
+        calculate_perspective_matrix(keystone->matrix, keystone->corners);
+    }
+    
     keystone->matrix_dirty = false;
 }
 
@@ -416,3 +445,131 @@ int keystone_load_settings(keystone_context_t *keystone) {
     }
     return 0;
 }
+
+// ============================================================================
+// Mesh Warp Functions (8x8 grid control points)
+// ============================================================================
+
+void keystone_reset_mesh(keystone_context_t *keystone) {
+    if (!keystone) return;
+    
+    // Initialize 8x8 mesh grid with evenly spaced control points
+    // Maps from [-1, 1] to [-1, 1] (normalized coordinates)
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            // Calculate normalized grid position (-1 to 1)
+            float grid_x = -1.0f + (x / 7.0f) * 2.0f;  // x: -1 to 1
+            float grid_y = 1.0f - (y / 7.0f) * 2.0f;   // y: 1 to -1 (top to bottom)
+            
+            keystone->mesh.grid[y][x] = (point_t){grid_x, grid_y};
+        }
+    }
+    
+    keystone->mesh.mesh_dirty = true;
+    printf("[MESH] Reset to default 8x8 grid\n");
+}
+
+void keystone_toggle_mesh_warp(keystone_context_t *keystone) {
+    if (!keystone) return;
+    
+    keystone->mesh.mesh_enabled = !keystone->mesh.mesh_enabled;
+    printf("[MESH] Mesh warp mode %s\n", keystone->mesh.mesh_enabled ? "ENABLED" : "DISABLED");
+    
+    if (keystone->mesh.mesh_enabled) {
+        // When enabling mesh mode, set the mesh grid corners to match current keystone corners
+        // This ensures no visual jump when toggling mesh mode
+        keystone->mesh.grid[0][0] = keystone->corners[CORNER_TOP_LEFT];     // TL
+        keystone->mesh.grid[0][7] = keystone->corners[CORNER_TOP_RIGHT];    // TR
+        keystone->mesh.grid[7][7] = keystone->corners[CORNER_BOTTOM_RIGHT]; // BR
+        keystone->mesh.grid[7][0] = keystone->corners[CORNER_BOTTOM_LEFT];  // BL
+        
+        // Interpolate interior points based on these corners
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++) {
+                if ((y == 0 || y == 7) && (x == 0 || x == 7)) {
+                    // Corner points already set above
+                    continue;
+                }
+                
+                // Bilinear interpolation: blend between corner positions based on grid position
+                float t_x = x / 7.0f;  // 0 to 1
+                float t_y = y / 7.0f;  // 0 to 1
+                
+                // Interpolate X coordinate
+                float x_top = keystone->mesh.grid[0][0].x + t_x * (keystone->mesh.grid[0][7].x - keystone->mesh.grid[0][0].x);
+                float x_bot = keystone->mesh.grid[7][0].x + t_x * (keystone->mesh.grid[7][7].x - keystone->mesh.grid[7][0].x);
+                float interp_x = x_top + t_y * (x_bot - x_top);
+                
+                // Interpolate Y coordinate
+                float y_top = keystone->mesh.grid[0][0].y + t_x * (keystone->mesh.grid[0][7].y - keystone->mesh.grid[0][0].y);
+                float y_bot = keystone->mesh.grid[7][0].y + t_x * (keystone->mesh.grid[7][7].y - keystone->mesh.grid[7][0].y);
+                float interp_y = y_top + t_y * (y_bot - y_top);
+                
+                keystone->mesh.grid[y][x] = (point_t){interp_x, interp_y};
+            }
+        }
+        
+        keystone->matrix_dirty = true;  // Force recalculation with mesh
+        
+        printf("[MESH] Initialized mesh grid to match current keystone corners\n");
+        printf("[MESH] Corners: TL=(%.3f,%.3f) TR=(%.3f,%.3f) BR=(%.3f,%.3f) BL=(%.3f,%.3f)\n",
+               keystone->mesh.grid[0][0].x, keystone->mesh.grid[0][0].y,
+               keystone->mesh.grid[0][7].x, keystone->mesh.grid[0][7].y,
+               keystone->mesh.grid[7][7].x, keystone->mesh.grid[7][7].y,
+               keystone->mesh.grid[7][0].x, keystone->mesh.grid[7][0].y);
+    } else {
+        // When disabling mesh mode, just mark matrix dirty to recalculate with corners
+        keystone->matrix_dirty = true;
+    }
+}
+
+bool keystone_mesh_warp_enabled(keystone_context_t *keystone) {
+    if (!keystone) return false;
+    return keystone->mesh.mesh_enabled;
+}
+
+// Select a mesh grid point (0-7 for both x and y)
+void keystone_mesh_select_point(keystone_context_t *keystone, int x, int y) {
+    if (!keystone) return;
+    
+    if (x >= 0 && x < 8 && y >= 0 && y < 8) {
+        keystone->mesh_selected_x = x;
+        keystone->mesh_selected_y = y;
+        printf("[MESH] Selected mesh point (%d, %d)\n", x, y);
+    } else {
+        keystone->mesh_selected_x = -1;
+        keystone->mesh_selected_y = -1;
+    }
+}
+
+// Move a mesh grid point
+void keystone_mesh_move_point(keystone_context_t *keystone, float dx, float dy) {
+    if (!keystone) return;
+    if (keystone->mesh_selected_x < 0 || keystone->mesh_selected_y < 0) {
+        return;  // No mesh point selected
+    }
+    
+    int x = keystone->mesh_selected_x;
+    int y = keystone->mesh_selected_y;
+    
+    // Get movement step
+    float move_step = keystone->move_step;
+    if (move_step <= 0.0f) {
+        move_step = 0.010f;
+    }
+    
+    // Apply movement to the selected mesh point
+    point_t *point = &keystone->mesh.grid[y][x];
+    point->x += dx * move_step;
+    point->y += dy * move_step;
+    
+    // Clamp to valid range
+    if (point->x < -1.5f) point->x = -1.5f;
+    if (point->x >  1.5f) point->x =  1.5f;
+    if (point->y < -1.5f) point->y = -1.5f;
+    if (point->y >  1.5f) point->y =  1.5f;
+    
+    keystone->mesh.mesh_dirty = true;
+    keystone->matrix_dirty = true;
+}
+

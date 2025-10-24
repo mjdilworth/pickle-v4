@@ -188,7 +188,7 @@ static int setup_terminal_input(input_context_t *input) {
     g_terminal_modified = true;
     
     printf("Using terminal input mode (press keys directly)\n");
-    printf("Controls: 1-4=select corner, arrows=move, s=save, r=reset, c=corners, b=border, h=help, q=quit\n");
+    printf("Controls: 1-4=select corner, arrows=move, s=save, r=reset, c=corners, b=border, h=help, m=mesh, q=quit\n");
     fflush(stdout);
     return 0;
 }
@@ -423,6 +423,12 @@ void input_update(input_context_t *input) {
                     // printf("Toggle help overlay\n");
                     break;
 
+                case 'm':
+                case 'M':
+                    input->toggle_mesh_warp = true;
+                    printf("M key pressed (toggle mesh warp)\n");
+                    break;
+
                 case 'r':
                 case 'R':
                     input->keys_just_pressed[KEY_R] = true;
@@ -485,6 +491,10 @@ void input_update(input_context_t *input) {
                                 break;
                             case KEY_R:
                                 // printf("R pressed (reset keystone)\n");
+                                break;
+                            case KEY_M:
+                                input->toggle_mesh_warp = true;
+                                printf("M key pressed (toggle mesh warp)\n");
                                 break;
                         }
                 }
