@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include "drm_display.h"
 #include "keystone.h"
+#include "wifi_manager.h"
 
 // Forward declarations
 struct display_ctx;
@@ -82,6 +83,7 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
 void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);
+void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr);
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
 
 // Shader source code

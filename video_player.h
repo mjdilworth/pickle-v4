@@ -10,6 +10,7 @@
 #include "video_decoder.h"
 #include "keystone.h"
 #include "input_handler.h"
+#include "wifi_manager.h"
 
 // Main application context
 typedef struct {
@@ -18,6 +19,7 @@ typedef struct {
     gl_context_t *gl;
     input_context_t *input;
     keystone_context_t *keystone;
+    wifi_manager_t wifi_mgr;
     bool running;
     bool loop_playback;
     const char *video_file;
@@ -25,6 +27,7 @@ typedef struct {
     bool show_timing;        // Flag to show frame timing information
     bool debug_gamepad;      // Flag to log gamepad button presses
     bool advanced_diagnostics; // Flag to enable detailed hardware decoder diagnostics
+    bool show_wifi_overlay;  // Show WiFi connection overlay
 } app_context_t;
 
 // Main application functions

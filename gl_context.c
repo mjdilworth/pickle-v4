@@ -1363,6 +1363,7 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
         "R      Reset\n"
         "C      Toggle Corners\n"
         "B      Toggle Border\n"
+        "W      WiFi Connect\n"
         "H      Toggle Help\n"
         "Q      Quit\n"
         "\n"
@@ -1455,6 +1456,104 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     glDisableVertexAttribArray(1);
     
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
+    if (!gl || !mgr) return;
+    
+    // Print WiFi menu to console every 60 frames (about once per second at 60fps)
+    static int print_counter = 0;
+    if (print_counter++ % 60 == 0) {
+        printf("\n=== WiFi Networks ===\n");
+        for (int i = 0; i < mgr->network_count && i < 5; i++) {
+            printf("  [%d] %s - Signal: %d%% %s\n", 
+                   i, mgr->networks[i].ssid, (int)mgr->networks[i].signal_strength,
+                   i == mgr->selected_index ? "← SELECTED" : "");
+        }
+        printf("Use D-pad UP/DOWN to select, SELECT button to confirm\n");
+        printf("======================\n");
+        fflush(stdout);
+    }
+    
+    // Enable blending for semi-transparent overlay
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+    
+    glUseProgram(gl->corner_program);
+    
+    // Set MVP matrix
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+    
+    // Render full-screen semi-transparent black background
+    float bg_vertices[24] = {
+        -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+         1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+         1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+        -1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 0.9f
+    };
+    
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(bg_vertices), bg_vertices, GL_DYNAMIC_DRAW);
+    
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    
+    // Draw bright title bar (white)
+    float title_vertices[24] = {
+        -0.8f,  0.6f, 1.0f, 1.0f, 1.0f, 1.0f,
+         0.8f,  0.6f, 1.0f, 1.0f, 1.0f, 1.0f,
+         0.8f,  0.5f, 1.0f, 1.0f, 1.0f, 1.0f,
+        -0.8f,  0.5f, 1.0f, 1.0f, 1.0f, 1.0f
+    };
+    
+    glBufferData(GL_ARRAY_BUFFER, sizeof(title_vertices), title_vertices, GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    
+    // Draw network selection boxes
+    float y_pos = 0.35f;
+    float box_height = 0.12f;
+    
+    for (int i = 0; i < mgr->network_count && i < 5; i++) {
+        float color_r = (i == mgr->selected_index) ? 0.0f : 0.1f;
+        float color_g = (i == mgr->selected_index) ? 1.0f : 0.3f;
+        float color_b = (i == mgr->selected_index) ? 0.0f : 0.3f;
+        
+        // 4 vertices, 6 floats each: x, y, r, g, b, a
+        float box_vertices[24] = {
+            -0.8f, y_pos, color_r, color_g, color_b, 1.0f,
+             0.8f, y_pos, color_r, color_g, color_b, 1.0f,
+             0.8f, y_pos - box_height, color_r, color_g, color_b, 1.0f,
+            -0.8f, y_pos - box_height, color_r, color_g, color_b, 1.0f
+        };
+        
+        glBufferData(GL_ARRAY_BUFFER, sizeof(box_vertices), box_vertices, GL_DYNAMIC_DRAW);
+        
+        int box_stride = 6 * sizeof(float);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, box_stride, (void*)0);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, box_stride, (void*)(2 * sizeof(float)));
+        
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        
+        y_pos -= box_height + 0.05f;
+    }
+    
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 

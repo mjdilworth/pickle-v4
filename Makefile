@@ -17,7 +17,7 @@ CFLAGS += $(RPi4_FLAGS)
 # Link-time optimization (reduce binary size, improve performance)
 CFLAGS += -flto=auto
 TARGET = pickle
-SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c keystone.c input_handler.c v4l2_utils.c
+SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c keystone.c input_handler.c v4l2_utils.c wifi_manager.c
 OBJECTS = $(SOURCES:.c=.o)
 
 # Library dependencies for RPi4

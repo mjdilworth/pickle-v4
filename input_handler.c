@@ -77,6 +77,7 @@ void input_clear_keys(input_context_t *input) {
     input->toggle_corners = false;
     input->toggle_border = false;
     input->toggle_help = false;
+    input->toggle_wifi = false;
     input->save_keystone = false;
 }
 
@@ -335,6 +336,7 @@ void input_update(input_context_t *input) {
         int bytes_read = read(input->stdin_fd, &ch, 1);
         while (bytes_read == 1) {
             // Convert ASCII characters to our internal key codes
+            printf("[INPUT] Key pressed: '%c' (0x%02x)\n", ch, (unsigned char)ch);
             switch (ch) {
                 case 'q':
                 case 'Q':
@@ -421,6 +423,11 @@ void input_update(input_context_t *input) {
                 case 'H':
                     input->toggle_help = true;
                     // printf("Toggle help overlay\n");
+                    break;
+                case 'w':
+                case 'W':
+                    input->toggle_wifi = true;
+                    // printf("Toggle WiFi menu\n");
                     break;
 
                 case 'r':

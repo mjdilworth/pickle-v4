@@ -15,6 +15,7 @@ typedef struct {
     bool toggle_corners;
     bool toggle_border;
     bool toggle_help;
+    bool toggle_wifi;               // W key: toggle WiFi menu
     bool save_keystone;
     
     // Terminal input fallback

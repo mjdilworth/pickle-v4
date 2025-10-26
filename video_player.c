@@ -25,13 +25,13 @@ static int validate_video_file(const char *filename) {
     }
     
     // Check file size limits
-    if (st.st_size > MAX_VIDEO_FILE_SIZE) {
+    if ((unsigned long long)st.st_size > MAX_VIDEO_FILE_SIZE) {
         fprintf(stderr, "Error: Video file too large (%lld bytes, limit: %lld bytes)\n",
                 (long long)st.st_size, (long long)MAX_VIDEO_FILE_SIZE);
         return -1;
     }
     
-    if (st.st_size < 1024) {  // Minimum 1KB for valid video
+    if ((unsigned long long)st.st_size < 1024) {  // Minimum 1KB for valid video
         fprintf(stderr, "Error: Video file too small (%lld bytes)\n", (long long)st.st_size);
         return -1;
     }
@@ -200,6 +200,13 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
     app->input->debug_gamepad = app->debug_gamepad;
 
     gl_setup_buffers(app->gl);
+    
+    // Initialize WiFi manager
+    if (wifi_manager_init(&app->wifi_mgr) != 0) {
+        fprintf(stderr, "Failed to initialize WiFi manager\n");
+        app_cleanup(app);
+        return -1;
+    }
 
     // Application initialization complete
     return 0;
@@ -353,6 +360,29 @@ void app_run(app_context_t *app) {
             app->input->toggle_help = false; // Reset flag
         }
         
+        // WiFi connect (W key)
+        if (app->input->toggle_wifi) {
+            app->show_wifi_overlay = !app->show_wifi_overlay;
+            printf("[DEBUG] WiFi toggle pressed - overlay now: %s\n", app->show_wifi_overlay ? "ON" : "OFF");
+            if (app->show_wifi_overlay) {
+                printf("[WiFi] WiFi menu opened (networks pre-scanned)\n");
+                // For now, use dummy networks - avoid popen during rendering
+                if (app->wifi_mgr.network_count == 0) {
+                    app->wifi_mgr.networks[0].signal_strength = 85;
+                    strncpy(app->wifi_mgr.networks[0].ssid, "Home-Network", MAX_SSID_LENGTH);
+                    app->wifi_mgr.networks[1].signal_strength = 70;
+                    strncpy(app->wifi_mgr.networks[1].ssid, "Guest-Network", MAX_SSID_LENGTH);
+                    app->wifi_mgr.networks[2].signal_strength = 60;
+                    strncpy(app->wifi_mgr.networks[2].ssid, "Office-Wifi", MAX_SSID_LENGTH);
+                    app->wifi_mgr.network_count = 3;
+                    app->wifi_mgr.state = WIFI_STATE_NETWORK_LIST;
+                    app->wifi_mgr.selected_index = 0;
+                    printf("[WiFi] Loaded %d test networks\n", app->wifi_mgr.network_count);
+                }
+            }
+            app->input->toggle_wifi = false; // Reset flag
+        }
+        
         // Gamepad-specific actions
         if (app->input->gamepad_enabled) {
             // X button: Cycle through corners
@@ -406,6 +436,57 @@ void app_run(app_context_t *app) {
             if (app->input->gamepad_toggle_mode) {
                 keystone_toggle_corners(app->keystone);
                 app->input->gamepad_toggle_mode = false;
+            }
+            
+            // WiFi menu navigation (D-pad and SELECT button)
+            if (app->show_wifi_overlay) {
+                if (app->wifi_mgr.state == WIFI_STATE_NETWORK_LIST) {
+                    // D-pad UP: Previous network
+                    if (app->input->gamepad_dpad_y < -0.5f) {
+                        if (app->wifi_mgr.selected_index > 0) {
+                            app->wifi_mgr.selected_index--;
+                        }
+                        app->input->gamepad_dpad_y = 0;  // Reset to avoid repeated input
+                    }
+                    // D-pad DOWN: Next network
+                    if (app->input->gamepad_dpad_y > 0.5f) {
+                        if (app->wifi_mgr.selected_index < app->wifi_mgr.network_count - 1) {
+                            app->wifi_mgr.selected_index++;
+                        }
+                        app->input->gamepad_dpad_y = 0;  // Reset
+                    }
+                    // SELECT: Choose network and show password prompt
+                    if (app->input->gamepad_reset_keystone) {
+                        wifi_manager_select_network(&app->wifi_mgr, app->wifi_mgr.selected_index);
+                        app->input->gamepad_reset_keystone = false;
+                    }
+                } else if (app->wifi_mgr.state == WIFI_STATE_PASSWORD_ENTRY) {
+                    // D-pad for keyboard navigation
+                    if (app->input->gamepad_dpad_x < -0.5f) {
+                        wifi_manager_move_cursor(&app->wifi_mgr, -1, 0);
+                        app->input->gamepad_dpad_x = 0;
+                    }
+                    if (app->input->gamepad_dpad_x > 0.5f) {
+                        wifi_manager_move_cursor(&app->wifi_mgr, 1, 0);
+                        app->input->gamepad_dpad_x = 0;
+                    }
+                    if (app->input->gamepad_dpad_y < -0.5f) {
+                        wifi_manager_move_cursor(&app->wifi_mgr, 0, -1);
+                        app->input->gamepad_dpad_y = 0;
+                    }
+                    if (app->input->gamepad_dpad_y > 0.5f) {
+                        wifi_manager_move_cursor(&app->wifi_mgr, 0, 1);
+                        app->input->gamepad_dpad_y = 0;
+                    }
+                    // SELECT: Connect with current password
+                    if (app->input->gamepad_reset_keystone) {
+                        wifi_manager_connect(&app->wifi_mgr,
+                                           app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid,
+                                           app->wifi_mgr.password);
+                        app->show_wifi_overlay = false;
+                        app->input->gamepad_reset_keystone = false;
+                    }
+                }
             }
         }
 
@@ -510,7 +591,7 @@ void app_run(app_context_t *app) {
                             first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
                             frame_count = 0;
                             // Update startup_time to reset the 5-second timeout
-                            clock_gettime(CLOCK_MONOTONIC, &startup_time);
+                            clock_gettime(CLOCK_MONOTONIC, &last_time);
                         } else {
                             printf("Playback finished.\n");
                             app->running = false;
@@ -625,6 +706,11 @@ void app_run(app_context_t *app) {
             }
             if (app->keystone->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone);
+            }
+            
+            // WiFi overlay rendering
+            if (app->show_wifi_overlay) {
+                gl_render_wifi_overlay(app->gl, &app->wifi_mgr);
             }
             
             // NOTE: State restoration is now handled by gl_render_frame()
@@ -776,6 +862,7 @@ void app_cleanup(app_context_t *app) {
         keystone_cleanup(app->keystone);
         free(app->keystone);
     }
+    wifi_manager_cleanup(&app->wifi_mgr);
     if (app->video) {
         video_cleanup(app->video);
         free(app->video);
