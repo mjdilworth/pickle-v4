@@ -540,29 +540,42 @@ void input_update(input_context_t *input) {
                     if (!was_pressed && input->gamepad_buttons[js.number]) {
                         input->gamepad_buttons_just_pressed[js.number] = true;
                         
-                        // Debug logging
+                        // Debug logging with CORRECTED button names
                         if (input->debug_gamepad) {
                             const char *btn_names[] = {
-                                "A", "B", "X", "Y", "L1", "R1", "SELECT", "START", "HOME"
+                                "A",       // 0
+                                "B",       // 1
+                                "?",       // 2
+                                "X",       // 3
+                                "Y",       // 4
+                                "?",       // 5
+                                "L1",      // 6
+                                "R1",      // 7
+                                "HOME",    // 8
+                                "?",       // 9
+                                "SELECT",  // 10
+                                "START"    // 11
                             };
-                            const char *btn_name = (js.number < 9) ? btn_names[js.number] : "UNKNOWN";
+                            const char *btn_name = (js.number < 12) ? btn_names[js.number] : "UNKNOWN";
                             printf("[GAMEPAD] Button pressed: %s (button %d)\n", btn_name, js.number);
                         }
                         
                         // Map specific buttons to actions
-                        // 8BitDo Zero 2 button layout: B=0, A=1, Y=2, X=3
+                        // 8BitDo Zero 2 actual button layout: B=0, A=1, L1=2, X=3, Y=4, R1=5
                         if (js.number == JS_BUTTON_X) {  // Button 3 = TOP button (X)
                             input->gamepad_cycle_corner = true;
                         } else if (js.number == JS_BUTTON_B) {  // Button 0 = BOTTOM button (B)
                             input->toggle_border = true;
                         } else if (js.number == JS_BUTTON_A) {  // Button 1 = RIGHT button (A)
                             input->toggle_corners = true;
-                        } else if (js.number == JS_BUTTON_Y) {  // Button 2 = LEFT button (Y)
+                        } else if (js.number == JS_BUTTON_Y) {  // Button 4 = LEFT button (Y)
                             input->toggle_help = true;
                         } else if (js.number == JS_BUTTON_L1) {
-                            input->gamepad_decrease_step = true;
-                        } else if (js.number == JS_BUTTON_R1) {
                             input->gamepad_increase_step = true;
+                            if (input->debug_gamepad) printf("[GAMEPAD] L1 pressed - increase step\n");
+                        } else if (js.number == JS_BUTTON_R1) {
+                            input->gamepad_decrease_step = true;
+                            if (input->debug_gamepad) printf("[GAMEPAD] R1 pressed - decrease step\n");
                         } else if (js.number == JS_BUTTON_SELECT) {
                             input->gamepad_reset_keystone = true;
                         } else if (js.number == JS_BUTTON_START) {
