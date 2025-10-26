@@ -62,16 +62,16 @@ void input_restore_terminal_global(void);  // Emergency terminal restoration
 
 // Gamepad button mappings for 8BitDo Zero 2 (using joystick API)
 // These match the js_event.number values from /dev/input/js0
-// Note: 8BitDo Zero 2 uses different button numbering than expected
-#define JS_BUTTON_B      0  // BOTTOM button
-#define JS_BUTTON_A      1  // RIGHT button  
-#define JS_BUTTON_Y      2  // LEFT button
+// ACTUAL 8BitDo Zero 2 button layout via joystick API:
+#define JS_BUTTON_B      1  // BOTTOM button
+#define JS_BUTTON_A      0  // RIGHT button  
 #define JS_BUTTON_X      3  // TOP button
-#define JS_BUTTON_L1     4
-#define JS_BUTTON_R1     5
-#define JS_BUTTON_SELECT 6
-#define JS_BUTTON_START  7
-#define JS_BUTTON_HOME   8
+#define JS_BUTTON_Y      4  // LEFT button
+#define JS_BUTTON_L1     6  // Left shoulder
+#define JS_BUTTON_R1     7  // Right shoulder
+#define JS_BUTTON_SELECT 10 // Select button - reset keystone
+#define JS_BUTTON_START  11 // Start button - save config
+#define JS_BUTTON_HOME   8  // Home button
 
 // Joystick axis indices
 #define JS_AXIS_LEFT_X   0

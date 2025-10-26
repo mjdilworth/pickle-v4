@@ -363,21 +363,22 @@ void app_run(app_context_t *app) {
                 if (current < 0 || current > 3) {
                     current = CORNER_TOP_LEFT;
                     keystone_select_corner(app->keystone, current);
-                    printf("[CYCLE] Starting with index %d (TOP_LEFT)\n", current);
+                    printf("[X-CYCLE] Starting with index %d (TOP_LEFT)\n", current);
                 } else {
-                    // Cycle: TOP_LEFT(0) -> TOP_RIGHT(1) -> BOTTOM_RIGHT(2) -> BOTTOM_LEFT(3) -> TOP_LEFT
+                    // Cycle clockwise: TOP_LEFT(0) -> BOTTOM_LEFT(3) -> BOTTOM_RIGHT(2) -> TOP_RIGHT(1) -> TOP_LEFT
                     int next;
                     switch (current) {
-                        case CORNER_TOP_LEFT:     next = CORNER_TOP_RIGHT; break;
-                        case CORNER_TOP_RIGHT:    next = CORNER_BOTTOM_RIGHT; break;
-                        case CORNER_BOTTOM_RIGHT: next = CORNER_BOTTOM_LEFT; break;
-                        case CORNER_BOTTOM_LEFT:  next = CORNER_TOP_LEFT; break;
+                        case CORNER_TOP_LEFT:     next = CORNER_BOTTOM_LEFT; break;
+                        case CORNER_BOTTOM_LEFT:  next = CORNER_BOTTOM_RIGHT; break;
+                        case CORNER_BOTTOM_RIGHT: next = CORNER_TOP_RIGHT; break;
+                        case CORNER_TOP_RIGHT:    next = CORNER_TOP_LEFT; break;
                         default:                  next = CORNER_TOP_LEFT; break;
                     }
                     keystone_select_corner(app->keystone, next);
-                    const char* names[] = {"TL(0)", "TR(1)", "BR(2)", "BL(3)"};
-                    printf("[CYCLE] %s -> %s (selected_corner is now %d)\n", 
-                           names[current], names[next], app->keystone->selected_corner);
+                    const char* names[] = {"TL", "TR", "BR", "BL"};
+                    printf("[X-CYCLE] %s(%.2f,%.2f) -> %s(%.2f,%.2f)\n", 
+                           names[current], app->keystone->corners[current].x, app->keystone->corners[current].y,
+                           names[next], app->keystone->corners[next].x, app->keystone->corners[next].y);
                 }
                 app->input->gamepad_cycle_corner = false;
             }
@@ -385,10 +386,12 @@ void app_run(app_context_t *app) {
             // L1/R1: Decrease/increase step size
             if (app->input->gamepad_decrease_step) {
                 keystone_decrease_step_size(app->keystone);
+                printf("[GAMEPAD] R1 - Step size decreased to %.6f\n", app->keystone->move_step);
                 app->input->gamepad_decrease_step = false;
             }
             if (app->input->gamepad_increase_step) {
                 keystone_increase_step_size(app->keystone);
+                printf("[GAMEPAD] L1 - Step size increased to %.6f\n", app->keystone->move_step);
                 app->input->gamepad_increase_step = false;
             }
             
