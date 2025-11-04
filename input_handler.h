@@ -59,6 +59,10 @@ void input_restore_terminal_global(void);  // Emergency terminal restoration
 #define KEY_CORNER_2     KEY_2
 #define KEY_CORNER_3     KEY_3
 #define KEY_CORNER_4     KEY_4
+#define KEY_CORNER_5     KEY_5
+#define KEY_CORNER_6     KEY_6
+#define KEY_CORNER_7     KEY_7
+#define KEY_CORNER_8     KEY_8
 
 // Gamepad button mappings for 8BitDo Zero 2 (using joystick API)
 // These match the js_event.number values from /dev/input/js0

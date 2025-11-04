@@ -402,6 +402,22 @@ void input_update(input_context_t *input) {
                     input->keys_just_pressed[KEY_4] = true;
                     // printf("Key 4 pressed (select corner 4)\n");
                     break;
+                case '5':
+                    input->keys_just_pressed[KEY_5] = true;
+                    // printf("Key 5 pressed (select corner 5)\n");
+                    break;
+                case '6':
+                    input->keys_just_pressed[KEY_6] = true;
+                    // printf("Key 6 pressed (select corner 6)\n");
+                    break;
+                case '7':
+                    input->keys_just_pressed[KEY_7] = true;
+                    // printf("Key 7 pressed (select corner 7)\n");
+                    break;
+                case '8':
+                    input->keys_just_pressed[KEY_8] = true;
+                    // printf("Key 8 pressed (select corner 8)\n");
+                    break;
                 case 's':
                 case 'S':
                     input->save_keystone = true;

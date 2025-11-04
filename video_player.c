@@ -41,7 +41,13 @@ static int validate_video_file(const char *filename) {
 }
 
 static bool process_keystone_movement(app_context_t *app, double delta_time, double target_frame_time) {
-    if (!app || !app->keystone || !app->input) {
+    if (!app || !app->input) {
+        return false;
+    }
+    
+    // Get active keystone
+    keystone_context_t *active_ks = (app->active_keystone == 1 && app->keystone2) ? app->keystone2 : app->keystone;
+    if (!active_ks) {
         return false;
     }
 
@@ -83,12 +89,12 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         move_y = up ? 1.0f : -1.0f;
     }
 
-    if (app->keystone->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
+    if (active_ks->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
         return false;
     }
     
     // Only allow movement if border or corners are visible
-    if (!app->keystone->show_border && !app->keystone->show_corners) {
+    if (!active_ks->show_border && !active_ks->show_corners) {
         return false;
     }
 
@@ -99,12 +105,12 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         if (speed_scale > 3.0f) speed_scale = 3.0f;
     }
 
-    keystone_move_corner(app->keystone, move_x * speed_scale, move_y * speed_scale);
+    keystone_move_corner(active_ks, move_x * speed_scale, move_y * speed_scale);
     app->needs_redraw = true;
     return true;
 }
 
-int app_init(app_context_t *app, const char *video_file, bool loop_playback, 
+int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, 
             bool show_timing, bool debug_gamepad, bool advanced_diagnostics) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
@@ -115,15 +121,23 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         return -1;
     }
     
+    // Validate second video file if provided
+    if (video_file2 && validate_video_file(video_file2) != 0) {
+        fprintf(stderr, "Failed to validate second video file\n");
+        return -1;
+    }
+    
     memset(app, 0, sizeof(*app));
     
     // Set all flags
     app->video_file = video_file;
+    app->video_file2 = video_file2;
     app->running = true;
     app->loop_playback = loop_playback;
     app->show_timing = show_timing;
     app->debug_gamepad = debug_gamepad;
     app->advanced_diagnostics = advanced_diagnostics;
+    app->active_keystone = 0;  // Start with first keystone active
 
     // Allocate contexts
     app->drm = calloc(1, sizeof(display_ctx_t));
@@ -131,6 +145,17 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
     app->video = calloc(1, sizeof(video_context_t));
     app->keystone = calloc(1, sizeof(keystone_context_t));
     app->input = calloc(1, sizeof(input_context_t));
+    
+    // Allocate second video and keystone if second file provided
+    if (video_file2) {
+        app->video2 = calloc(1, sizeof(video_context_t));
+        app->keystone2 = calloc(1, sizeof(keystone_context_t));
+        if (!app->video2 || !app->keystone2) {
+            fprintf(stderr, "Failed to allocate second video/keystone contexts\n");
+            app_cleanup(app);
+            return -1;
+        }
+    }
 
     if (!app->drm || !app->gl || !app->video || !app->keystone || !app->input) {
         fprintf(stderr, "Failed to allocate contexts\n");
@@ -170,10 +195,29 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         return -1;
     }
     
-    printf("Video dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
+    printf("Video 1 dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
     
     // Set loop playback if requested
     video_set_loop(app->video, loop_playback);
+
+    // Initialize second video decoder if provided
+    if (video_file2) {
+        if (video_init(app->video2, video_file2, app->advanced_diagnostics) != 0) {
+            fprintf(stderr, "Failed to initialize second video decoder\n");
+            app_cleanup(app);
+            return -1;
+        }
+        
+        if (app->video2->width > MAX_VIDEO_WIDTH || app->video2->height > MAX_VIDEO_HEIGHT) {
+            fprintf(stderr, "Error: Video 2 dimensions %dx%d exceed limits (%dx%d max)\n",
+                    app->video2->width, app->video2->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
+            app_cleanup(app);
+            return -1;
+        }
+        
+        printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
+        video_set_loop(app->video2, loop_playback);
+    }
 
     // Initialize keystone correction
     if (keystone_init(app->keystone) != 0) {
@@ -187,6 +231,22 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         printf("Loaded saved keystone settings from pickle_keystone.conf\n");
     } else {
         printf("No saved keystone settings found, using defaults\n");
+    }
+    
+    // Initialize second keystone if second video provided
+    if (video_file2) {
+        if (keystone_init(app->keystone2) != 0) {
+            fprintf(stderr, "Failed to initialize second keystone correction\n");
+            app_cleanup(app);
+            return -1;
+        }
+        
+        // Load saved keystone settings for second keystone
+        if (keystone_load_from_file(app->keystone2, "pickle_keystone2.conf") == 0) {
+            printf("Loaded saved keystone2 settings from pickle_keystone2.conf\n");
+        } else {
+            printf("No saved keystone2 settings found, using defaults\n");
+        }
     }
 
     // Initialize input handler
@@ -305,51 +365,79 @@ void app_run(app_context_t *app) {
         }
 
         // Handle keystone corner selection - match visual numbering
-        // Key should select the corner with the matching visual number
+        // Keys 1-4 select corners for first keystone (video 1)
+        // Keys 5-8 select corners for second keystone (video 2)
         if (input_is_key_just_pressed(app->input, KEY_1)) {
             keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);  // Visual "1" (bottom-left)
+            app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_2)) {
             keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT); // Visual "2" (bottom-right)
+            app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_3)) {
             keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);    // Visual "3" (top-right)
+            app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_4)) {
             keystone_select_corner(app->keystone, CORNER_TOP_LEFT);     // Visual "4" (top-left)
+            app->active_keystone = 0;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_5)) {
+            keystone_select_corner(app->keystone2, CORNER_TOP_LEFT);     // Key "5" = TL (next to keystone1 TR)
+            app->active_keystone = 1;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_6)) {
+            keystone_select_corner(app->keystone2, CORNER_TOP_RIGHT);    // Key "6" = TR
+            app->active_keystone = 1;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_7)) {
+            keystone_select_corner(app->keystone2, CORNER_BOTTOM_RIGHT); // Key "7" = BR
+            app->active_keystone = 1;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_8)) {
+            keystone_select_corner(app->keystone2, CORNER_BOTTOM_LEFT);  // Key "8" = BL
+            app->active_keystone = 1;
         }
         
         // Check for arrow key input (simply helps the corner movement by triggering input_is_key_pressed)
 
+        // Get active keystone
+        keystone_context_t *active_ks = (app->active_keystone == 1 && app->keystone2) ? app->keystone2 : app->keystone;
+        
         // Reset keystone to defaults
         if (input_is_key_just_pressed(app->input, KEY_R)) {
-            keystone_reset_corners(app->keystone);
-            printf("Keystone reset to defaults\n");
+            keystone_reset_corners(active_ks);
+            printf("Keystone %d reset to defaults\n", app->active_keystone + 1);
         }
         
         // Save keystone settings (S key or P key for compatibility)
         if (app->input->save_keystone) {
-            if (keystone_save_settings(app->keystone) == 0) {
-                printf("Keystone settings saved to pickle_keystone.conf\n");
-            } else {
-                printf("Failed to save keystone settings\n");
+            if (app->active_keystone == 0) {
+                if (keystone_save_settings(app->keystone) == 0) {
+                    printf("Keystone 1 settings saved to pickle_keystone.conf\n");
+                } else {
+                    printf("Failed to save keystone 1 settings\n");
+                }
+            } else if (app->keystone2) {
+                if (keystone_save_to_file(app->keystone2, "pickle_keystone2.conf") == 0) {
+                    printf("Keystone 2 settings saved to pickle_keystone2.conf\n");
+                } else {
+                    printf("Failed to save keystone 2 settings\n");
+                }
             }
             app->input->save_keystone = false; // Reset flag
         }
         
         // Toggle corner visibility
         if (app->input->toggle_corners) {
-            keystone_toggle_corners(app->keystone);
+            keystone_toggle_corners(active_ks);
             app->input->toggle_corners = false; // Reset flag
         }
         
         // Toggle border visibility
         if (app->input->toggle_border) {
-            keystone_toggle_border(app->keystone);
-            printf("Border toggled: %s\n", app->keystone->show_border ? "ON" : "OFF");
+            keystone_toggle_border(active_ks);
+            printf("Border toggled: %s (keystone %d)\n", active_ks->show_border ? "ON" : "OFF", app->active_keystone + 1);
             app->input->toggle_border = false; // Reset flag
         }
         
         // Toggle help overlay visibility
         if (app->input->toggle_help) {
-            keystone_toggle_help(app->keystone);
+            keystone_toggle_help(active_ks);
             app->input->toggle_help = false; // Reset flag
         }
         
@@ -357,13 +445,13 @@ void app_run(app_context_t *app) {
         if (app->input->gamepad_enabled) {
             // X button: Cycle through corners
             if (app->input->gamepad_cycle_corner) {
-                int current = app->keystone->selected_corner;
+                int current = active_ks->selected_corner;
                 
                 // If no corner selected, start with top-left
                 if (current < 0 || current > 3) {
                     current = CORNER_TOP_LEFT;
-                    keystone_select_corner(app->keystone, current);
-                    printf("[X-CYCLE] Starting with index %d (TOP_LEFT)\n", current);
+                    keystone_select_corner(active_ks, current);
+                    printf("[X-CYCLE] Starting with index %d (TOP_LEFT) keystone %d\n", current, app->active_keystone + 1);
                 } else {
                     // Cycle clockwise: TOP_LEFT(0) -> BOTTOM_LEFT(3) -> BOTTOM_RIGHT(2) -> TOP_RIGHT(1) -> TOP_LEFT
                     int next;
@@ -374,24 +462,25 @@ void app_run(app_context_t *app) {
                         case CORNER_TOP_RIGHT:    next = CORNER_TOP_LEFT; break;
                         default:                  next = CORNER_TOP_LEFT; break;
                     }
-                    keystone_select_corner(app->keystone, next);
+                    keystone_select_corner(active_ks, next);
                     const char* names[] = {"TL", "TR", "BR", "BL"};
-                    printf("[X-CYCLE] %s(%.2f,%.2f) -> %s(%.2f,%.2f)\n", 
-                           names[current], app->keystone->corners[current].x, app->keystone->corners[current].y,
-                           names[next], app->keystone->corners[next].x, app->keystone->corners[next].y);
+                    printf("[X-CYCLE] %s(%.2f,%.2f) -> %s(%.2f,%.2f) keystone %d\n", 
+                           names[current], active_ks->corners[current].x, active_ks->corners[current].y,
+                           names[next], active_ks->corners[next].x, active_ks->corners[next].y,
+                           app->active_keystone + 1);
                 }
                 app->input->gamepad_cycle_corner = false;
             }
             
             // L1/R1: Decrease/increase step size
             if (app->input->gamepad_decrease_step) {
-                keystone_decrease_step_size(app->keystone);
-                printf("[GAMEPAD] R1 - Step size decreased to %.6f\n", app->keystone->move_step);
+                keystone_decrease_step_size(active_ks);
+                printf("[GAMEPAD] R1 - Step size decreased to %.6f (keystone %d)\n", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_decrease_step = false;
             }
             if (app->input->gamepad_increase_step) {
-                keystone_increase_step_size(app->keystone);
-                printf("[GAMEPAD] L1 - Step size increased to %.6f\n", app->keystone->move_step);
+                keystone_increase_step_size(active_ks);
+                printf("[GAMEPAD] L1 - Step size increased to %.6f (keystone %d)\n", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_increase_step = false;
             }
             
@@ -413,11 +502,16 @@ void app_run(app_context_t *app) {
         // This hides decode latency by overlapping decode with render/swap
         static bool next_frame_ready = false;
         static bool first_frame_decoded = false;
+        static bool next_frame_ready2 = false;
+        static bool first_frame_decoded2 = false;
         
         // Decode video frame if enough time has passed
         uint8_t *video_data = NULL;
+        uint8_t *video_data2 = NULL;
         static int frame_count = 0;
+        static int frame_count2 = 0;
         static uint8_t *last_video_data = NULL;
+        static uint8_t *last_video_data2 = NULL;
         
         if (delta_time >= frame_budget) {
             // Update timing first to maintain consistent frame rate
@@ -537,8 +631,58 @@ void app_run(app_context_t *app) {
                         fflush(stdout);
                     }
                     
-                    // We now clear the arrow keys ONLY if we've successfully processed a movement
+                                        // We now clear the arrow keys ONLY if we've successfully processed a movement
             // This allows for continued movement if a corner is not selected
+            
+                // Decode second video if available
+                if (app->video2) {
+                    if (next_frame_ready2 && first_frame_decoded2) {
+                        // Use pre-decoded frame
+                        uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
+                        int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
+                        video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                        
+                        if (y_data2 != NULL) {
+                            video_data2 = y_data2;
+                            last_video_data2 = video_data2;
+                            frame_count2++;
+                        }
+                        next_frame_ready2 = false;
+                    } else {
+                        // Decode new frame for video 2
+                        int decode_result2 = video_decode_frame(app->video2);
+                        
+                        if (decode_result2 == 0) {
+                            if (frame_count2 == 0) {
+                                printf("First frame of video 2 decoded successfully\n");
+                                first_frame_decoded2 = true;
+                                fflush(stdout);
+                            }
+                            
+                            uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
+                            int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
+                            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                            
+                            if (y_data2 != NULL) {
+                                video_data2 = y_data2;
+                                last_video_data2 = video_data2;
+                                frame_count2++;
+                                next_frame_ready2 = true;
+                            }
+                        } else if (video_is_eof(app->video2)) {
+                            if (app->loop_playback) {
+                                video_seek(app->video2, 0);
+                                next_frame_ready2 = false;
+                                first_frame_decoded2 = false;
+                                frame_count2 = 0;
+                            }
+                        } else {
+                            video_data2 = last_video_data2;
+                            next_frame_ready2 = false;
+                        }
+                    }
+                }
+                
             if (app->keystone->selected_corner < 0) {
                 // No corner selected, clear key states to prevent movement later
                 app->input->keys_pressed[KEY_UP] = false;
@@ -546,10 +690,11 @@ void app_run(app_context_t *app) {
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
             }
-            }
+            }  // Close the if (delta_time >= frame_budget) block
         } else {
             // Use the last decoded frame for rendering
             video_data = last_video_data;
+            video_data2 = last_video_data2;
         }
 
         // Get video dimensions
@@ -580,24 +725,39 @@ void app_run(app_context_t *app) {
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
         
-        // Use NV12 format for optimized rendering
+        // Render first video with first keystone (clear screen)
         uint8_t *nv12_data = video_get_nv12_data(app->video);
         int nv12_stride = video_get_nv12_stride(app->video);
         
         // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
         if (false && nv12_data) {
             // Render with NV12 packed format (faster - single texture upload)
-            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone);
+            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone, true);
         } else {
             // Fallback to original YUV rendering (for compatibility)
             video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
             
             if (y_data && u_data && v_data) {
                 gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                              y_stride, u_stride, v_stride, app->drm, app->keystone);
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true);
             } else {
                 gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                              0, 0, 0, app->drm, app->keystone);
+                              0, 0, 0, app->drm, app->keystone, true);
+            }
+        }
+        
+        // Render second video with second keystone (don't clear screen)
+        if (app->video2 && app->keystone2 && video_data2) {
+            uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
+            int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
+            int video_width2 = app->video2->width;
+            int video_height2 = app->video2->height;
+            
+            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+            
+            if (y_data2 && u_data2 && v_data2) {
+                gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2, 
+                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false);
             }
         }
         
@@ -607,6 +767,7 @@ void app_run(app_context_t *app) {
         clock_gettime(CLOCK_MONOTONIC, &overlay_start);
         
         // OPTIMIZED: Only render overlays when actually needed
+        // Render overlays for first keystone
         bool any_overlay_visible = (app->keystone && (app->keystone->show_corners || 
                                                      app->keystone->show_border || 
                                                      app->keystone->show_help));
@@ -631,6 +792,26 @@ void app_run(app_context_t *app) {
             // The main video rendering function detects and fixes state corruption
             
             // Clear any OpenGL errors from overlay rendering
+            while (glGetError() != GL_NO_ERROR) {
+                // Clear error queue
+            }
+        }
+        
+        // Render overlays for second keystone
+        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners || 
+                                                       app->keystone2->show_border || 
+                                                       app->keystone2->show_help));
+        if (any_overlay_visible2) {
+            if (app->keystone2->show_corners) {
+                gl_render_corners(app->gl, app->keystone2);
+            }
+            if (app->keystone2->show_border) {
+                gl_render_border(app->gl, app->keystone2);
+            }
+            if (app->keystone2->show_help) {
+                gl_render_help_overlay(app->gl, app->keystone2);
+            }
+            
             while (glGetError() != GL_NO_ERROR) {
                 // Clear error queue
             }
@@ -776,9 +957,17 @@ void app_cleanup(app_context_t *app) {
         keystone_cleanup(app->keystone);
         free(app->keystone);
     }
+    if (app->keystone2) {
+        keystone_cleanup(app->keystone2);
+        free(app->keystone2);
+    }
     if (app->video) {
         video_cleanup(app->video);
         free(app->video);
+    }
+    if (app->video2) {
+        video_cleanup(app->video2);
+        free(app->video2);
     }
     if (app->gl) {
         gl_cleanup(app->gl);

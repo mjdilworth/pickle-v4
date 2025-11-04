@@ -58,6 +58,7 @@ int main(int argc, char *argv[]) {
     bool debug_gamepad = false;
     bool advanced_diagnostics = false;
     char *video_file = NULL;
+    char *video_file2 = NULL;
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -71,7 +72,7 @@ int main(int argc, char *argv[]) {
             advanced_diagnostics = true;
             printf("Advanced hardware decoder diagnostics enabled\n");
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
+            fprintf(stderr, "Usage: %s [options] <video_file1.mp4> [video_file2.mp4]\n", argv[0]);
             fprintf(stderr, "\nOptions:\n");
             fprintf(stderr, "  -l               Loop video playback\n");
             fprintf(stderr, "  --timing         Show frame timing information\n");
@@ -81,7 +82,8 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "\nKeyboard Controls:\n");
             fprintf(stderr, "  q/ESC    Quit\n");
             fprintf(stderr, "  h        Toggle help overlay\n");
-            fprintf(stderr, "  1-4      Select keystone corners\n");
+            fprintf(stderr, "  1-4      Select keystone corners (video 1)\n");
+            fprintf(stderr, "  5-8      Select keystone corners (video 2)\n");
             fprintf(stderr, "  arrows   Move selected corner\n");
             fprintf(stderr, "  r        Reset keystone\n");
             fprintf(stderr, "  s        Save keystone settings\n");
@@ -98,7 +100,14 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  START+SELECT (2s)  Quit\n");
             return 0;
         } else if (argv[i][0] != '-') {
-            video_file = argv[i];
+            if (!video_file) {
+                video_file = argv[i];
+            } else if (!video_file2) {
+                video_file2 = argv[i];
+            } else {
+                fprintf(stderr, "Too many video files specified\n");
+                return 1;
+            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             fprintf(stderr, "Use -h or --help for usage information\n");
@@ -108,7 +117,7 @@ int main(int argc, char *argv[]) {
     
     if (!video_file) {
         fprintf(stderr, "Error: No video file specified\n");
-        fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options] <video_file1.mp4> [video_file2.mp4]\n", argv[0]);
         fprintf(stderr, "Use -h or --help for more information\n");
         return 1;
     }
@@ -126,7 +135,7 @@ int main(int argc, char *argv[]) {
     setup_signal_handlers();
     
     // Initialize and run the video player
-    if (app_init(&app, video_file, loop_playback, show_timing, debug_gamepad, advanced_diagnostics) != 0) {
+    if (app_init(&app, video_file, video_file2, loop_playback, show_timing, debug_gamepad, advanced_diagnostics) != 0) {
         fprintf(stderr, "Failed to initialize application\n");
         g_app = NULL;  // Clear global reference
         return 1;

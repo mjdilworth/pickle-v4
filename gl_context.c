@@ -489,7 +489,7 @@ void gl_setup_buffers(gl_context_t *gl) {
 
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
-                    display_ctx_t *drm, keystone_context_t *keystone) {
+                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen) {
     (void)stride; // Unused parameter - kept for API consistency
     static int frame_rendered = 0;
     static int last_width = 0, last_height = 0;
@@ -500,7 +500,10 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     }
     
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Only clear screen if requested (first video clears, second doesn't)
+    if (clear_screen) {
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     
     // Set up OpenGL state only once or when needed
     if (!gl_state_set) {
@@ -605,7 +608,7 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
                     int width, int height, int y_stride, int u_stride, int v_stride,
-                    display_ctx_t *drm, keystone_context_t *keystone) {
+                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen) {
     static int frame_rendered = 0;
     static int last_width = 0, last_height = 0;
     static bool gl_state_set = false;
@@ -617,7 +620,10 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Black background
     }
     
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Only clear screen if requested (first video clears, second doesn't)
+    if (clear_screen) {
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     
     // Set up OpenGL state only once or when needed
     if (!gl_state_set) {
@@ -1363,6 +1369,7 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
         "R      Reset\n"
         "C      Toggle Corners\n"
         "B      Toggle Border\n"
+        "W      WiFi Connect\n"
         "H      Toggle Help\n"
         "Q      Quit\n"
         "\n"
@@ -1457,6 +1464,387 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
+
+// WiFi overlay function disabled - requires wifi_manager_t which is not defined
+#if 0
+void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
+    if (!gl || !mgr) return;
+    
+    // DEBUG: Log what mgr pointer value we received
+    #ifndef NDEBUG
+    static int render_call_count = 0;
+    if (render_call_count++ % 60 == 0) {
+        printf("[WiFi Render CALLED] mgr pointer=%p, selected_index=%d\n", (void*)mgr, mgr->selected_index);
+        fflush(stdout);
+    }
+    #endif
+    
+    // Print WiFi menu to console every 60 frames (about once per second at 60fps)
+    static int print_counter = 0;
+    if (print_counter++ % 60 == 0) {
+        printf("\n=== WiFi Networks ===\n");
+        for (int i = 0; i < mgr->network_count && i < 5; i++) {
+            printf("  [%d] %s - Signal: %d%% %s\n", 
+                   i, mgr->networks[i].ssid, (int)mgr->networks[i].signal_strength,
+                   i == mgr->selected_index ? "← SELECTED" : "");
+        }
+        printf("Use D-pad UP/DOWN to select, SELECT button to confirm\n");
+        printf("======================\n");
+        fflush(stdout);
+    }
+    
+    // Enable blending for semi-transparent overlay
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+    
+    glUseProgram(gl->corner_program);
+    
+    // Set MVP matrix
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+    
+    // Render full-screen semi-transparent black background
+    float bg_vertices[24] = {
+        -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+         1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+         1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+        -1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 0.9f
+    };
+    
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(bg_vertices), bg_vertices, GL_DYNAMIC_DRAW);
+    
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    
+    // Draw a highlight bar behind the currently selected network line (only in list mode)
+    // This makes selection visible even if the '>' glyph isn't present in the font
+    if (mgr->state == WIFI_STATE_NETWORK_LIST) {
+        // Text layout parameters must match draw_text_simple()
+        const float base_y = 0.5f;
+        const float text_size = 0.025f;
+        const float line_height = text_size * 1.3f;
+        // Header (WiFi Networks) + blank line before networks start
+        int selected_line_index = 2 + mgr->selected_index; // 0-based from top
+        float line_y = base_y - selected_line_index * line_height;
+        
+        // Highlight rectangle extents
+        float rect_left = -0.9f;
+        float rect_right = 0.5f;
+        float rect_top = line_y + (line_height * 0.55f);
+        float rect_bottom = line_y - (line_height * 0.55f);
+        
+        // Semi-transparent green highlight
+        float hl_vertices[24] = {
+            rect_left,  rect_bottom, 0.0f, 0.6f, 0.2f, 0.45f,
+            rect_right, rect_bottom, 0.0f, 0.6f, 0.2f, 0.45f,
+            rect_right, rect_top,    0.0f, 0.6f, 0.2f, 0.45f,
+            rect_left,  rect_top,    0.0f, 0.6f, 0.2f, 0.45f
+        };
+        
+        glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(hl_vertices), hl_vertices, GL_DYNAMIC_DRAW);
+        int hl_stride = 6 * sizeof(float);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, hl_stride, (void*)0);
+        glEnableVertexAttribArray(gl->corner_a_position);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, hl_stride, (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    }
+    
+    // Build WiFi overlay text depending on state
+    char wifi_text[1024];
+    int offset = 0;
+    if (mgr->state == WIFI_STATE_NETWORK_LIST) {
+        offset = snprintf(wifi_text, sizeof(wifi_text), "WiFi Networks\n\n");
+        for (int i = 0; i < mgr->network_count && i < 5; i++) {
+            if (i == mgr->selected_index) {
+                offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                                 "> %s (%d%%)\n", mgr->networks[i].ssid, 
+                                 (int)mgr->networks[i].signal_strength);
+            } else {
+                offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                                 "  %s (%d%%)\n", mgr->networks[i].ssid,
+                                 (int)mgr->networks[i].signal_strength);
+            }
+        }
+        snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                 "\nArrows: Select\nEnter/SELECT: Choose");
+    } else if (mgr->state == WIFI_STATE_PASSWORD_ENTRY) {
+        // Password display (masked or visible)
+        char shown[256];
+        if (mgr->show_password) {
+            snprintf(shown, sizeof(shown), "%s", mgr->password);
+        } else {
+            int len = (mgr->password_length >= 0) ? mgr->password_length : 0;
+            if (len > (int)sizeof(shown) - 1) len = (int)sizeof(shown) - 1;
+            memset(shown, '*', len);
+            shown[len] = '\0';
+        }
+
+        offset = snprintf(wifi_text, sizeof(wifi_text),
+                          "WiFi Password\n\nSSID: %s\nPassword: %s (%s)\n\n",
+                          mgr->networks[mgr->selected_index].ssid,
+                          shown,
+                          mgr->show_password ? "visible" : "hidden");
+        offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                           "Arrows: Move  Enter/SELECT: Press Key  Backspace: Delete\n");
+        if (mgr->status[0] != '\0') {
+            // Append status/error message
+            offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                               "\n%s\n",
+                               mgr->status);
+        }
+        
+        // After the text, draw a simple on-screen keyboard grid
+        // Layout is in mgr->keyboard_layout[4] with varying row lengths
+    const float key_text_size = 0.028f;
+    const float start_y = 0.12f; // slightly lower to reduce overlap
+    const float row_gap = key_text_size * 2.6f;
+    const float key_w = 0.11f;   // slightly smaller keys
+    const float key_h = row_gap * 0.45f; // a bit shorter for clearer rows
+    const float key_gap = 0.02f; // spacing between keys
+        
+    // Draw each key; render selection background before its label to avoid tinting
+
+        for (int r = 0; r < 4; ++r) {
+            int row_len = (int)strlen(mgr->keyboard_layout[r]);
+            // Center the row based on total width including gaps
+            float row_total_w = row_len * key_w + (row_len - 1) * key_gap;
+            float row_offset_x = -0.5f * row_total_w;
+            float y = start_y - r * row_gap;
+            for (int c = 0; c < row_len; ++c) {
+                float x = row_offset_x + c * (key_w + key_gap);
+                // Highlight if selected
+                int cursor_row = mgr->keyboard_cursor / 12;
+                int cursor_col = mgr->keyboard_cursor % 12;
+                bool is_sel = (cursor_row == r && cursor_col == c);
+                
+                // Base key background (dark grey)
+                float base_r = 0.05f, base_g = 0.05f, base_b = 0.05f, base_a = 0.55f;
+                
+                // Draw key rectangle
+                float rect[24] = {
+                    x,           y - key_h, 0.0f, base_r, base_g, base_b, base_a,
+                    x + key_w,   y - key_h, 0.0f, base_r, base_g, base_b, base_a,
+                    x + key_w,   y + key_h, 0.0f, base_r, base_g, base_b, base_a,
+                    x,           y + key_h, 0.0f, base_r, base_g, base_b, base_a
+                };
+                glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+                glBufferData(GL_ARRAY_BUFFER, sizeof(rect), rect, GL_DYNAMIC_DRAW);
+                glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(gl->corner_a_position);
+                glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+                glEnableVertexAttribArray(1);
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                if (is_sel) {
+                    // To avoid any translucent artifacts, draw selection with blending temporarily disabled
+                    glDisable(GL_BLEND);
+                    float sel_rcol = 0.20f, sel_gcol = 0.85f, sel_bcol = 0.30f, sel_acol = 1.0f;
+                    float srect[24] = {
+                        x,         y - key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol,
+                        x + key_w, y - key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol,
+                        x + key_w, y + key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol,
+                        x,         y + key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol
+                    };
+                    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(srect), srect, GL_DYNAMIC_DRAW);
+                    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                    glEnableVertexAttribArray(gl->corner_a_position);
+                    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+                    glEnableVertexAttribArray(1);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+                    // Border
+                    float bt = (key_w < key_h ? key_w : key_h) * 0.10f;
+                    float br = 1.0f, bg = 1.0f, bb = 0.2f, ba = 1.0f;
+                    float b_top[24] = {
+                        x - bt,      y + key_h + bt, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y + key_h + bt, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y + key_h,    0.0f, br, bg, bb, ba,
+                        x - bt,      y + key_h,      0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_top), b_top, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    float b_bot[24] = {
+                        x - bt,      y - key_h,      0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y - key_h,   0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y - key_h - bt, 0.0f, br, bg, bb, ba,
+                        x - bt,      y - key_h - bt, 0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_bot), b_bot, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    float b_left[24] = {
+                        x - bt, y - key_h, 0.0f, br, bg, bb, ba,
+                        x,      y - key_h, 0.0f, br, bg, bb, ba,
+                        x,      y + key_h, 0.0f, br, bg, bb, ba,
+                        x - bt, y + key_h, 0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_left), b_left, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    float b_right[24] = {
+                        x + key_w, y - key_h, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y - key_h, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y + key_h, 0.0f, br, bg, bb, ba,
+                        x + key_w, y + key_h, 0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_right), b_right, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    glEnable(GL_BLEND);
+                }
+
+                // Draw label
+                char label[8] = {0};
+                char k = mgr->keyboard_layout[r][c];
+                if (k == '_') { label[0] = 'S'; label[1] = 'P'; }
+                else if (k == '<') { label[0] = 'B'; label[1] = 'K'; label[2] = 'S'; label[3] = 'P'; }
+                else if (k == '>') { label[0] = 'O'; label[1] = 'K'; }
+                else if (k == '!') {
+                    if (mgr->show_password) { label[0] = 'H'; label[1] = 'I'; label[2] = 'D'; label[3] = 'E'; }
+                    else { label[0] = 'S'; label[1] = 'H'; label[2] = 'O'; label[3] = 'W'; }
+                }
+                else label[0] = k;
+                int label_len = (int)strlen(label);
+                float max_fit_size = (key_w * 0.80f) / (1.2f * (label_len > 0 ? label_len : 1));
+                float label_size = max_fit_size;
+                if (label_size > 0.040f) label_size = 0.040f;
+                if (label_size < 0.022f) label_size = 0.022f;
+                float total_w = (label_len ? label_len : 1) * label_size * 1.2f;
+                float tx = x + (key_w - total_w) * 0.5f;
+                float ty = y + label_size * 0.2f; // better vertical centering for our font
+
+                float text_buf[512];
+                int vcount = 0;
+                // Slightly increase label size when selected
+                float eff_label_size = is_sel ? (label_size * 1.1f) : label_size;
+                draw_text_simple(text_buf, &vcount, label, tx, ty, eff_label_size);
+                if (vcount > 0) {
+                    float colored[4096];
+                    int cc = 0;
+                    for (int i = 0; i < vcount && (cc + 6) < 4096; ++i) {
+                        colored[cc++] = text_buf[i * 2 + 0];
+                        colored[cc++] = text_buf[i * 2 + 1];
+                        // Invert label color when selected (black on bright key)
+                        float tr = is_sel ? 0.0f : 1.0f;
+                        float tg = is_sel ? 0.0f : 1.0f;
+                        float tb = is_sel ? 0.0f : 1.0f;
+                        colored[cc++] = tr;
+                        colored[cc++] = tg;
+                        colored[cc++] = tb;
+                        colored[cc++] = 1.0f;
+                    }
+                    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+                    glBufferData(GL_ARRAY_BUFFER, cc * sizeof(float), colored, GL_DYNAMIC_DRAW);
+                    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+                    glEnableVertexAttribArray(gl->corner_a_position);
+                    glEnableVertexAttribArray(1);
+                    int pixels = vcount / 4;
+                    for (int p = 0; p < pixels; ++p) glDrawArrays(GL_TRIANGLE_FAN, p * 4, 4);
+                }
+            }
+        }
+
+        // (Selection already drawn per-key before labels)
+    } else if (mgr->state == WIFI_STATE_SCANNING) {
+        snprintf(wifi_text, sizeof(wifi_text),
+                 "WiFi\n\nScanning for networks...\n\nPlease wait");
+    } else {
+        // Fallback: show nothing if in other states
+        snprintf(wifi_text, sizeof(wifi_text), "WiFi\n");
+    }
+    
+    // DEBUG: Log the text being rendered
+    #ifndef NDEBUG
+    static int wifi_text_render_count = 0;
+    if (wifi_text_render_count++ % 120 == 0) {
+        printf("[WiFi Text Rendered] selected_index=%d, First line: %.50s\n", 
+               mgr->selected_index, wifi_text);
+    }
+    #endif
+    
+    // Render text using same approach as help overlay
+    float text_vertices[30000];
+    int text_vertex_count = 0;
+    draw_text_simple(text_vertices, &text_vertex_count, wifi_text, -0.8f, 0.5f, 0.025f);
+    
+    #ifndef NDEBUG
+    static int detailed_log_count = 0;
+    bool should_log_detailed = (detailed_log_count++ % 120 == 0);
+    #else
+    bool should_log_detailed = false;
+    #endif
+    
+    if (should_log_detailed) {
+        printf("[WiFi Render] idx=%d, count=%d\n", mgr->selected_index, text_vertex_count);
+        // Print line by line to see the markers clearly
+        printf("=== Full WiFi Text ===\n%s\n", wifi_text);
+        printf("====== End Text ======\n");
+        
+    // Also show text length
+    printf("[DEBUG] wifi_text strlen=%zu\n", strlen(wifi_text));
+    fflush(stdout);
+    }
+    
+    if (text_vertex_count > 0) {
+        // Create colored vertices for text - YELLOW to be clearly visible
+        float colored_vertices[180000];
+        int colored_vertex_count = 0;
+        for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
+            colored_vertices[colored_vertex_count++] = text_vertices[i * 2 + 0]; // x
+            colored_vertices[colored_vertex_count++] = text_vertices[i * 2 + 1]; // y
+            colored_vertices[colored_vertex_count++] = 1.0f; // r - YELLOW
+            colored_vertices[colored_vertex_count++] = 1.0f; // g - YELLOW
+            colored_vertices[colored_vertex_count++] = 0.0f; // b - no blue
+            colored_vertices[colored_vertex_count++] = 1.0f; // a
+        }
+        
+        // Upload text with colors
+        glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+        glBufferData(GL_ARRAY_BUFFER, colored_vertex_count * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(gl->corner_a_position);
+        glEnableVertexAttribArray(1);
+        
+        int text_pixels = text_vertex_count / 4;
+        
+        if (should_log_detailed) {
+            printf("  Rendering %d text pixels\n", text_pixels);
+            printf("  text_vertex_count=%d, colored_vertex_count=%d\n", text_vertex_count, colored_vertex_count);
+        }
+        
+        // Draw all text pixels (each character pixel is a 4-vertex rectangle)
+        int draw_calls = 0;
+        for (int i = 0; i < text_pixels; i++) {
+            glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+            draw_calls++;
+        }
+        
+        if (should_log_detailed) {
+            printf("  Completed %d draw calls\n", draw_calls);
+            fflush(stdout);
+        }
+    }
+    
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+#endif
 
 void gl_cleanup(gl_context_t *gl) {
     // Clean up YUV textures
