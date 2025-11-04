@@ -12,16 +12,21 @@ int wifi_manager_init(wifi_manager_t *mgr) {
     mgr->selected_index = 0;
     mgr->keyboard_cursor = 0;
     mgr->state = WIFI_STATE_IDLE;
+    mgr->status[0] = '\0';
+    mgr->last_exit_code = 0;
+    mgr->show_password = true; // Default to visible per request; can be toggled from UI
     
-    // Initialize keyboard layout - QWERTY style
+    // Initialize on-screen keyboard layout - QWERTY style with special keys
+    // Row3 includes '<' (Backspace), '_' (Space), '>' (Done)
     const char *rows[] = {
         "1234567890",
         "qwertyuiop",
         "asdfghjkl",
-        "zxcvbnm"
+        "<zxcvbnm_>!"  // '!' = toggle show/hide
     };
     for (int i = 0; i < 4; i++) {
-        strncpy(mgr->keyboard_layout[i], rows[i], 13);
+        memset(mgr->keyboard_layout[i], 0, sizeof(mgr->keyboard_layout[i]));
+        strncpy(mgr->keyboard_layout[i], rows[i], 12);
     }
     
     return 0;
@@ -121,7 +126,7 @@ void wifi_manager_add_password_char(wifi_manager_t *mgr, char c) {
     if (mgr->password_length < MAX_PASSWORD_LENGTH) {
         mgr->password[mgr->password_length++] = c;
         mgr->password[mgr->password_length] = '\0';
-        printf("[WIFI] Password: %s\n", mgr->password);
+           printf("[WIFI] Password length: %d\n", mgr->password_length);
     }
 }
 
@@ -130,17 +135,19 @@ void wifi_manager_remove_password_char(wifi_manager_t *mgr) {
     if (mgr->password_length > 0) {
         mgr->password_length--;
         mgr->password[mgr->password_length] = '\0';
-        printf("[WIFI] Password: %s\n", mgr->password);
+           printf("[WIFI] Password length: %d\n", mgr->password_length);
     }
 }
 
 void wifi_manager_move_cursor(wifi_manager_t *mgr, int dx, int dy) {
     if (!mgr) return;
-    // Simple cursor movement in keyboard grid
-    // Row 0: 10 chars, Row 1: 10 chars, Row 2: 9 chars, Row 3: 7 chars
-    int row_lengths[] = {10, 10, 9, 7};
-    int current_row = mgr->keyboard_cursor / 10;
-    int current_col = mgr->keyboard_cursor % 10;
+    // Cursor movement in keyboard grid using actual row lengths
+    int current_row = mgr->keyboard_cursor / 12; // maximum row width bound
+    int current_col = mgr->keyboard_cursor % 12;
+    if (current_row < 0) current_row = 0;
+    if (current_row > 3) current_row = 3;
+    int row_len = (int)strlen(mgr->keyboard_layout[current_row]);
+    if (current_col >= row_len) current_col = row_len > 0 ? row_len - 1 : 0;
     
     current_col += dx;
     current_row += dy;
@@ -149,11 +156,25 @@ void wifi_manager_move_cursor(wifi_manager_t *mgr, int dx, int dy) {
     if (current_row < 0) current_row = 0;
     if (current_row > 3) current_row = 3;
     if (current_col < 0) current_col = 0;
-    if (current_col >= row_lengths[current_row]) {
-        current_col = row_lengths[current_row] - 1;
-    }
+    row_len = (int)strlen(mgr->keyboard_layout[current_row]);
+    if (current_col >= row_len) current_col = row_len > 0 ? row_len - 1 : 0;
     
-    mgr->keyboard_cursor = current_row * 10 + current_col;
+    mgr->keyboard_cursor = current_row * 12 + current_col;
+}
+
+char wifi_manager_get_key_at(const wifi_manager_t *mgr, int cursor) {
+    if (!mgr) return '\0';
+    int row = cursor / 12;
+    int col = cursor % 12;
+    if (row < 0 || row > 3) return '\0';
+    int row_len = (int)strlen(mgr->keyboard_layout[row]);
+    if (col < 0 || col >= row_len) return '\0';
+    return mgr->keyboard_layout[row][col];
+}
+
+char wifi_manager_get_cursor_key(const wifi_manager_t *mgr) {
+    if (!mgr) return '\0';
+    return wifi_manager_get_key_at(mgr, mgr->keyboard_cursor);
 }
 
 void wifi_manager_update_config(const char *ssid, const char *password) {
@@ -173,6 +194,24 @@ void wifi_manager_update_config(const char *ssid, const char *password) {
     printf("[WIFI] Updated wpa_supplicant.conf with network: %s\n", ssid);
 }
 
+// Execute: nmcli device wifi connect <ssid> password <password> without shell
+static int nmcli_connect_noninteractive(const char *ssid, const char *password) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        const char *argv[] = {
+            "nmcli", "device", "wifi", "connect", ssid, "password", password, NULL
+        };
+        execvp("nmcli", (char * const *)argv);
+        _exit(127); // Exec failed
+    } else if (pid < 0) {
+        return -1;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
 int wifi_manager_connect(wifi_manager_t *mgr, const char *ssid, const char *password) {
     if (!mgr) {
         printf("[WIFI] Error: WiFi manager is NULL\n");
@@ -186,13 +225,19 @@ int wifi_manager_connect(wifi_manager_t *mgr, const char *ssid, const char *pass
     mgr->state = WIFI_STATE_CONNECTING;
     printf("[WIFI] Connecting to: %s\n", ssid);
     
-    wifi_manager_update_config(ssid, password);
-    
-    // Trigger WiFi reconnection
-    system("sudo systemctl restart wpa_supplicant 2>/dev/null || nmcli networking off && sleep 1 && nmcli networking on");
-    
-    printf("[WIFI] Connection attempt in progress...\n");
-    return 0;
+    // Try NetworkManager via nmcli (no shell, no sudo)
+    int nm_rc = nmcli_connect_noninteractive(ssid, password);
+    mgr->last_exit_code = nm_rc;
+    if (nm_rc == 0) {
+        snprintf(mgr->status, sizeof(mgr->status), "Connecting to %s...", ssid);
+        printf("[WIFI] nmcli connection command issued successfully (exit=%d)\n", nm_rc);
+        return 0; // success
+    }
+    // Do NOT attempt to modify system files or restart services without privileges
+    snprintf(mgr->status, sizeof(mgr->status), "Connect failed (nmcli exit=%d). Insufficient privileges?", nm_rc);
+    printf("[WIFI] nmcli failed (exit=%d). Not attempting privileged fallbacks.\n", nm_rc);
+    // Return non-zero to signal failure to caller (keep overlay open)
+    return nm_rc != 0 ? nm_rc : -1;
 }
 
 void wifi_manager_cleanup(wifi_manager_t *mgr) {

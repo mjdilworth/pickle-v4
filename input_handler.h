@@ -42,6 +42,12 @@ typedef struct {
     bool gamepad_toggle_mode;           // START: toggle keystone mode
     uint64_t gamepad_start_select_time; // For START+SELECT hold detection
     bool debug_gamepad;                 // Debug flag for logging button presses
+
+    // Text input queue for terminal mode (to avoid keycode collisions)
+    #define INPUT_TEXT_QUEUE_SIZE 128
+    char text_queue[INPUT_TEXT_QUEUE_SIZE];
+    int text_queue_head; // write index
+    int text_queue_tail; // read index
 } input_context_t;
 
 // Input handling functions
@@ -53,6 +59,9 @@ bool input_is_key_just_pressed(input_context_t *input, int key);
 bool input_should_quit(input_context_t *input);
 void input_clear_keys(input_context_t *input);
 void input_restore_terminal_global(void);  // Emergency terminal restoration
+
+// Text input helpers
+bool input_pop_text_char(input_context_t *input, char *out_char);
 
 // Key codes for our application
 #define KEY_QUIT         KEY_Q

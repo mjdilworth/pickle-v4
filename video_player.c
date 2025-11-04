@@ -44,6 +44,11 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     if (!app || !app->keystone || !app->input) {
         return false;
     }
+    
+    // Skip keystone movement if WiFi overlay is active
+    if (app->show_wifi_overlay) {
+        return false;
+    }
 
     bool left = input_is_key_pressed(app->input, KEY_LEFT);
     bool right = input_is_key_pressed(app->input, KEY_RIGHT);
@@ -365,22 +370,110 @@ void app_run(app_context_t *app) {
             app->show_wifi_overlay = !app->show_wifi_overlay;
             printf("[DEBUG] WiFi toggle pressed - overlay now: %s\n", app->show_wifi_overlay ? "ON" : "OFF");
             if (app->show_wifi_overlay) {
-                printf("[WiFi] WiFi menu opened (networks pre-scanned)\n");
-                // For now, use dummy networks - avoid popen during rendering
-                if (app->wifi_mgr.network_count == 0) {
-                    app->wifi_mgr.networks[0].signal_strength = 85;
-                    strncpy(app->wifi_mgr.networks[0].ssid, "Home-Network", MAX_SSID_LENGTH);
-                    app->wifi_mgr.networks[1].signal_strength = 70;
-                    strncpy(app->wifi_mgr.networks[1].ssid, "Guest-Network", MAX_SSID_LENGTH);
-                    app->wifi_mgr.networks[2].signal_strength = 60;
-                    strncpy(app->wifi_mgr.networks[2].ssid, "Office-Wifi", MAX_SSID_LENGTH);
-                    app->wifi_mgr.network_count = 3;
-                    app->wifi_mgr.state = WIFI_STATE_NETWORK_LIST;
-                    app->wifi_mgr.selected_index = 0;
-                    printf("[WiFi] Loaded %d test networks\n", app->wifi_mgr.network_count);
-                }
+                printf("[WiFi] Opening WiFi menu - scanning for networks...\n");
+                wifi_manager_scan(&app->wifi_mgr); // Synchronous scan via nmcli
             }
             app->input->toggle_wifi = false; // Reset flag
+        }
+        
+        // WiFi keyboard navigation (arrow keys when WiFi overlay is active)
+        if (app->show_wifi_overlay) {
+            if (app->wifi_mgr.state == WIFI_STATE_NETWORK_LIST) {
+                // DEBUG: Show key states occasionally
+                #ifndef NDEBUG
+                static int debug_frame = 0;
+                if (debug_frame++ % 30 == 0) {
+                    printf("[WiFi Nav Debug] UP=%d DOWN=%d, selected_index=%d\n",
+                           app->input->keys_just_pressed[KEY_UP],
+                           app->input->keys_just_pressed[KEY_DOWN],
+                           app->wifi_mgr.selected_index);
+                }
+                #endif
+                
+                // Arrow UP: Previous network
+                if (app->input->keys_just_pressed[KEY_UP]) {
+                    #ifndef NDEBUG
+                    printf("[WiFi UP PRESSED] Before: index=%d\n", app->wifi_mgr.selected_index);
+                    #endif
+                    if (app->wifi_mgr.selected_index > 0) {
+                        app->wifi_mgr.selected_index--;
+                        #ifndef NDEBUG
+                        printf("[WiFi] Selected network %d: %s (NOW selected_index=%d in mgr)\n", 
+                               app->wifi_mgr.selected_index,
+                               app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid,
+                               app->wifi_mgr.selected_index);
+                        fflush(stdout);
+                        #endif
+                    }
+                }
+                // Arrow DOWN: Next network
+                if (app->input->keys_just_pressed[KEY_DOWN]) {
+                    #ifndef NDEBUG
+                    printf("[WiFi DOWN PRESSED] Before: index=%d\n", app->wifi_mgr.selected_index);
+                    #endif
+                    if (app->wifi_mgr.selected_index < app->wifi_mgr.network_count - 1) {
+                        app->wifi_mgr.selected_index++;
+                        #ifndef NDEBUG
+                        printf("[WiFi] Selected network %d: %s (NOW selected_index=%d in mgr)\n", 
+                               app->wifi_mgr.selected_index,
+                               app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid,
+                               app->wifi_mgr.selected_index);
+                        fflush(stdout);
+                        #endif
+                    }
+                }
+                // ENTER: Select network
+                if (app->input->keys_just_pressed[KEY_ENTER]) {
+                    wifi_manager_select_network(&app->wifi_mgr, app->wifi_mgr.selected_index);
+                    printf("[WiFi] Network selected: %s - entering password mode\n",
+                           app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid);
+                    app->input->keys_just_pressed[KEY_ENTER] = false;
+                }
+            } else if (app->wifi_mgr.state == WIFI_STATE_PASSWORD_ENTRY) {
+                // Keyboard-based password entry with on-screen keyboard
+                // Move cursor with arrow keys
+                if (app->input->keys_just_pressed[KEY_LEFT])  wifi_manager_move_cursor(&app->wifi_mgr, -1, 0);
+                if (app->input->keys_just_pressed[KEY_RIGHT]) wifi_manager_move_cursor(&app->wifi_mgr,  1, 0);
+                if (app->input->keys_just_pressed[KEY_UP])    wifi_manager_move_cursor(&app->wifi_mgr,  0, -1);
+                if (app->input->keys_just_pressed[KEY_DOWN])  wifi_manager_move_cursor(&app->wifi_mgr,  0, 1);
+
+                // Direct typing from terminal input queue only (no keycode collisions)
+                char tchar;
+                int safety = 0;
+                while (input_pop_text_char(app->input, &tchar) && safety++ < 16) {
+                    wifi_manager_add_password_char(&app->wifi_mgr, tchar);
+                }
+
+                if (app->input->keys_just_pressed[KEY_BACKSPACE]) {
+                    wifi_manager_remove_password_char(&app->wifi_mgr);
+                    app->input->keys_just_pressed[KEY_BACKSPACE] = false;
+                }
+
+                // Press selected key on Enter
+                if (app->input->keys_just_pressed[KEY_ENTER]) {
+                    char key = wifi_manager_get_cursor_key(&app->wifi_mgr);
+                    if (key == '<') {
+                        wifi_manager_remove_password_char(&app->wifi_mgr);
+                    } else if (key == '!') {
+                        app->wifi_mgr.show_password = !app->wifi_mgr.show_password;
+                    } else if (key == '>') {
+                        int rc = wifi_manager_connect(&app->wifi_mgr,
+                                                      app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid,
+                                                      app->wifi_mgr.password);
+                        if (rc == 0) {
+                            app->show_wifi_overlay = false;
+                        } else {
+                            // Stay in password entry to show error message and allow retry
+                            app->wifi_mgr.state = WIFI_STATE_PASSWORD_ENTRY;
+                        }
+                    } else if (key == '_') {
+                        wifi_manager_add_password_char(&app->wifi_mgr, ' ');
+                    } else if (key != '\0') {
+                        wifi_manager_add_password_char(&app->wifi_mgr, key);
+                    }
+                    app->input->keys_just_pressed[KEY_ENTER] = false;
+                }
+            }
         }
         
         // Gamepad-specific actions
@@ -442,48 +535,74 @@ void app_run(app_context_t *app) {
             if (app->show_wifi_overlay) {
                 if (app->wifi_mgr.state == WIFI_STATE_NETWORK_LIST) {
                     // D-pad UP: Previous network
-                    if (app->input->gamepad_dpad_y < -0.5f) {
+                    static int16_t last_dpad_y = 0;
+                    if (app->input->gamepad_dpad_y < 0 && last_dpad_y == 0) {
                         if (app->wifi_mgr.selected_index > 0) {
                             app->wifi_mgr.selected_index--;
+                            printf("[WiFi] Selected network %d: %s\n", 
+                                   app->wifi_mgr.selected_index,
+                                   app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid);
                         }
-                        app->input->gamepad_dpad_y = 0;  // Reset to avoid repeated input
                     }
                     // D-pad DOWN: Next network
-                    if (app->input->gamepad_dpad_y > 0.5f) {
+                    if (app->input->gamepad_dpad_y > 0 && last_dpad_y == 0) {
                         if (app->wifi_mgr.selected_index < app->wifi_mgr.network_count - 1) {
                             app->wifi_mgr.selected_index++;
+                            printf("[WiFi] Selected network %d: %s\n", 
+                                   app->wifi_mgr.selected_index,
+                                   app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid);
                         }
-                        app->input->gamepad_dpad_y = 0;  // Reset
                     }
+                    last_dpad_y = app->input->gamepad_dpad_y;
+                    
                     // SELECT: Choose network and show password prompt
                     if (app->input->gamepad_reset_keystone) {
                         wifi_manager_select_network(&app->wifi_mgr, app->wifi_mgr.selected_index);
+                        printf("[WiFi] Network selected: %s - entering password mode\n",
+                               app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid);
                         app->input->gamepad_reset_keystone = false;
                     }
                 } else if (app->wifi_mgr.state == WIFI_STATE_PASSWORD_ENTRY) {
                     // D-pad for keyboard navigation
-                    if (app->input->gamepad_dpad_x < -0.5f) {
+                    static int16_t last_dpad_x = 0;
+                    static int16_t last_dpad_y_pass = 0;
+                    
+                    if (app->input->gamepad_dpad_x < 0 && last_dpad_x == 0) {
                         wifi_manager_move_cursor(&app->wifi_mgr, -1, 0);
-                        app->input->gamepad_dpad_x = 0;
                     }
-                    if (app->input->gamepad_dpad_x > 0.5f) {
+                    if (app->input->gamepad_dpad_x > 0 && last_dpad_x == 0) {
                         wifi_manager_move_cursor(&app->wifi_mgr, 1, 0);
-                        app->input->gamepad_dpad_x = 0;
                     }
-                    if (app->input->gamepad_dpad_y < -0.5f) {
+                    if (app->input->gamepad_dpad_y < 0 && last_dpad_y_pass == 0) {
                         wifi_manager_move_cursor(&app->wifi_mgr, 0, -1);
-                        app->input->gamepad_dpad_y = 0;
                     }
-                    if (app->input->gamepad_dpad_y > 0.5f) {
+                    if (app->input->gamepad_dpad_y > 0 && last_dpad_y_pass == 0) {
                         wifi_manager_move_cursor(&app->wifi_mgr, 0, 1);
-                        app->input->gamepad_dpad_y = 0;
                     }
-                    // SELECT: Connect with current password
+                    last_dpad_x = app->input->gamepad_dpad_x;
+                    last_dpad_y_pass = app->input->gamepad_dpad_y;
+                    
+                    // SELECT: Press current key
                     if (app->input->gamepad_reset_keystone) {
-                        wifi_manager_connect(&app->wifi_mgr,
-                                           app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid,
-                                           app->wifi_mgr.password);
-                        app->show_wifi_overlay = false;
+                        char key = wifi_manager_get_cursor_key(&app->wifi_mgr);
+                        if (key == '<') {
+                            wifi_manager_remove_password_char(&app->wifi_mgr);
+                        } else if (key == '!') {
+                            app->wifi_mgr.show_password = !app->wifi_mgr.show_password;
+                        } else if (key == '>') {
+                            int rc = wifi_manager_connect(&app->wifi_mgr,
+                                                          app->wifi_mgr.networks[app->wifi_mgr.selected_index].ssid,
+                                                          app->wifi_mgr.password);
+                            if (rc == 0) {
+                                app->show_wifi_overlay = false;
+                            } else {
+                                app->wifi_mgr.state = WIFI_STATE_PASSWORD_ENTRY;
+                            }
+                        } else if (key == '_') {
+                            wifi_manager_add_password_char(&app->wifi_mgr, ' ');
+                        } else if (key != '\0') {
+                            wifi_manager_add_password_char(&app->wifi_mgr, key);
+                        }
                         app->input->gamepad_reset_keystone = false;
                     }
                 }

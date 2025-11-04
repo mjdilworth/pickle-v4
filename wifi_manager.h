@@ -30,7 +30,11 @@ typedef struct {
     int password_length;
     wifi_state_t state;
     int keyboard_cursor;  // Position in virtual keyboard
-    char keyboard_layout[4][13];  // 4 rows of keyboard
+    char keyboard_layout[4][13];  // 4 rows of keyboard (strings, null-terminated)
+    // Status / error reporting
+    char status[160];
+    int last_exit_code;
+    bool show_password;  // Toggle to show/hide password characters
 } wifi_manager_t;
 
 // WiFi functions
@@ -40,6 +44,8 @@ void wifi_manager_select_network(wifi_manager_t *mgr, int index);
 void wifi_manager_add_password_char(wifi_manager_t *mgr, char c);
 void wifi_manager_remove_password_char(wifi_manager_t *mgr);
 void wifi_manager_move_cursor(wifi_manager_t *mgr, int dx, int dy);
+char wifi_manager_get_key_at(const wifi_manager_t *mgr, int cursor);
+char wifi_manager_get_cursor_key(const wifi_manager_t *mgr);
 int wifi_manager_connect(wifi_manager_t *mgr, const char *ssid, const char *password);
 void wifi_manager_update_config(const char *ssid, const char *password);
 void wifi_manager_cleanup(wifi_manager_t *mgr);

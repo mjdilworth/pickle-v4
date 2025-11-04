@@ -215,6 +215,8 @@ static void restore_terminal(input_context_t *input) {
 
 int input_init(input_context_t *input) {
     memset(input, 0, sizeof(*input));
+    input->text_queue_head = 0;
+    input->text_queue_tail = 0;
     
     // Initialize gamepad polling timer
     struct timeval tv;
@@ -315,14 +317,6 @@ void input_update(input_context_t *input) {
             try_connect_gamepad(input);
         }
     }
-    
-    if (input->use_stdin_fallback) {
-        // Terminal mode has no key-up events; treat directional keys as one-shot
-        input->keys_pressed[KEY_UP] = false;
-        input->keys_pressed[KEY_DOWN] = false;
-        input->keys_pressed[KEY_LEFT] = false;
-        input->keys_pressed[KEY_RIGHT] = false;
-    }
 
     // Store previous key states for edge detection
     memcpy(prev_keys, input->keys_pressed, sizeof(prev_keys));
@@ -331,17 +325,24 @@ void input_update(input_context_t *input) {
     memset(input->keys_just_pressed, false, sizeof(input->keys_just_pressed));
     
     if (input->use_stdin_fallback) {
-        // Handle terminal input
+        // Handle terminal input - read ONE character per frame to handle rapid key presses properly
         char ch;
         int bytes_read = read(input->stdin_fd, &ch, 1);
-        while (bytes_read == 1) {
+        if (bytes_read == 1) {
             // Convert ASCII characters to our internal key codes
+            #ifndef NDEBUG
             printf("[INPUT] Key pressed: '%c' (0x%02x)\n", ch, (unsigned char)ch);
+            fflush(stdout);
+            #endif
             switch (ch) {
                 case 'q':
                 case 'Q':
                     input->should_quit = true;
                     printf("Quit requested\n");
+                    break;
+                case '\n': // Enter (LF)
+                case '\r': // Enter (CR)
+                    input->keys_just_pressed[KEY_ENTER] = true;
                     break;
                 case 27: // ESC - check for arrow key sequences
                     {
@@ -349,44 +350,74 @@ void input_update(input_context_t *input) {
                         // Try to read the escape sequence
                         if (read(input->stdin_fd, &seq[0], 1) == 1 && seq[0] == '[') {
                             if (read(input->stdin_fd, &seq[1], 1) == 1) {
+                                #ifndef NDEBUG
+                                printf("[INPUT] Escape sequence read: ESC [ %c\n", seq[1]);
+                                fflush(stdout);
+                                #endif
                                 switch (seq[1]) {
                                     case 'A': // Up arrow
+                                        #ifndef NDEBUG
+                                        printf("[INPUT] Arrow UP detected\n");
+                                        fflush(stdout);
+                                        #endif
                                         input->keys_just_pressed[KEY_UP] = true;
                                         input->keys_pressed[KEY_UP] = true;
                                         // Hold functionality removed
                                         break;
                                     case 'B': // Down arrow
+                                        #ifndef NDEBUG
+                                        printf("[INPUT] Arrow DOWN detected\n");
+                                        fflush(stdout);
+                                        #endif
                                         input->keys_just_pressed[KEY_DOWN] = true;
                                         input->keys_pressed[KEY_DOWN] = true;
                                         // Hold functionality removed
                                         break;
                                     case 'C': // Right arrow
+                                        #ifndef NDEBUG
+                                        printf("[INPUT] Arrow RIGHT detected\n");
+                                        fflush(stdout);
+                                        #endif
                                         input->keys_just_pressed[KEY_RIGHT] = true;
                                         input->keys_pressed[KEY_RIGHT] = true;
                                         // Hold functionality removed
                                         break;
                                     case 'D': // Left arrow
+                                        #ifndef NDEBUG
+                                        printf("[INPUT] Arrow LEFT detected\n");
+                                        fflush(stdout);
+                                        #endif
                                         input->keys_just_pressed[KEY_LEFT] = true;
                                         input->keys_pressed[KEY_LEFT] = true;
                                         // Hold functionality removed
                                         break;
                                     default:
-                                        // Unknown escape sequence, treat as quit
-                                        input->should_quit = true;
-                                        printf("Quit requested (ESC)\n");
+                                        #ifndef NDEBUG
+                                        printf("[INPUT] Unknown escape sequence: ESC [ %c\n", seq[1]);
+                                        fflush(stdout);
+                                        #endif
+                                        // Ignore unknown ESC sequences in release
                                         break;
                                 }
                             } else {
                                 // Just ESC by itself
+                                #ifndef NDEBUG
                                 input->should_quit = true;
                                 printf("Quit requested (ESC)\n");
+                                #endif
                             }
                         } else {
                             // Just ESC by itself
+                            #ifndef NDEBUG
                             input->should_quit = true;
                             printf("Quit requested (ESC)\n");
+                            #endif
                         }
                     }
+                    break;
+                case 127: // Backspace (DEL)
+                case 8:   // Backspace (BS)
+                    input->keys_just_pressed[KEY_BACKSPACE] = true;
                     break;
                 case '1':
                     input->keys_just_pressed[KEY_1] = true;
@@ -440,10 +471,22 @@ void input_update(input_context_t *input) {
                     input->save_keystone = true;
                     // printf("P key pressed (save keystone)\n");
                     break;
+                default:
+                    // Queue printable ASCII for text input (prevents keycode collisions)
+                    if ((unsigned char)ch >= 32 && (unsigned char)ch <= 126) {
+                        int next_head = (input->text_queue_head + 1) % INPUT_TEXT_QUEUE_SIZE;
+                        if (next_head != input->text_queue_tail) { // not full
+                            input->text_queue[input->text_queue_head] = ch;
+                            input->text_queue_head = next_head;
+                        }
+                    }
+                    break;
             }
-            // Read next character
-            bytes_read = read(input->stdin_fd, &ch, 1);
         }
+        
+        // AFTER processing stdin input, clear directional keys that weren't pressed
+        // This ensures keys are fresh for this frame's processing
+        // (They will be set to true above if a key was actually pressed)
         
     } else {
         // Handle event device input (original method)
@@ -698,4 +741,12 @@ bool input_is_key_just_pressed(input_context_t *input, int key) {
 
 bool input_should_quit(input_context_t *input) {
     return input->should_quit;
+}
+
+bool input_pop_text_char(input_context_t *input, char *out_char) {
+    if (!input || !out_char) return false;
+    if (input->text_queue_head == input->text_queue_tail) return false; // empty
+    *out_char = input->text_queue[input->text_queue_tail];
+    input->text_queue_tail = (input->text_queue_tail + 1) % INPUT_TEXT_QUEUE_SIZE;
+    return true;
 }
