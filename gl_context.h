@@ -21,11 +21,16 @@ typedef struct {
     GLuint vertex_shader;
     GLuint fragment_shader;
     
-    // YUV textures for hardware decoded video
+    // YUV textures for hardware decoded video (video 1)
     GLuint texture_y;     // Y plane texture
     GLuint texture_u;     // U plane texture  
     GLuint texture_v;     // V plane texture
     GLuint texture_nv12;  // NV12 packed format texture
+    
+    // YUV textures for second video (video 2)
+    GLuint texture_y2;    // Y plane texture (video 2)
+    GLuint texture_u2;    // U plane texture (video 2)
+    GLuint texture_v2;    // V plane texture (video 2)
     
     // Pixel Buffer Objects for async DMA transfers
     GLuint pbo[3];        // PBOs for Y, U, V planes (async upload)
@@ -50,6 +55,7 @@ typedef struct {
     GLint u_texture_v;    // V plane sampler
     GLint u_texture_nv12; // NV12 packed sampler
     GLint u_keystone_matrix;
+    GLint u_flip_y;       // Flip texture Y coordinate (for upside-down videos)
     
     // Vertex attributes
     GLint a_position;
@@ -76,9 +82,9 @@ int gl_create_shaders(gl_context_t *gl);
 void gl_setup_buffers(gl_context_t *gl);
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
                     int width, int height, int y_stride, int u_stride, int v_stride,
-                    struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen);
+                    struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
-                    struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen);
+                    struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);

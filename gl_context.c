@@ -120,6 +120,7 @@ const char *vertex_shader_source =
     "// Legacy uniforms for compatibility\n"
     "uniform mat4 u_mvp_matrix;\n"
     "uniform mat4 u_keystone_matrix;\n"
+    "uniform float u_flip_y;\n"
     "\n"
     "// Output to fragment shader\n"
     "out vec2 v_texcoord;\n"
@@ -130,8 +131,8 @@ const char *vertex_shader_source =
     "    pos = u_keystone_matrix * pos;\n"
     "    gl_Position = u_mvp_matrix * pos;\n"
     "    \n"
-    "    // Pass texture coordinates to fragment shader\n"
-    "    v_texcoord = a_texcoord;\n"
+    "    // Pass texture coordinates to fragment shader, optionally flipping Y\n"
+    "    v_texcoord = vec2(a_texcoord.x, u_flip_y > 0.5 ? 1.0 - a_texcoord.y : a_texcoord.y);\n"
     "}\n";
 
 // Optimized YUV→RGB conversion fragment shader (OpenGL ES 3.1)
@@ -252,6 +253,7 @@ static int create_program(gl_context_t *gl) {
     gl->u_texture_v = glGetUniformLocation(gl->program, "u_texture_v");
     gl->u_texture_nv12 = glGetUniformLocation(gl->program, "u_texture_nv12");
     gl->u_keystone_matrix = glGetUniformLocation(gl->program, "u_keystone_matrix");
+    gl->u_flip_y = glGetUniformLocation(gl->program, "u_flip_y");
     gl->a_position = glGetAttribLocation(gl->program, "a_position");
     gl->a_texcoord = glGetAttribLocation(gl->program, "a_texcoord");
 
@@ -435,28 +437,54 @@ void gl_setup_buffers(gl_context_t *gl) {
 
     // Store for later use - don't set attributes here since no VAO
 
-    // Generate YUV textures
+    // Generate YUV textures for video 1
     glGenTextures(1, &gl->texture_y);
     glGenTextures(1, &gl->texture_u);
     glGenTextures(1, &gl->texture_v);
     glGenTextures(1, &gl->texture_nv12);
     
-    // Setup Y texture
+    // Generate YUV textures for video 2
+    glGenTextures(1, &gl->texture_y2);
+    glGenTextures(1, &gl->texture_u2);
+    glGenTextures(1, &gl->texture_v2);
+    
+    // Setup Y texture (video 1)
     glBindTexture(GL_TEXTURE_2D, gl->texture_y);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Setup U texture
+    // Setup U texture (video 1)
     glBindTexture(GL_TEXTURE_2D, gl->texture_u);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Setup V texture
+    // Setup V texture (video 1)
     glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Setup Y texture (video 2)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_y2);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Setup U texture (video 2)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_u2);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Setup V texture (video 2)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_v2);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -489,8 +517,9 @@ void gl_setup_buffers(gl_context_t *gl) {
 
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
-                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen) {
+                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
     (void)stride; // Unused parameter - kept for API consistency
+    (void)video_index; // NV12 not currently used for dual video
     static int frame_rendered = 0;
     static int last_width = 0, last_height = 0;
     static bool gl_state_set = false;
@@ -608,15 +637,22 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
                     int width, int height, int y_stride, int u_stride, int v_stride,
-                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen) {
-    static int frame_rendered = 0;
-    static int last_width = 0, last_height = 0;
+                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // Separate tracking for each video
+    static int frame_rendered[2] = {0, 0};
+    static int last_width[2] = {0, 0};
+    static int last_height[2] = {0, 0};
     static bool gl_state_set = false;
+    
+    // Select appropriate texture set based on video index
+    GLuint tex_y = (video_index == 0) ? gl->texture_y : gl->texture_y2;
+    GLuint tex_u = (video_index == 0) ? gl->texture_u : gl->texture_u2;
+    GLuint tex_v = (video_index == 0) ? gl->texture_v : gl->texture_v2;
     
     // Handle stride for YUV data with potential padding
     
     // Set black clear color for video background
-    if (frame_rendered == 0) {
+    if (frame_rendered[video_index] == 0) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Black background
     }
     
@@ -631,51 +667,58 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         gl_state_set = true;
     }
     
-    // CRITICAL: Complete buffer unbinding before state restoration
-    // This is needed to prevent state leakage from previous operations
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glUseProgram(0);
-    
-    // Reset vertex attribute arrays
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    
-    // Now set up the correct state for video rendering
-    glUseProgram(gl->program);
-    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
-    
-    // Position attribute
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    
-    // Texture coordinate attribute  
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    
-    // Set MVP matrix (identity - only once)
-    float mvp_matrix[16] = {
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1
-    };
-    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
-    
-    // Explicitly disable blending - overlays might have enabled it
-    glDisable(GL_BLEND);
-    
-    // Disable depth test - make sure video is always visible
-    glDisable(GL_DEPTH_TEST);
+    // CRITICAL: Only do full state setup once per frame (for video_index 0)
+    // For video_index > 0, just update textures and keystone matrix
+    if (video_index == 0) {
+        // Complete buffer unbinding before state restoration
+        // This is needed to prevent state leakage from previous operations
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+        
+        // Reset vertex attribute arrays
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        
+        // Now set up the correct state for video rendering
+        glUseProgram(gl->program);
+        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+        
+        // Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        
+        // Texture coordinate attribute  
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+        
+        // Set MVP matrix (identity - only once)
+        float mvp_matrix[16] = {
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        };
+        glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+        
+        // Explicitly disable blending - overlays might have enabled it
+        glDisable(GL_BLEND);
+        
+        // Disable depth test - make sure video is always visible
+        glDisable(GL_DEPTH_TEST);
+    }
     
     // Set keystone matrix (may change dynamically)
     const float *keystone_matrix = keystone_get_matrix(keystone);
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
     
+    // Set flip_y uniform (flip video 2, don't flip video 1)
+    glUniform1f(gl->u_flip_y, video_index == 1 ? 1.0f : 0.0f);
+    
     // Restore texture units and samplers (critical for video rendering)
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
     
     // Set proper texture parameters (might have been changed by overlays)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -684,7 +727,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_u);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
     
     // Set proper texture parameters
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -693,7 +736,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
     
     // Set proper texture parameters
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -719,7 +762,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         bool y_direct = (y_stride == width);
         bool u_direct = (u_stride == uv_width);
         bool v_direct = (v_stride == uv_width);
-        bool size_changed = (width != last_width || height != last_height || frame_rendered == 0);
+        bool size_changed = (width != last_width[video_index] || height != last_height[video_index] || frame_rendered[video_index] == 0);
         
         if (size_changed) {
             printf("YUV strides: Y=%d U=%d V=%d (dimensions: %dx%d, UV: %dx%d)\n", 
@@ -729,7 +772,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         
         // Y texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+        glBindTexture(GL_TEXTURE_2D, tex_y);
         
         if (gl->use_pbo && y_direct) {
             // PBO async upload path (fastest for direct data)
@@ -777,7 +820,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         }
         // U texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, gl->texture_u);
+        glBindTexture(GL_TEXTURE_2D, tex_u);
         
         if (gl->use_pbo && u_direct) {
             // PBO async upload path
@@ -824,7 +867,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         
         // V texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
         glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+        glBindTexture(GL_TEXTURE_2D, tex_v);
         
         if (gl->use_pbo && v_direct) {
             // PBO async upload path
@@ -869,32 +912,20 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             }
         }
         
-        if (frame_rendered == 0) {
+        if (frame_rendered[video_index] == 0) {
             printf("GPU YUV→RGB rendering started (%dx%d)\n", width, height);
         }
-        last_width = width;
-        last_height = height;
+        last_width[video_index] = width;
+        last_height[video_index] = height;
         
-        frame_rendered++;
-    } else if (frame_rendered == 0) {
+        frame_rendered[video_index]++;
+    } else if (frame_rendered[video_index] == 0) {
         // Skip test pattern for now - YUV textures need proper initialization
         printf("Waiting for video data...\n");
     }
     
-    // Check for OpenGL errors before drawing
-    GLenum error = glGetError();
-    if (error != GL_NO_ERROR) {
-        printf("OpenGL error before draw: 0x%x\n", error);
-    }
-    
     // Draw quad
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    
-    // Check for OpenGL errors after drawing
-    error = glGetError();
-    if (error != GL_NO_ERROR) {
-        printf("OpenGL error after draw: 0x%x\n", error);
-    }
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
     static int swap_count = 0;
@@ -1073,13 +1104,6 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
     // Render all 4 corner squares - colors are now in vertex data
-    static int last_selected = -999;
-    
-    // Debug when selection changes
-    if (keystone->selected_corner != last_selected) {
-        printf("[RENDER] Selected corner changed: %d -> %d\n", last_selected, keystone->selected_corner);
-        last_selected = keystone->selected_corner;
-    }
     
     // Draw all corner squares in one call - each corner is 4 vertices
     for (int i = 0; i < 4; i++) {
@@ -1847,11 +1871,16 @@ void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
 #endif
 
 void gl_cleanup(gl_context_t *gl) {
-    // Clean up YUV textures
+    // Clean up YUV textures (video 1)
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
     if (gl->texture_v) glDeleteTextures(1, &gl->texture_v);
     if (gl->texture_nv12) glDeleteTextures(1, &gl->texture_nv12);
+    
+    // Clean up YUV textures (video 2)
+    if (gl->texture_y2) glDeleteTextures(1, &gl->texture_y2);
+    if (gl->texture_u2) glDeleteTextures(1, &gl->texture_u2);
+    if (gl->texture_v2) glDeleteTextures(1, &gl->texture_v2);
     
     // Clean up PBOs
     if (gl->use_pbo) {

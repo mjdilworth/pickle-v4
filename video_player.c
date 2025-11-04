@@ -406,19 +406,29 @@ void app_run(app_context_t *app) {
         
         // Save keystone settings (S key or P key for compatibility)
         if (app->input->save_keystone) {
-            if (app->active_keystone == 0) {
-                if (keystone_save_settings(app->keystone) == 0) {
-                    printf("Keystone 1 settings saved to pickle_keystone.conf\n");
-                } else {
-                    printf("Failed to save keystone 1 settings\n");
-                }
-            } else if (app->keystone2) {
+            // Save both keystones
+            bool saved1 = false, saved2 = false;
+            
+            if (keystone_save_settings(app->keystone) == 0) {
+                printf("Keystone 1 settings saved to pickle_keystone.conf\n");
+                saved1 = true;
+            } else {
+                printf("Failed to save keystone 1 settings\n");
+            }
+            
+            if (app->keystone2) {
                 if (keystone_save_to_file(app->keystone2, "pickle_keystone2.conf") == 0) {
                     printf("Keystone 2 settings saved to pickle_keystone2.conf\n");
+                    saved2 = true;
                 } else {
                     printf("Failed to save keystone 2 settings\n");
                 }
             }
+            
+            if (saved1 && saved2) {
+                printf("Both keystone configurations saved successfully\n");
+            }
+            
             app->input->save_keystone = false; // Reset flag
         }
         
@@ -690,8 +700,8 @@ void app_run(app_context_t *app) {
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
             }
-            }  // Close the if (delta_time >= frame_budget) block
-        } else {
+            }  // Close the else block from line 532
+        } else {  // Close if (delta_time >= frame_budget) and start else  
             // Use the last decoded frame for rendering
             video_data = last_video_data;
             video_data2 = last_video_data2;
@@ -732,22 +742,22 @@ void app_run(app_context_t *app) {
         // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
         if (false && nv12_data) {
             // Render with NV12 packed format (faster - single texture upload)
-            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone, true);
+            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone, true, 0);
         } else {
             // Fallback to original YUV rendering (for compatibility)
             video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
             
             if (y_data && u_data && v_data) {
                 gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                              y_stride, u_stride, v_stride, app->drm, app->keystone, true);
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
             } else {
                 gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                              0, 0, 0, app->drm, app->keystone, true);
+                              0, 0, 0, app->drm, app->keystone, true, 0);
             }
         }
         
         // Render second video with second keystone (don't clear screen)
-        if (app->video2 && app->keystone2 && video_data2) {
+        if (app->video2 && app->keystone2) {
             uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
             int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
             int video_width2 = app->video2->width;
@@ -757,7 +767,14 @@ void app_run(app_context_t *app) {
             
             if (y_data2 && u_data2 && v_data2) {
                 gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2, 
-                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false);
+                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+            } else if (last_video_data2) {
+                // Fallback: render last valid frame if current decode failed
+                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                if (y_data2 && u_data2 && v_data2) {
+                    gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2, 
+                                  y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                }
             }
         }
         
@@ -849,6 +866,19 @@ void app_run(app_context_t *app) {
                 next_frame_ready = false;
             } else {
                 next_frame_ready = false;
+            }
+        }
+        
+        // OPTIMIZATION: Pre-decode next frame for video 2
+        if (app->video2 && first_frame_decoded2 && !next_frame_ready2 && frame_count2 > 0) {
+            int predecode_result2 = video_decode_frame(app->video2);
+            
+            if (predecode_result2 == 0) {
+                next_frame_ready2 = true;
+            } else if (video_is_eof(app->video2)) {
+                next_frame_ready2 = false;
+            } else {
+                next_frame_ready2 = false;
             }
         }
         
@@ -944,7 +974,7 @@ void app_run(app_context_t *app) {
                 overrun_count = 0;
             }
         }
-    }
+    }  // End while (app->running)
 }
 
 void app_cleanup(app_context_t *app) {
