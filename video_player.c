@@ -400,8 +400,29 @@ void app_run(app_context_t *app) {
         
         // Reset keystone to defaults
         if (input_is_key_just_pressed(app->input, KEY_R)) {
-            keystone_reset_corners(active_ks);
-            printf("Keystone %d reset to defaults\n", app->active_keystone + 1);
+            // Reset keystone 1 to full screen
+            keystone_reset_corners(app->keystone);
+            printf("Keystone 1 reset to defaults\n");
+            
+            // If second video exists, reset keystone 2 to a smaller inset area
+            if (app->keystone2) {
+                // Reset to defaults first
+                keystone_reset_corners(app->keystone2);
+                
+                // Then adjust to be slightly inset (10% margin on each side)
+                float inset = 0.10f; // 10% inset from edges
+                app->keystone2->corners[CORNER_TOP_LEFT].x = -1.0f + inset;      // TL X
+                app->keystone2->corners[CORNER_TOP_LEFT].y = 1.0f - inset;       // TL Y
+                app->keystone2->corners[CORNER_TOP_RIGHT].x = 1.0f - inset;      // TR X
+                app->keystone2->corners[CORNER_TOP_RIGHT].y = 1.0f - inset;      // TR Y
+                app->keystone2->corners[CORNER_BOTTOM_RIGHT].x = 1.0f - inset;   // BR X
+                app->keystone2->corners[CORNER_BOTTOM_RIGHT].y = -1.0f + inset;  // BR Y
+                app->keystone2->corners[CORNER_BOTTOM_LEFT].x = -1.0f + inset;   // BL X
+                app->keystone2->corners[CORNER_BOTTOM_LEFT].y = -1.0f + inset;   // BL Y
+                
+                keystone_calculate_matrix(app->keystone2);
+                printf("Keystone 2 reset to inset defaults (visible inside keystone 1)\n");
+            }
         }
         
         // Save keystone settings (S key or P key for compatibility)
@@ -496,8 +517,30 @@ void app_run(app_context_t *app) {
             
             // SELECT: Reset keystone
             if (app->input->gamepad_reset_keystone) {
+                // Reset keystone 1 to full screen
                 keystone_reset_corners(app->keystone);
-                printf("Keystone reset to defaults (gamepad)\n");
+                printf("Keystone 1 reset to defaults (gamepad)\n");
+                
+                // If second video exists, reset keystone 2 to a smaller inset area
+                if (app->keystone2) {
+                    // Reset to defaults first
+                    keystone_reset_corners(app->keystone2);
+                    
+                    // Then adjust to be slightly inset (10% margin on each side)
+                    float inset = 0.10f; // 10% inset from edges
+                    app->keystone2->corners[CORNER_TOP_LEFT].x = -1.0f + inset;      // TL X
+                    app->keystone2->corners[CORNER_TOP_LEFT].y = 1.0f - inset;       // TL Y
+                    app->keystone2->corners[CORNER_TOP_RIGHT].x = 1.0f - inset;      // TR X
+                    app->keystone2->corners[CORNER_TOP_RIGHT].y = 1.0f - inset;      // TR Y
+                    app->keystone2->corners[CORNER_BOTTOM_RIGHT].x = 1.0f - inset;   // BR X
+                    app->keystone2->corners[CORNER_BOTTOM_RIGHT].y = -1.0f + inset;  // BR Y
+                    app->keystone2->corners[CORNER_BOTTOM_LEFT].x = -1.0f + inset;   // BL X
+                    app->keystone2->corners[CORNER_BOTTOM_LEFT].y = -1.0f + inset;   // BL Y
+                    
+                    keystone_calculate_matrix(app->keystone2);
+                    printf("Keystone 2 reset to inset defaults (gamepad)\n");
+                }
+                
                 app->input->gamepad_reset_keystone = false;
             }
             
