@@ -713,8 +713,8 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     const float *keystone_matrix = keystone_get_matrix(keystone);
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
     
-    // Set flip_y uniform (flip video 2, don't flip video 1)
-    glUniform1f(gl->u_flip_y, video_index == 1 ? 1.0f : 0.0f);
+    // Set flip_y uniform (flip both videos - they're both encoded upside down)
+    glUniform1f(gl->u_flip_y, 1.0f);
     
     // Restore texture units and samplers (critical for video rendering)
     glActiveTexture(GL_TEXTURE0);
@@ -977,12 +977,12 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     static GLuint corner_vbo = 0;
     static bool vbo_initialized = false;
     static int cached_selected_corner = -2;  // Track which corner was selected
+    static int cached_vertex_count = 0;  // Track vertex count for rendering
     
     // Initialize VBO once on first call
     if (!vbo_initialized) {
         glGenBuffers(1, &corner_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
-        // OPTIMIZED: Pre-allocate with GL_DYNAMIC_DRAW on first init only
         glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices), NULL, GL_DYNAMIC_DRAW);
         vbo_initialized = true;
     }
@@ -1070,6 +1070,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         // glBufferSubData only updates the data, much faster than reallocating
         glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
+        cached_vertex_count = vertex_count;  // Cache for rendering
     }  // End needs_update block
     
     // Always bind and render (even if not updated)
@@ -1103,9 +1104,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Render all 4 corner squares - colors are now in vertex data
-    
-    // Draw all corner squares in one call - each corner is 4 vertices
+    // Draw all corner squares - each corner is 4 vertices
     for (int i = 0; i < 4; i++) {
         glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
     }
@@ -1816,8 +1815,6 @@ void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
         printf("=== Full WiFi Text ===\n%s\n", wifi_text);
         printf("====== End Text ======\n");
         
-    // Also show text length
-    printf("[DEBUG] wifi_text strlen=%zu\n", strlen(wifi_text));
     fflush(stdout);
     }
     

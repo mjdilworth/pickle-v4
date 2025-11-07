@@ -278,10 +278,10 @@ const float* keystone_get_matrix(keystone_context_t *keystone) {
 }
 
 void keystone_reset_corners(keystone_context_t *keystone) {
-    keystone->corners[CORNER_TOP_LEFT]     = (point_t){-1.0f, -1.0f};
-    keystone->corners[CORNER_TOP_RIGHT]    = (point_t){ 1.0f, -1.0f};
-    keystone->corners[CORNER_BOTTOM_RIGHT] = (point_t){ 1.0f,  1.0f};
-    keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f,  1.0f};
+    keystone->corners[CORNER_TOP_LEFT]     = (point_t){-1.0f,  1.0f};
+    keystone->corners[CORNER_TOP_RIGHT]    = (point_t){ 1.0f,  1.0f};
+    keystone->corners[CORNER_BOTTOM_RIGHT] = (point_t){ 1.0f, -1.0f};
+    keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f, -1.0f};
     
     keystone->matrix_dirty = true;
     keystone->corners_dirty = true;  // Mark corners VBO needs update

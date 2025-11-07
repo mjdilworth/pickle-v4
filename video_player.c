@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 #include <linux/input.h>
 #include <sys/stat.h>
 #include "production_config.h"
@@ -25,7 +26,7 @@ static int validate_video_file(const char *filename) {
     }
     
     // Check file size limits
-    if (st.st_size > MAX_VIDEO_FILE_SIZE) {
+    if ((unsigned long long)st.st_size > MAX_VIDEO_FILE_SIZE) {
         fprintf(stderr, "Error: Video file too large (%lld bytes, limit: %lld bytes)\n",
                 (long long)st.st_size, (long long)MAX_VIDEO_FILE_SIZE);
         return -1;
@@ -50,6 +51,8 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     if (!active_ks) {
         return false;
     }
+    
+
 
     bool left = input_is_key_pressed(app->input, KEY_LEFT);
     bool right = input_is_key_pressed(app->input, KEY_RIGHT);
@@ -110,6 +113,141 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     return true;
 }
 
+// Async decode thread function for video 2
+static void* async_decode_thread(void *arg) {
+    async_decode_t *decoder = (async_decode_t *)arg;
+    
+    while (!decoder->should_exit) {
+        pthread_mutex_lock(&decoder->mutex);
+        
+        // Wait for signal to decode
+        while (!decoder->decoding && !decoder->should_exit) {
+            pthread_cond_wait(&decoder->cond, &decoder->mutex);
+        }
+        
+        if (decoder->should_exit) {
+            pthread_mutex_unlock(&decoder->mutex);
+            break;
+        }
+        
+        decoder->decoding = false;
+        pthread_mutex_unlock(&decoder->mutex);
+        
+        // Decode frame (outside lock to allow main thread to continue)
+        int result = video_decode_frame(decoder->video);
+        
+        pthread_mutex_lock(&decoder->mutex);
+        if (result == 0) {
+            decoder->frame_ready = true;
+            // Signal that frame is ready (for async_decode_wait_frame)
+            pthread_cond_signal(&decoder->cond);
+        }
+        pthread_mutex_unlock(&decoder->mutex);
+    }
+    
+    return NULL;
+}
+
+// Create async decoder for video 2
+async_decode_t* async_decode_create(video_context_t *video) {
+    async_decode_t *decoder = (async_decode_t *)malloc(sizeof(async_decode_t));
+    if (!decoder) {
+        fprintf(stderr, "Failed to allocate async decoder\n");
+        return NULL;
+    }
+    
+    decoder->video = video;
+    decoder->frame_ready = false;
+    decoder->decoding = false;
+    decoder->should_exit = false;
+    decoder->running = false;
+    
+    pthread_mutex_init(&decoder->mutex, NULL);
+    pthread_cond_init(&decoder->cond, NULL);
+    
+    // Start decode thread
+    if (pthread_create(&decoder->thread, NULL, async_decode_thread, decoder) != 0) {
+        fprintf(stderr, "Failed to create async decode thread\n");
+        free(decoder);
+        return NULL;
+    }
+    
+    decoder->running = true;
+    return decoder;
+}
+
+// Destroy async decoder
+void async_decode_destroy(async_decode_t *decoder) {
+    if (!decoder) return;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    decoder->should_exit = true;
+    pthread_cond_signal(&decoder->cond);
+    pthread_mutex_unlock(&decoder->mutex);
+    
+    pthread_join(decoder->thread, NULL);
+    pthread_mutex_destroy(&decoder->mutex);
+    pthread_cond_destroy(&decoder->cond);
+    
+    free(decoder);
+}
+
+// Request decode of next frame
+void async_decode_request_frame(async_decode_t *decoder) {
+    if (!decoder) return;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    decoder->frame_ready = false;
+    decoder->decoding = true;
+    pthread_cond_signal(&decoder->cond);
+    pthread_mutex_unlock(&decoder->mutex);
+}
+
+// Check if frame is ready
+bool async_decode_frame_ready(async_decode_t *decoder) {
+    if (!decoder) return false;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    bool ready = decoder->frame_ready;
+    pthread_mutex_unlock(&decoder->mutex);
+    
+    return ready;
+}
+
+// Wait for frame to be ready (with timeout in milliseconds)
+bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
+    if (!decoder) return false;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    
+    // If already ready, return immediately
+    if (decoder->frame_ready) {
+        pthread_mutex_unlock(&decoder->mutex);
+        return true;
+    }
+    
+    // Wait with timeout
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    
+    while (!decoder->frame_ready && !decoder->should_exit) {
+        if (pthread_cond_timedwait(&decoder->cond, &decoder->mutex, &ts) == ETIMEDOUT) {
+            pthread_mutex_unlock(&decoder->mutex);
+            return false;
+        }
+    }
+    
+    bool ready = decoder->frame_ready;
+    pthread_mutex_unlock(&decoder->mutex);
+    return ready;
+}
+
 int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, 
             bool show_timing, bool debug_gamepad, bool advanced_diagnostics) {
     printf("app_init: Starting initialization...\n");
@@ -138,6 +276,7 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     app->debug_gamepad = debug_gamepad;
     app->advanced_diagnostics = advanced_diagnostics;
     app->active_keystone = 0;  // Start with first keystone active
+    app->gamepad_corner_cycle_index = -1;  // Reset corner cycle
 
     // Allocate contexts
     app->drm = calloc(1, sizeof(display_ctx_t));
@@ -233,6 +372,22 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         printf("No saved keystone settings found, using defaults\n");
     }
     
+    // Force show_corners and show_border to OFF at startup (user toggles with gamepad)
+    app->keystone->show_corners = false;
+    app->keystone->show_border = false;
+    
+    // CRITICAL FIX: Verify keystone corners are in correct physical positions
+    // If they're inverted or scrambled, reset them to ensure selection matches visual corners
+    // Check if corners are in correct order: TL should have Y > BR (Y positive = UP in normalized coords)
+    float tl_y = app->keystone->corners[CORNER_TOP_LEFT].y;
+    float br_y = app->keystone->corners[CORNER_BOTTOM_RIGHT].y;
+    if (tl_y < br_y) {  // TOP_LEFT Y should be > BOTTOM_RIGHT Y (1.0 > -1.0)
+        printf("WARNING: Keystone 1 corners are inverted/scrambled! Resetting to defaults.\n");
+        printf("  TL Y=%.2f, BR Y=%.2f (expected TL > BR)\n", tl_y, br_y);
+        keystone_reset_corners(app->keystone);
+        printf("Keystone 1 reset to correct defaults\n");
+    }
+    
     // Initialize second keystone if second video provided
     if (video_file2) {
         if (keystone_init(app->keystone2) != 0) {
@@ -247,6 +402,19 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         } else {
             printf("No saved keystone2 settings found, using defaults\n");
         }
+        
+        // Force show_corners and show_border to OFF at startup
+        app->keystone2->show_corners = false;
+        app->keystone2->show_border = false;
+        
+        // Create async decoder for video 2
+        app->async_decoder = async_decode_create(app->video2);
+        if (!app->async_decoder) {
+            fprintf(stderr, "Failed to create async decoder for video 2\n");
+            app_cleanup(app);
+            return -1;
+        }
+        printf("Async decoder created for video 2\n");
     }
 
     // Initialize input handler
@@ -364,23 +532,24 @@ void app_run(app_context_t *app) {
             break;
         }
 
-        // Handle keystone corner selection - match visual numbering
+        // Handle keystone corner selection - standard clockwise numbering from top-left
         // Keys 1-4 select corners for first keystone (video 1)
         // Keys 5-8 select corners for second keystone (video 2)
+        // Standard layout: 1=top-left, 2=top-right, 3=bottom-right, 4=bottom-left (clockwise)
         if (input_is_key_just_pressed(app->input, KEY_1)) {
-            keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);  // Visual "1" (bottom-left)
+            keystone_select_corner(app->keystone, CORNER_TOP_LEFT);      // Key "1" = TL
             app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_2)) {
-            keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT); // Visual "2" (bottom-right)
+            keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);     // Key "2" = TR
             app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_3)) {
-            keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);    // Visual "3" (top-right)
+            keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT);  // Key "3" = BR
             app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_4)) {
-            keystone_select_corner(app->keystone, CORNER_TOP_LEFT);     // Visual "4" (top-left)
+            keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);   // Key "4" = BL
             app->active_keystone = 0;
         } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_5)) {
-            keystone_select_corner(app->keystone2, CORNER_TOP_LEFT);     // Key "5" = TL (next to keystone1 TR)
+            keystone_select_corner(app->keystone2, CORNER_TOP_LEFT);     // Key "5" = TL
             app->active_keystone = 1;
         } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_6)) {
             keystone_select_corner(app->keystone2, CORNER_TOP_RIGHT);    // Key "6" = TR
@@ -455,15 +624,32 @@ void app_run(app_context_t *app) {
         
         // Toggle corner visibility
         if (app->input->toggle_corners) {
-            keystone_toggle_corners(active_ks);
-            app->input->toggle_corners = false; // Reset flag
+            if (app->keystone2) {
+                // Two videos: toggle BOTH keystones
+                app->keystone->show_corners = !app->keystone->show_corners;
+                app->keystone2->show_corners = !app->keystone2->show_corners;
+                printf("[TOGGLE] Corners: %s (both keystone 1 & 2)\n", 
+                       app->keystone->show_corners ? "ON" : "OFF");
+            } else {
+                // Single video: toggle only keystone 1
+                app->keystone->show_corners = !app->keystone->show_corners;
+                printf("[TOGGLE] Corners: %s (keystone 1 only)\n", 
+                       app->keystone->show_corners ? "ON" : "OFF");
+            }
+            app->input->toggle_corners = false;
         }
         
         // Toggle border visibility
         if (app->input->toggle_border) {
-            keystone_toggle_border(active_ks);
-            printf("Border toggled: %s (keystone %d)\n", active_ks->show_border ? "ON" : "OFF", app->active_keystone + 1);
-            app->input->toggle_border = false; // Reset flag
+            if (app->keystone2) {
+                // Two videos: toggle BOTH keystones
+                app->keystone->show_border = !app->keystone->show_border;
+                app->keystone2->show_border = !app->keystone2->show_border;
+            } else {
+                // Single video: toggle only keystone 1
+                app->keystone->show_border = !app->keystone->show_border;
+            }
+            app->input->toggle_border = false;
         }
         
         // Toggle help overlay visibility
@@ -476,29 +662,72 @@ void app_run(app_context_t *app) {
         if (app->input->gamepad_enabled) {
             // X button: Cycle through corners
             if (app->input->gamepad_cycle_corner) {
-                int current = active_ks->selected_corner;
+                // If video 2 EXISTS, cycle through all 8 corners (both keystones)
+                // Otherwise, cycle through only the 4 corners of the active keystone
                 
-                // If no corner selected, start with top-left
-                if (current < 0 || current > 3) {
-                    current = CORNER_TOP_LEFT;
-                    keystone_select_corner(active_ks, current);
-                    printf("[X-CYCLE] Starting with index %d (TOP_LEFT) keystone %d\n", current, app->active_keystone + 1);
-                } else {
-                    // Cycle clockwise: TOP_LEFT(0) -> BOTTOM_LEFT(3) -> BOTTOM_RIGHT(2) -> TOP_RIGHT(1) -> TOP_LEFT
-                    int next;
-                    switch (current) {
-                        case CORNER_TOP_LEFT:     next = CORNER_BOTTOM_LEFT; break;
-                        case CORNER_BOTTOM_LEFT:  next = CORNER_BOTTOM_RIGHT; break;
-                        case CORNER_BOTTOM_RIGHT: next = CORNER_TOP_RIGHT; break;
-                        case CORNER_TOP_RIGHT:    next = CORNER_TOP_LEFT; break;
-                        default:                  next = CORNER_TOP_LEFT; break;
+                if (app->keystone2) {
+                    // Dual video mode - cycle through all 8 corners (1-8 mode)
+                    const char* corner_names[] = {"TL", "TR", "BR", "BL"};
+                    
+                    // Initialize index if first press
+                    if (app->gamepad_corner_cycle_index < 0 || app->gamepad_corner_cycle_index >= 8) {
+                        app->gamepad_corner_cycle_index = 0;
                     }
-                    keystone_select_corner(active_ks, next);
-                    const char* names[] = {"TL", "TR", "BR", "BL"};
-                    printf("[X-CYCLE] %s(%.2f,%.2f) -> %s(%.2f,%.2f) keystone %d\n", 
-                           names[current], active_ks->corners[current].x, active_ks->corners[current].y,
-                           names[next], active_ks->corners[next].x, active_ks->corners[next].y,
-                           app->active_keystone + 1);
+                    
+                    // Determine which keystone and corner to select based on current index
+                    int next_index = app->gamepad_corner_cycle_index;  // Cache the index we're about to use
+                    keystone_context_t *target_keystone;
+                    int target_corner;
+                    int target_video;
+                    
+                    if (next_index < 4) {
+                        // Corners 0-3: Video 1 (corners TL, TR, BR, BL)
+                        target_keystone = app->keystone;
+                        target_corner = next_index;  // 0, 1, 2, or 3
+                        target_video = 1;
+                        app->active_keystone = 0;
+                    } else {
+                        // Corners 4-7: Video 2 (corners TL, TR, BR, BL)
+                        target_keystone = app->keystone2;
+                        target_corner = next_index - 4;  // 0, 1, 2, or 3
+                        target_video = 2;
+                        app->active_keystone = 1;
+                    }
+                    
+                    // DEBUG logging BEFORE change
+                    static int cycle_debug_count = 0;
+                    if (cycle_debug_count < 10) {  // Only log first 10 cycles
+                        printf("[X-CYCLE] Index=%d → Video %d corner %s (enum=%d)\n",
+                               next_index, target_video, corner_names[target_corner], target_corner);
+                        cycle_debug_count++;
+                    }
+                    
+                    // Select the corner
+                    keystone_select_corner(target_keystone, target_corner);
+                    target_keystone->show_corners = true;
+                    
+                    // Increment to next position for next button press
+                    app->gamepad_corner_cycle_index = (next_index + 1) % 8;
+                } else {
+                    // Single video mode - cycle through current keystone's 4 corners
+                    int current = active_ks->selected_corner;
+                    
+                    // If no corner selected, start with top-left
+                    if (current < 0 || current > 3) {
+                        current = CORNER_TOP_LEFT;
+                        keystone_select_corner(active_ks, current);
+                    } else {
+                        // Cycle clockwise: TOP_LEFT(0) -> TOP_RIGHT(1) -> BOTTOM_RIGHT(2) -> BOTTOM_LEFT(3) -> TOP_LEFT
+                        int next;
+                        switch (current) {
+                            case CORNER_TOP_LEFT:     next = CORNER_TOP_RIGHT; break;
+                            case CORNER_TOP_RIGHT:    next = CORNER_BOTTOM_RIGHT; break;
+                            case CORNER_BOTTOM_RIGHT: next = CORNER_BOTTOM_LEFT; break;
+                            case CORNER_BOTTOM_LEFT:  next = CORNER_TOP_LEFT; break;
+                            default:                  next = CORNER_TOP_LEFT; break;
+                        }
+                        keystone_select_corner(active_ks, next);
+                    }
                 }
                 app->input->gamepad_cycle_corner = false;
             }
@@ -546,8 +775,41 @@ void app_run(app_context_t *app) {
             
             // START: Toggle keystone mode (corners visibility)
             if (app->input->gamepad_toggle_mode) {
-                keystone_toggle_corners(app->keystone);
+                if (app->keystone2) {
+                    // Two videos: toggle BOTH keystones
+                    keystone_toggle_corners(app->keystone);
+                    keystone_toggle_corners(app->keystone2);
+                } else {
+                    // Single video: toggle only keystone 1
+                    keystone_toggle_corners(app->keystone);
+                }
                 app->input->gamepad_toggle_mode = false;
+            }
+            
+            // A button: Toggle corners on ALL keystones
+            if (app->input->gamepad_toggle_all_corners) {
+                if (app->keystone2) {
+                    // Two videos: toggle BOTH keystones
+                    app->keystone->show_corners = !app->keystone->show_corners;
+                    app->keystone2->show_corners = !app->keystone2->show_corners;
+                } else {
+                    // Single video: toggle only keystone 1
+                    app->keystone->show_corners = !app->keystone->show_corners;
+                }
+                app->input->gamepad_toggle_all_corners = false;
+            }
+            
+            // B button: Toggle borders on ALL keystones
+            if (app->input->gamepad_toggle_all_borders) {
+                if (app->keystone2) {
+                    // Two videos: toggle BOTH keystones
+                    app->keystone->show_border = !app->keystone->show_border;
+                    app->keystone2->show_border = !app->keystone2->show_border;
+                } else {
+                    // Single video: toggle only keystone 1
+                    app->keystone->show_border = !app->keystone->show_border;
+                }
+                app->input->gamepad_toggle_all_borders = false;
             }
         }
 
@@ -555,12 +817,13 @@ void app_run(app_context_t *app) {
         // This hides decode latency by overlapping decode with render/swap
         static bool next_frame_ready = false;
         static bool first_frame_decoded = false;
-        static bool next_frame_ready2 = false;
         static bool first_frame_decoded2 = false;
         
         // Decode video frame if enough time has passed
         uint8_t *video_data = NULL;
         uint8_t *video_data2 = NULL;
+        uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;  // Static for rendering reuse
+        int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
         static int frame_count = 0;
         static int frame_count2 = 0;
         static uint8_t *last_video_data = NULL;
@@ -601,8 +864,6 @@ void app_run(app_context_t *app) {
                         diagnostic_frame_count++;
                         
                         if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
-                            printf("DEBUG: Frame %d (pre-decoded, 0.0ms), diagnostic_frame_count=%d\n", 
-                                   frame_count, diagnostic_frame_count);
                             fflush(stdout);
                         }
                         
@@ -640,8 +901,6 @@ void app_run(app_context_t *app) {
                             diagnostic_frame_count++;
                             
                             if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
-                                printf("DEBUG: Frame %d decoded (%.1fms), diagnostic_frame_count=%d\n", 
-                                       frame_count, decode_time * 1000, diagnostic_frame_count);
                                 fflush(stdout);
                             }
                             
@@ -657,7 +916,8 @@ void app_run(app_context_t *app) {
                             first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
                             frame_count = 0;
                             // Update startup_time to reset the 5-second timeout
-                            clock_gettime(CLOCK_MONOTONIC, &startup_time);
+                            clock_gettime(CLOCK_MONOTONIC, &current_time);
+                            startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
                         } else {
                             printf("Playback finished.\n");
                             app->running = false;
@@ -687,12 +947,32 @@ void app_run(app_context_t *app) {
                                         // We now clear the arrow keys ONLY if we've successfully processed a movement
             // This allows for continued movement if a corner is not selected
             
-                // Decode second video if available
-                if (app->video2) {
-                    if (next_frame_ready2 && first_frame_decoded2) {
-                        // Use pre-decoded frame
-                        uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
-                        int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
+                // Decode second video if available (using async decoder)
+                if (app->video2 && app->async_decoder) {
+                    // For first frame, block until ready to prevent texture flickering
+                    if (!first_frame_decoded2) {
+                        if (frame_count2 == 0) {
+                            async_decode_request_frame(app->async_decoder);
+                        }
+                        
+                        // Wait up to 100ms for first frame to be ready
+                        if (async_decode_wait_frame(app->async_decoder, 100)) {
+                            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                            
+                            if (y_data2 != NULL) {
+                                video_data2 = y_data2;
+                                last_video_data2 = video_data2;
+                                frame_count2++;
+                                printf("First frame of video 2 decoded successfully (async)\n");
+                                first_frame_decoded2 = true;
+                                fflush(stdout);
+                                
+                                // Request next frame immediately
+                                async_decode_request_frame(app->async_decoder);
+                            }
+                        }
+                    } else if (async_decode_frame_ready(app->async_decoder)) {
+                        // Async frame is ready, use it (non-blocking after first frame)
                         video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
                         
                         if (y_data2 != NULL) {
@@ -700,40 +980,18 @@ void app_run(app_context_t *app) {
                             last_video_data2 = video_data2;
                             frame_count2++;
                         }
-                        next_frame_ready2 = false;
-                    } else {
-                        // Decode new frame for video 2
-                        int decode_result2 = video_decode_frame(app->video2);
                         
-                        if (decode_result2 == 0) {
-                            if (frame_count2 == 0) {
-                                printf("First frame of video 2 decoded successfully\n");
-                                first_frame_decoded2 = true;
-                                fflush(stdout);
-                            }
-                            
-                            uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
-                            int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
-                            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                            
-                            if (y_data2 != NULL) {
-                                video_data2 = y_data2;
-                                last_video_data2 = video_data2;
-                                frame_count2++;
-                                next_frame_ready2 = true;
-                            }
-                        } else if (video_is_eof(app->video2)) {
-                            if (app->loop_playback) {
-                                video_seek(app->video2, 0);
-                                next_frame_ready2 = false;
-                                first_frame_decoded2 = false;
-                                frame_count2 = 0;
-                            }
-                        } else {
-                            video_data2 = last_video_data2;
-                            next_frame_ready2 = false;
+                        // Request next frame from async decoder
+                        async_decode_request_frame(app->async_decoder);
+                    } else if (video_is_eof(app->video2)) {
+                        if (app->loop_playback) {
+                            video_seek(app->video2, 0);
+                            first_frame_decoded2 = false;
+                            frame_count2 = 0;
+                            async_decode_request_frame(app->async_decoder);
                         }
                     }
+                    // else: use last_video_data2 (already set from previous frame)
                 }
                 
             if (app->keystone->selected_corner < 0) {
@@ -800,24 +1058,17 @@ void app_run(app_context_t *app) {
         }
         
         // Render second video with second keystone (don't clear screen)
-        if (app->video2 && app->keystone2) {
-            uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
-            int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
+        // NOTE: We already captured video2 YUV pointers during decode section above
+        // Reuse them here to avoid race conditions with async decode thread
+        if (app->video2 && app->keystone2 && video_data2) {
+            // Get dimensions (safe to call anytime)
             int video_width2 = app->video2->width;
             int video_height2 = app->video2->height;
             
-            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-            
-            if (y_data2 && u_data2 && v_data2) {
+            // Use pre-captured pointers from decode section
+            if (u_data2 && v_data2 && y_stride2 > 0) {
                 gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2, 
                               y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
-            } else if (last_video_data2) {
-                // Fallback: render last valid frame if current decode failed
-                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                if (y_data2 && u_data2 && v_data2) {
-                    gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2, 
-                                  y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
-                }
             }
         }
         
@@ -837,11 +1088,6 @@ void app_run(app_context_t *app) {
                 gl_render_corners(app->gl, app->keystone);
             }
             if (app->keystone->show_border) {
-                static int border_render_count = 0;
-                if (border_render_count < 3) {  // Only log first 3 times
-                    printf("Rendering border overlay (frame %d)\n", border_render_count + 1);
-                    border_render_count++;
-                }
                 gl_render_border(app->gl, app->keystone);
             }
             if (app->keystone->show_help) {
@@ -912,18 +1158,8 @@ void app_run(app_context_t *app) {
             }
         }
         
-        // OPTIMIZATION: Pre-decode next frame for video 2
-        if (app->video2 && first_frame_decoded2 && !next_frame_ready2 && frame_count2 > 0) {
-            int predecode_result2 = video_decode_frame(app->video2);
-            
-            if (predecode_result2 == 0) {
-                next_frame_ready2 = true;
-            } else if (video_is_eof(app->video2)) {
-                next_frame_ready2 = false;
-            } else {
-                next_frame_ready2 = false;
-            }
-        }
+        // Note: Video 2 pre-decode is now handled by async decoder thread
+        // No need for manual pre-decode here
         
         clock_gettime(CLOCK_MONOTONIC, &render_end);
         
@@ -1021,6 +1257,10 @@ void app_run(app_context_t *app) {
 }
 
 void app_cleanup(app_context_t *app) {
+    if (app->async_decoder) {
+        async_decode_destroy(app->async_decoder);
+        app->async_decoder = NULL;
+    }
     if (app->input) {
         input_cleanup(app->input);
         free(app->input);
