@@ -1108,6 +1108,14 @@ void app_run(app_context_t *app) {
                                                        app->keystone2->show_border || 
                                                        app->keystone2->show_help));
         if (any_overlay_visible2) {
+            // If keystone1 has a selected corner, temporarily deselect keystone2's corner
+            // This ensures only one keystone's corners appear highlighted at a time
+            int saved_selected_corner = -1;
+            if (app->keystone->selected_corner >= 0) {
+                saved_selected_corner = app->keystone2->selected_corner;
+                app->keystone2->selected_corner = -1;
+            }
+            
             if (app->keystone2->show_corners) {
                 gl_render_corners(app->gl, app->keystone2);
             }
@@ -1116,6 +1124,11 @@ void app_run(app_context_t *app) {
             }
             if (app->keystone2->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone2);
+            }
+            
+            // Restore the selection
+            if (saved_selected_corner >= 0) {
+                app->keystone2->selected_corner = saved_selected_corner;
             }
             
             while (glGetError() != GL_NO_ERROR) {

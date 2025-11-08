@@ -978,6 +978,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     static bool vbo_initialized = false;
     static int cached_selected_corner = -2;  // Track which corner was selected
     static int cached_vertex_count = 0;  // Track vertex count for rendering
+    static bool last_show_corners = false;  // Track visibility toggle
     
     // Initialize VBO once on first call
     if (!vbo_initialized) {
@@ -987,9 +988,11 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         vbo_initialized = true;
     }
     
-    // OPTIMIZATION: Only update VBO if corners moved or selection changed
-    bool needs_update = keystone->corners_dirty || 
-                        (cached_selected_corner != keystone->selected_corner);
+    // Force update if visibility toggled or selection changed
+    bool visibility_changed = (last_show_corners != keystone->show_corners);
+    bool selection_changed = (cached_selected_corner != keystone->selected_corner);
+    bool needs_update = keystone->corners_dirty || visibility_changed || selection_changed;
+    last_show_corners = keystone->show_corners;
     
     // Always prepare corner colors (outside needs_update so available for rendering)
     float corner_colors[4][4];
