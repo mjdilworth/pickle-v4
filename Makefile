@@ -8,6 +8,10 @@ CFLAGS = -Wall -Wextra -std=c99 -O2 -g
 
 # ARM CPU Detection and NEON SIMD optimization (works for both armv7 and aarch64)
 ARCH_FLAGS = $(shell uname -m | grep -qE 'arm|aarch64' && echo '-ftree-vectorize -ffast-math')
+# RPi4-specific: Cortex-A72 CPU tuning with NEON intrinsics
+ifeq ($(shell uname -m),aarch64)
+    ARCH_FLAGS += -march=armv8-a+crc -mtune=cortex-a72 -mcpu=cortex-a72
+endif
 CFLAGS += $(ARCH_FLAGS)
 
 # Additional RPi4 optimizations
@@ -102,8 +106,12 @@ show-flags:
 # Release build with maximum optimization
 release: CFLAGS = -Wall -Wextra -std=c99 -O3 -DNDEBUG
 release: CFLAGS += $(ARCH_FLAGS) $(RPi4_FLAGS)
-release: CFLAGS += -flto -fvisibility=hidden -ffunction-sections -fdata-sections
-release: LDFLAGS = -Wl,--gc-sections,-s
+release: CFLAGS += -flto=auto -fvisibility=hidden -ffunction-sections -fdata-sections
+# RPi4-specific release optimizations
+ifeq ($(shell uname -m),aarch64)
+release: CFLAGS += -march=armv8-a+crc+simd -mtune=cortex-a72 -mcpu=cortex-a72
+endif
+release: LDFLAGS = -Wl,--gc-sections,-s -flto=auto
 release: clean $(TARGET)
 	@echo "Release build complete: $(TARGET)"
 	@ls -lh $(TARGET)

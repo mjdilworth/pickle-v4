@@ -205,6 +205,16 @@ int drm_init(display_ctx_t *drm) {
     return 0;
 }
 
+// Callback to destroy framebuffer when GBM buffer is destroyed
+static void drm_fb_destroy_callback(struct gbm_bo *bo, void *data) {
+    int drm_fd = gbm_device_get_fd(gbm_bo_get_device(bo));
+    uint32_t fb_id = (uint32_t)(uintptr_t)data;
+    
+    if (fb_id) {
+        drmModeRmFB(drm_fd, fb_id);
+    }
+}
+
 uint32_t drm_get_fb_for_bo(display_ctx_t *drm, struct gbm_bo *bo) {
     uint32_t fb_id = (uint32_t)(uintptr_t)gbm_bo_get_user_data(bo);
     if (fb_id) {
@@ -223,7 +233,8 @@ uint32_t drm_get_fb_for_bo(display_ctx_t *drm, struct gbm_bo *bo) {
         return 0;
     }
     
-    gbm_bo_set_user_data(bo, (void *)(uintptr_t)fb_id, NULL);
+    // Register destroy callback to automatically free framebuffer when buffer is destroyed
+    gbm_bo_set_user_data(bo, (void *)(uintptr_t)fb_id, drm_fb_destroy_callback);
     return fb_id;
 }
 

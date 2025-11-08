@@ -162,12 +162,24 @@ async_decode_t* async_decode_create(video_context_t *video) {
     decoder->should_exit = false;
     decoder->running = false;
     
-    pthread_mutex_init(&decoder->mutex, NULL);
-    pthread_cond_init(&decoder->cond, NULL);
+    if (pthread_mutex_init(&decoder->mutex, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize decoder mutex\n");
+        free(decoder);
+        return NULL;
+    }
+    
+    if (pthread_cond_init(&decoder->cond, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize decoder condition variable\n");
+        pthread_mutex_destroy(&decoder->mutex);
+        free(decoder);
+        return NULL;
+    }
     
     // Start decode thread
     if (pthread_create(&decoder->thread, NULL, async_decode_thread, decoder) != 0) {
         fprintf(stderr, "Failed to create async decode thread\n");
+        pthread_cond_destroy(&decoder->cond);
+        pthread_mutex_destroy(&decoder->mutex);
         free(decoder);
         return NULL;
     }

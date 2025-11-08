@@ -977,7 +977,6 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     static GLuint corner_vbo = 0;
     static bool vbo_initialized = false;
     static int cached_selected_corner = -2;  // Track which corner was selected
-    static int cached_vertex_count = 0;  // Track vertex count for rendering
     static bool last_show_corners = false;  // Track visibility toggle
     
     // Initialize VBO once on first call
@@ -1073,7 +1072,6 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         // glBufferSubData only updates the data, much faster than reallocating
         glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
-        cached_vertex_count = vertex_count;  // Cache for rendering
     }  // End needs_update block
     
     // Always bind and render (even if not updated)
