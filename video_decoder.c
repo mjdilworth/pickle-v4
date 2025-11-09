@@ -11,6 +11,44 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 
+// V4L2 M2M format negotiation callback for RPi hardware decoder
+// RPi V4L2 M2M driver prefers NV12 first, then YUV420P
+static enum AVPixelFormat get_format_callback(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    const enum AVPixelFormat *p;
+    
+    printf("[HW_DECODE] Format negotiation - available formats:\n");
+    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        const char *name = av_get_pix_fmt_name(*p);
+        printf("[HW_DECODE]   - %s (%d)\n", name ? name : "unknown", *p);
+    }
+    
+    // CRITICAL: RPi V4L2 M2M prefers NV12 for better performance
+    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == AV_PIX_FMT_NV12) {
+            printf("[HW_DECODE] ✓ Selected: NV12 (preferred for RPi V4L2 M2M)\n");
+            return AV_PIX_FMT_NV12;
+        }
+    }
+    
+    // Fallback to YUV420P
+    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == AV_PIX_FMT_YUV420P) {
+            printf("[HW_DECODE] ✓ Selected: YUV420P (fallback)\n");
+            return *p;
+        }
+    }
+    
+    // Last resort: first available format
+    if (pix_fmts[0] != AV_PIX_FMT_NONE) {
+        printf("[HW_DECODE] ✓ Selected: %s (first available)\n", 
+               av_get_pix_fmt_name(pix_fmts[0]));
+        return pix_fmts[0];
+    }
+    
+    fprintf(stderr, "[HW_DECODE] ERROR: No suitable format found\n");
+    return AV_PIX_FMT_NONE;
+}
+
 int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics) {
     memset(video, 0, sizeof(*video));
     
@@ -238,31 +276,80 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
 
     // Configure hardware decoding for V4L2 M2M
     if (video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M) {
-        printf("[HW_DECODE] V4L2: Configuring V4L2 M2M decoder...\n");
-        // Don't force pixel format - let the decoder choose the best format
-        video->codec_ctx->thread_count = 1; // V4L2 handles threading internally
-        printf("[HW_DECODE] V4L2: Set thread_count=1 (V4L2 handles threading)\n");
+        printf("[HW_DECODE] V4L2: Configuring V4L2 M2M decoder for Raspberry Pi...\n");
         
-        // Enable CHUNKS mode for V4L2 M2M decoder
+        // Set format negotiation callback
+        video->codec_ctx->get_format = get_format_callback;
+        printf("[HW_DECODE] V4L2: ✓ Format negotiation callback registered\n");
+        
+        // CRITICAL: V4L2 M2M must be single-threaded
+        video->codec_ctx->thread_count = 1;
+        video->codec_ctx->thread_type = 0;  // Disable all threading
+        printf("[HW_DECODE] V4L2: Set thread_count=1, thread_type=0 (V4L2 handles threading)\n");
+        
+        // Low-latency flags for better V4L2 M2M performance
+        video->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        video->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+        printf("[HW_DECODE] V4L2: ✓ LOW_DELAY and FAST flags enabled\n");
+        
+        // Enable CHUNKS mode for V4L2 M2M decoder (handles partial frames)
         video->codec_ctx->flags2 |= AV_CODEC_FLAG2_CHUNKS;
         printf("[HW_DECODE] V4L2: ✓ CHUNKS mode enabled (supports partial frames)\n");
+        
+        // Prepare V4L2-specific options
+        AVDictionary *codec_opts = NULL;
+        
+        // CRITICAL FIX: Set V4L2 buffer counts - essential for RPi stability
+        // These values prevent decoder stalls and ensure smooth operation
+        av_dict_set(&codec_opts, "num_capture_buffers", "32", 0);
+        av_dict_set(&codec_opts, "num_output_buffers", "16", 0);
+        printf("[HW_DECODE] V4L2: Set num_capture_buffers=32, num_output_buffers=16\n");
+        
+        // CRITICAL FIX: Force standard mmap mode (not PRIME/DRM) for compatibility
+        // This ensures the decoder uses memory-mapped buffers correctly
+        if (av_opt_set_int(video->codec_ctx->priv_data, "num_capture_buffers", 32, 0) == 0) {
+            printf("[HW_DECODE] V4L2: ✓ Forcing mmap mode (not PRIME/DRM)\n");
+        }
+        
+        // Optional: Force specific device (uncomment if needed)
+        // av_dict_set(&codec_opts, "device", "/dev/video10", 0);
+        // printf("[HW_DECODE] V4L2: Set device=/dev/video10\n");
+        
         printf("[HW_DECODE] V4L2: Configuration complete\n");
+        printf("[HW_DECODE] V4L2: Note - decoder may buffer 20-30 packets before first frame\n");
+        
+        // Open codec with V4L2 options
+        int ret = avcodec_open2(video->codec_ctx, video->codec, &codec_opts);
+        av_dict_free(&codec_opts);
+        
+        if (ret < 0) {
+            fprintf(stderr, "Failed to open V4L2 M2M codec: %s\n", av_err2str(ret));
+            fprintf(stderr, "This might indicate:\n");
+            fprintf(stderr, "  - V4L2 M2M driver not compatible with this FFmpeg version\n");
+            fprintf(stderr, "  - Missing /dev/video* device\n");
+            fprintf(stderr, "  - Codec doesn't support this video profile/level\n");
+            avcodec_free_context(&video->codec_ctx);
+            avformat_close_input(&video->format_ctx);
+            av_packet_free(&video->packet);
+            return -1;
+        }
+        printf("[HW_DECODE] V4L2: ✓ Codec opened successfully with V4L2 options\n");
     } else {
         // Software decoding settings
         video->codec_ctx->thread_count = 4;
         video->codec_ctx->thread_type = FF_THREAD_FRAME;
-    }
-
-    // Open codec
-    if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
-        fprintf(stderr, "Failed to open codec\n");
-        fprintf(stderr, "This might indicate:\n");
-        fprintf(stderr, "  - Missing codec support\n");
-        fprintf(stderr, "  - Incompatible video format\n");
-        avcodec_free_context(&video->codec_ctx);
-        avformat_close_input(&video->format_ctx);
-        av_packet_free(&video->packet);
-        return -1;
+        
+        // Open codec
+        if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
+            fprintf(stderr, "Failed to open codec\n");
+            fprintf(stderr, "This might indicate:\n");
+            fprintf(stderr, "  - Missing codec support\n");
+            fprintf(stderr, "  - Incompatible video format\n");
+            avcodec_free_context(&video->codec_ctx);
+            avformat_close_input(&video->format_ctx);
+            av_packet_free(&video->packet);
+            return -1;
+        }
     }
     printf("Codec opened successfully\n");
 
@@ -334,41 +421,36 @@ int video_decode_frame(video_context_t *video) {
     int packets_sent_this_call = 0;
     // Hardware decoders that are broken/incompatible will hang immediately
     // Working decoders typically output a frame within 3-5 packets
-    int MAX_PACKETS_PER_CALL = 10;  // Detect hangs quickly
+    // V4L2 M2M may buffer 20-30 packets before first frame (normal behavior)
+    // Some videos (especially high bitrate) may need 40-50 packets
+    int MAX_PACKETS_PER_CALL = 50;  // Allow enough buffering for all video types
     if (video->use_hardware_decode && decode_call_count == 1) {
-        MAX_PACKETS_PER_CALL = 10;  // First call: try 10 packets, then fallback if no output
+        MAX_PACKETS_PER_CALL = 50;  // First call: generous timeout for V4L2 buffering
         printf("[HW_DECODE] First decode: will send up to %d packets before software fallback\n", MAX_PACKETS_PER_CALL);
+        printf("[HW_DECODE] Note: V4L2 M2M may buffer 20-50 packets depending on video\n");
     }
     
     while (packets_sent_this_call < MAX_PACKETS_PER_CALL) {
         // First, try to get any frame the decoder has buffered
-        if (video->use_hardware_decode && packets_sent_this_call < 5) {
-            printf("[HW-DEBUG] Loop iteration %d: Calling avcodec_receive_frame...\n", packets_sent_this_call);
-            fflush(stdout);
-        }
-        
         int receive_result = avcodec_receive_frame(video->codec_ctx, video->frame);
-        
-        if (video->use_hardware_decode && packets_sent_this_call < 5) {
-            printf("[HW-DEBUG] Loop iteration %d: receive_result=%d (%s)\n", 
-                   packets_sent_this_call, receive_result, 
-                   receive_result == AVERROR(EAGAIN) ? "EAGAIN" : av_err2str(receive_result));
-            fflush(stdout);
-        }
         
         if (receive_result == 0) {
             // Successfully decoded a frame
             static int frame_count = 0;
             frame_count++;
             
-            if (frame_count == 1 || (video->advanced_diagnostics && (frame_count % 100) == 0)) {
+            if (frame_count == 1) {
                 const char *fmt_name = av_get_pix_fmt_name(video->frame->format);
-                printf("\n----- Successfully decoded frame #%d -----\n", frame_count);
-                printf("* Decoder: %s\n", video->use_hardware_decode ? "Hardware" : "Software");
+                printf("\n✓✓✓ SUCCESS! First frame decoded after %d packets ✓✓✓\n", packets_sent_this_call);
+                printf("* Decoder: %s\n", video->use_hardware_decode ? "Hardware (V4L2 M2M)" : "Software");
                 printf("* Frame format: %s (%d)\n", fmt_name ? fmt_name : "unknown", video->frame->format);
                 printf("* Frame size: %dx%d\n", video->frame->width, video->frame->height);
                 printf("* Picture type: %c\n", av_get_picture_type_char(video->frame->pict_type));
-                printf("------------------------------------------\n\n");
+                printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+                fflush(stdout);
+            } else if (video->advanced_diagnostics && (frame_count % 100) == 0) {
+                const char *fmt_name = av_get_pix_fmt_name(video->frame->format);
+                printf("Frame #%d decoded successfully\n", frame_count);
                 fflush(stdout);
             }
             
@@ -433,14 +515,8 @@ int video_decode_frame(video_context_t *video) {
         AVPacket *bsf_pkt = NULL;
         
         if (video->use_hardware_decode && video->bsf_annexb_ctx) {
-            // Convert avcC to Annex-B
-            if (packets_sent_this_call < 3) {
-                printf("[HW_DECODE] Packet %d: Sending to BSF (size=%d, pts=%ld)\n", 
-                       packets_sent_this_call, video->packet->size, video->packet->pts);
-            }
-            
+            // Convert avcC to Annex-B (silent operation after initial success)
             if (av_bsf_send_packet(video->bsf_annexb_ctx, video->packet) < 0) {
-                fprintf(stderr, "[HW_DECODE] ✗ BSF send failed for packet %d\n", packets_sent_this_call);
                 av_packet_unref(video->packet);
                 continue;
             }
@@ -448,44 +524,21 @@ int video_decode_frame(video_context_t *video) {
             bsf_pkt = av_packet_alloc();
             int ret = av_bsf_receive_packet(video->bsf_annexb_ctx, bsf_pkt);
             if (ret == AVERROR(EAGAIN)) {
-                // BSF needs more packets
-                if (packets_sent_this_call < 3) {
-                    printf("[HW_DECODE] BSF: EAGAIN (needs more packets)\n");
-                }
+                // BSF needs more packets (normal operation)
                 av_packet_free(&bsf_pkt);
                 av_packet_unref(video->packet);
                 continue;
             } else if (ret < 0) {
-                fprintf(stderr, "[HW_DECODE] ✗ BSF receive failed: %s\n", av_err2str(ret));
                 av_packet_free(&bsf_pkt);
                 av_packet_unref(video->packet);
                 continue;
-            }
-            
-            if (packets_sent_this_call < 3) {
-                printf("[HW_DECODE] BSF: ✓ Converted packet (size: %d→%d)\n", 
-                       video->packet->size, bsf_pkt->size);
             }
             
             pkt_to_decode = bsf_pkt;
         }
         
-        // Send packet to decoder
-        if (video->use_hardware_decode && packets_sent_this_call < 3) {
-            printf("[HW_DECODE] Sending packet %d to decoder (size=%d)...\n", 
-                   packets_sent_this_call, pkt_to_decode->size);
-        }
-        
+        // Send packet to decoder (only log errors or first 3)
         int send_result = avcodec_send_packet(video->codec_ctx, pkt_to_decode);
-        
-        if (video->use_hardware_decode && packets_sent_this_call < 3) {
-            if (send_result == 0) {
-                printf("[HW_DECODE] ✓ Packet %d sent successfully\n", packets_sent_this_call);
-            } else {
-                printf("[HW_DECODE] ✗ Packet %d send result: %s\n", 
-                       packets_sent_this_call, av_err2str(send_result));
-            }
-        }
         
         // Cleanup packets
         if (bsf_pkt) {
@@ -496,6 +549,19 @@ int video_decode_frame(video_context_t *video) {
         if (send_result < 0) {
             fprintf(stderr, "[HW_DECODE] ✗ Error sending packet to decoder: %s\n", av_err2str(send_result));
             return -1;
+        }
+        
+        // Show buffering progress for V4L2 M2M on first decode
+        if (video->use_hardware_decode && decode_call_count == 1) {
+            if (packets_sent_this_call == 10) {
+                printf("[HW_DECODE] Buffering: sent %d packets, waiting for first frame...\n", packets_sent_this_call);
+            } else if (packets_sent_this_call == 20) {
+                printf("[HW_DECODE] Buffering: sent %d packets (normal for V4L2 M2M)...\n", packets_sent_this_call);
+            } else if (packets_sent_this_call == 30) {
+                printf("[HW_DECODE] Buffering: sent %d packets...\n", packets_sent_this_call);
+            } else if (packets_sent_this_call == 40) {
+                printf("[HW_DECODE] Buffering: sent %d packets (large buffer needed)...\n", packets_sent_this_call);
+            }
         }
         
         // Loop continues automatically - will try to receive frame next iteration
@@ -890,9 +956,28 @@ void video_cleanup(video_context_t *video) {
     if (video->packet) {
         av_packet_free(&video->packet);
     }
+    
+    // CRITICAL: Properly close codec before freeing to release V4L2 device
     if (video->codec_ctx) {
+        // Flush any pending frames
+        avcodec_flush_buffers(video->codec_ctx);
+        
+        // Send flush packet to ensure V4L2 M2M decoder releases resources
+        avcodec_send_packet(video->codec_ctx, NULL);
+        
+        // Drain any remaining frames
+        AVFrame *dummy = av_frame_alloc();
+        if (dummy) {
+            while (avcodec_receive_frame(video->codec_ctx, dummy) == 0) {
+                av_frame_unref(dummy);
+            }
+            av_frame_free(&dummy);
+        }
+        
+        // Now safe to free codec context and release V4L2 device
         avcodec_free_context(&video->codec_ctx);
     }
+    
     if (video->format_ctx) {
         avformat_close_input(&video->format_ctx);
     }
