@@ -959,23 +959,54 @@ void video_cleanup(video_context_t *video) {
     
     // CRITICAL: Properly close codec before freeing to release V4L2 device
     if (video->codec_ctx) {
-        // Flush any pending frames
-        avcodec_flush_buffers(video->codec_ctx);
+        const char *codec_name = video->codec_ctx->codec ? video->codec_ctx->codec->name : "unknown";
+        bool is_v4l2m2m = (strstr(codec_name, "v4l2m2m") != NULL);
         
-        // Send flush packet to ensure V4L2 M2M decoder releases resources
-        avcodec_send_packet(video->codec_ctx, NULL);
-        
-        // Drain any remaining frames
-        AVFrame *dummy = av_frame_alloc();
-        if (dummy) {
-            while (avcodec_receive_frame(video->codec_ctx, dummy) == 0) {
-                av_frame_unref(dummy);
+        if (is_v4l2m2m) {
+            // V4L2 M2M requires extra care to release hardware properly
+            // Flush any pending frames
+            avcodec_flush_buffers(video->codec_ctx);
+            
+            // Send EOF to decoder
+            int ret = avcodec_send_packet(video->codec_ctx, NULL);
+            if (ret < 0 && ret != AVERROR_EOF) {
+                fprintf(stderr, "[CLEANUP] Warning: V4L2 M2M EOF send failed: %s\n", av_err2str(ret));
             }
-            av_frame_free(&dummy);
+            
+            // Drain all remaining frames
+            AVFrame *dummy = av_frame_alloc();
+            if (dummy) {
+                int drain_count = 0;
+                while (drain_count < 50) {  // Safety limit
+                    ret = avcodec_receive_frame(video->codec_ctx, dummy);
+                    if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+                        break;
+                    }
+                    if (ret < 0) {
+                        break;  // Error, stop draining
+                    }
+                    av_frame_unref(dummy);
+                    drain_count++;
+                }
+                av_frame_free(&dummy);
+                
+                if (drain_count > 0) {
+                    printf("[CLEANUP] Drained %d frames from V4L2 M2M decoder\n", drain_count);
+                }
+            }
+            
+            // Give V4L2 driver time to release resources
+            // This helps prevent device-busy errors on next run
+            usleep(10000);  // 10ms delay
         }
         
         // Now safe to free codec context and release V4L2 device
         avcodec_free_context(&video->codec_ctx);
+        
+        // Extra delay for V4L2 M2M to ensure kernel driver fully releases device
+        if (is_v4l2m2m) {
+            usleep(50000);  // 50ms delay after context free
+        }
     }
     
     if (video->format_ctx) {

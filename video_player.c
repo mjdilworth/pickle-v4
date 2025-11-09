@@ -484,7 +484,8 @@ void app_run(app_context_t *app) {
     double adaptive_frame_time = target_frame_time;  // Current adaptive frame time
     
     // Frame timing diagnostics
-    struct timespec decode_start, decode_end, render_start, render_end;
+    // Timing measurement variables (render_start/render_end now local to render section)
+    struct timespec decode_start, decode_end;
     double total_decode_time = 0, total_render_time = 0;
     int diagnostic_frame_count = 0;
     
@@ -1041,7 +1042,9 @@ void app_run(app_context_t *app) {
             fflush(stdout);
         }
         
-        // Measure render time with detailed breakdown
+        // CRITICAL: Start render timing RIGHT BEFORE actual GL operations
+        // Don't include async decode prep, input handling, or other non-render work
+        struct timespec render_start, render_end;
         clock_gettime(CLOCK_MONOTONIC, &render_start);
         struct timespec gl_render_start, gl_render_end, overlay_start, overlay_end, swap_start, swap_end;
         
@@ -1158,6 +1161,10 @@ void app_run(app_context_t *app) {
         
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
         
+        // CRITICAL: Capture render_end BEFORE pre-decode to measure actual render time
+        // Pre-decode is an optimization that overlaps with VSync, not part of render cost
+        clock_gettime(CLOCK_MONOTONIC, &render_end);
+        
         // OPTIMIZATION: Pre-decode next frame while GPU presents current frame
         // This overlaps decode with VSync wait, hiding decode latency
         if (first_frame_decoded && !next_frame_ready && frame_count > 0) {
@@ -1185,8 +1192,6 @@ void app_run(app_context_t *app) {
         
         // Note: Video 2 pre-decode is now handled by async decoder thread
         // No need for manual pre-decode here
-        
-        clock_gettime(CLOCK_MONOTONIC, &render_end);
         
         // Calculate detailed timing for debugging
         double gl_time = (gl_render_end.tv_sec - gl_render_start.tv_sec) + 
@@ -1233,8 +1238,10 @@ void app_run(app_context_t *app) {
                 fflush(stdout);
             }
         }
+        
+        // Update render_time from actual local timestamps (don't redeclare - use outer scope variable)
         render_time = (render_end.tv_sec - render_start.tv_sec) +
-                    (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
+                     (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
         
         total_render_time += render_time;
 
