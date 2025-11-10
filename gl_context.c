@@ -50,6 +50,70 @@ static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src,
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size);
 static void draw_text_simple(float *vertices, int *vertex_count, const char *text, float x, float y, float size);
 
+// GLeglImageOES type definition (in case headers don't provide it)
+#ifndef GLeglImageOES
+typedef void* GLeglImageOES;
+#endif
+
+// EGL extension function pointers for DMA buffer zero-copy rendering
+typedef EGLImage (*eglCreateImageKHR_func)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint *attrib_list);
+typedef void (*glEGLImageTargetTexture2DOES_func)(GLenum target, GLeglImageOES image);
+typedef EGLBoolean (*eglDestroyImageKHR_func)(EGLDisplay dpy, EGLImage image);
+
+// Initialize EGL extension function pointers at runtime
+static eglCreateImageKHR_func eglCreateImageKHR = NULL;
+static glEGLImageTargetTexture2DOES_func glEGLImageTargetTexture2DOES = NULL;
+static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
+
+// EGL DMA buffer extension constants (in case headers don't have them)
+#ifndef EGL_LINUX_DMA_BUF_EXT
+#define EGL_LINUX_DMA_BUF_EXT 0x3270
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_FD_EXT
+#define EGL_DMA_BUF_PLANE0_FD_EXT 0x3272
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_PITCH_EXT
+#define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE1_FD_EXT
+#define EGL_DMA_BUF_PLANE1_FD_EXT 0x3275
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE1_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE1_OFFSET_EXT 0x3276
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE1_PITCH_EXT
+#define EGL_DMA_BUF_PLANE1_PITCH_EXT 0x3277
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE2_FD_EXT
+#define EGL_DMA_BUF_PLANE2_FD_EXT 0x3278
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE2_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE2_OFFSET_EXT 0x3279
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE2_PITCH_EXT
+#define EGL_DMA_BUF_PLANE2_PITCH_EXT 0x327A
+#endif
+
+#ifndef EGL_LINUX_DRM_FOURCC_EXT
+#define EGL_LINUX_DRM_FOURCC_EXT 0x3271
+#endif
+
+#ifndef DRM_FORMAT_NV12
+#define DRM_FORMAT_NV12 0x3231564e  // 'NV12'
+#endif
+
 // OpenGL ES 3.0 constants for single-channel textures
 #ifndef GL_R8
 #define GL_R8 0x8229
@@ -388,6 +452,34 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         printf("VSync enabled for smooth frame pacing\n");
     }
 
+    // Detect EGL DMA buffer import support (zero-copy rendering)
+    gl->supports_egl_image = false;
+    const char *egl_extensions = eglQueryString(gl->egl_display, EGL_EXTENSIONS);
+    if (egl_extensions && strstr(egl_extensions, "EGL_EXT_image_dma_buf_import")) {
+        gl->supports_egl_image = true;
+        printf("[EGL] DMA buffer import supported - zero-copy rendering enabled!\n");
+        
+        // Load EGL extension function pointers
+        eglCreateImageKHR = (eglCreateImageKHR_func)eglGetProcAddress("eglCreateImageKHR");
+        glEGLImageTargetTexture2DOES = (glEGLImageTargetTexture2DOES_func)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+        eglDestroyImageKHR = (eglDestroyImageKHR_func)eglGetProcAddress("eglDestroyImageKHR");
+        
+        if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES || !eglDestroyImageKHR) {
+            fprintf(stderr, "[EGL] Failed to load DMA buffer extension functions\n");
+            gl->supports_egl_image = false;
+        } else {
+            printf("[EGL] ✓ Extension functions loaded successfully\n");
+        }
+    } else {
+        printf("[EGL] DMA buffer import NOT supported, using standard texture upload\n");
+    }
+    
+    // Initialize EGL image handles
+    gl->egl_image_y = EGL_NO_IMAGE;
+    gl->egl_image_uv = EGL_NO_IMAGE;
+    gl->egl_image_y2 = EGL_NO_IMAGE;
+    gl->egl_image_uv2 = EGL_NO_IMAGE;
+
     // Create shaders and program
     if (create_program(gl) != 0) {
         gl_cleanup(gl);
@@ -716,33 +808,16 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     // Set flip_y uniform (flip both videos - they're both encoded upside down)
     glUniform1f(gl->u_flip_y, 1.0f);
     
-    // Restore texture units and samplers (critical for video rendering)
+    // OPTIMIZED: Bind textures without excessive glTexParameteri calls
+    // Texture parameters are set once during initialization, not per-frame
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_y);
-    
-    // Set proper texture parameters (might have been changed by overlays)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_u);
     
-    // Set proper texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_v);
-    
-    // Set proper texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
     // Reset to texture unit 0
     glActiveTexture(GL_TEXTURE0);
@@ -751,6 +826,10 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     glUniform1i(gl->u_texture_y, 0);
     glUniform1i(gl->u_texture_u, 1);
     glUniform1i(gl->u_texture_v, 2);
+    
+    // TIMER: Measure texture upload time
+    struct timespec tex_start, tex_end;
+    clock_gettime(CLOCK_MONOTONIC, &tex_start);
     
     // Update YUV textures if video data is provided
     if (y_data && u_data && v_data) {
@@ -770,146 +849,65 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             printf("Direct upload: Y=%s U=%s V=%s\n", y_direct?"YES":"NO", u_direct?"YES":"NO", v_direct?"YES":"NO");
         }
         
-        // Y texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
+        // ULTRA-OPTIMIZED: Use glTexStorage2D once, then glTexSubImage2D for updates
+        // This is faster on some GPUs because storage is immutable
+        static bool storage_initialized[2] = {false, false};
+        
+        if (!storage_initialized[video_index] || size_changed) {
+            // First time or resolution changed - allocate storage
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
+            
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_u);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, uv_width, uv_height);
+            
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, tex_v);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, uv_width, uv_height);
+            
+            storage_initialized[video_index] = true;
+        }
+        
+        // Y texture - OPTIMIZED: Direct upload (avoid PBO overhead)
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex_y);
         
-        if (gl->use_pbo && y_direct) {
-            // PBO async upload path (fastest for direct data)
-            int y_size = width * height;
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[0]);
-            
-            if (size_changed) {
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, y_size, NULL, GL_STREAM_DRAW);
-            }
-            
-            // Map buffer and copy data
-            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, y_size, 
-                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-            if (pbo_mem) {
-                memcpy(pbo_mem, y_data, y_size);
-                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                
-                // Upload from PBO (async DMA)
-                if (size_changed) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, 0);
-                }
-            }
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else if (y_direct) {
-            // Direct upload (no PBO)
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_data);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
-            }
+        if (y_direct) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
         } else {
-            // Stride copy path (no PBO for non-direct data)
+            // Stride copy path (for padded data)
             int needed_size = width * height;
             allocate_yuv_buffers(needed_size);
-            
             copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
-            
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
-            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
         }
-        // U texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
+        
+        // U texture - OPTIMIZED: Direct upload
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, tex_u);
         
-        if (gl->use_pbo && u_direct) {
-            // PBO async upload path
-            int u_size = uv_width * uv_height;
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[1]);
-            
-            if (size_changed) {
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, u_size, NULL, GL_STREAM_DRAW);
-            }
-            
-            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, u_size,
-                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-            if (pbo_mem) {
-                memcpy(pbo_mem, u_data, u_size);
-                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                
-                if (size_changed) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
-                }
-            }
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else if (u_direct) {
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_data);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
-            }
+        if (u_direct) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
         } else {
-            // Use pre-allocated buffers for U plane
-            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = uv_width * uv_height;
             allocate_yuv_buffers(needed_size);
-            
             copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
-            
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
-            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
         }
         
-        // V texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
+        // V texture - OPTIMIZED: Direct upload
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, tex_v);
         
-        if (gl->use_pbo && v_direct) {
-            // PBO async upload path
-            int v_size = uv_width * uv_height;
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[2]);
-            
-            if (size_changed) {
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, v_size, NULL, GL_STREAM_DRAW);
-            }
-            
-            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, v_size,
-                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-            if (pbo_mem) {
-                memcpy(pbo_mem, v_data, v_size);
-                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                
-                if (size_changed) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
-                }
-            }
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else if (v_direct) {
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_data);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
-            }
+        if (v_direct) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
         } else {
-            // Use pre-allocated buffers for V plane
-            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
             int needed_size = uv_width * uv_height;
             allocate_yuv_buffers(needed_size);
-            
             copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
-            
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
-            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
         }
         
         if (frame_rendered[video_index] == 0) {
@@ -924,8 +922,27 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         printf("Waiting for video data...\n");
     }
     
+    clock_gettime(CLOCK_MONOTONIC, &tex_end);
+    double tex_upload_time = (tex_end.tv_sec - tex_start.tv_sec) + (tex_end.tv_nsec - tex_start.tv_nsec) / 1e9;
+    
+    // TIMER: Measure draw call time
+    struct timespec draw_start, draw_end;
+    clock_gettime(CLOCK_MONOTONIC, &draw_start);
+    
     // Draw quad
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    
+    clock_gettime(CLOCK_MONOTONIC, &draw_end);
+    double draw_time = (draw_end.tv_sec - draw_start.tv_sec) + (draw_end.tv_nsec - draw_start.tv_nsec) / 1e9;
+    
+    // Diagnostic output
+    static int frame_diag = 0;
+    if (frame_diag < 5 && (tex_upload_time > 0.005 || draw_time > 0.010)) {
+        printf("[RENDER_DETAIL] Video%d - TexUpload: %.2fms, DrawCall: %.2fms, Total: %.2fms\n",
+               video_index, tex_upload_time * 1000, draw_time * 1000, 
+               (tex_upload_time + draw_time) * 1000);
+        frame_diag++;
+    }
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
     static int swap_count = 0;
@@ -1867,6 +1884,129 @@ void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 #endif
+
+// DMA buffer zero-copy rendering
+// Imports hardware-decoded frame via DMA buffer file descriptor
+// Uses eglCreateImageKHR and glEGLImageTargetTexture2DOES for zero-copy binding
+void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
+                        struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    if (!gl || dma_fd < 0) {
+        fprintf(stderr, "[DMA] Invalid arguments for DMA rendering\n");
+        return;
+    }
+    
+    if (!gl->supports_egl_image) {
+        fprintf(stderr, "[DMA] EGL DMA buffer import not supported, falling back to CPU upload\n");
+        return;
+    }
+    
+    // Set up rendering state
+    glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
+    if (clear_screen && video_index == 0) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
+    
+    glUseProgram(gl->program);
+    
+    // NV12 format via DMA buffer (Y plane + UV packed plane)
+    // Y plane: 1920x1080
+    // UV plane: 960x540 (2x2 chroma subsampling)
+    
+    struct timespec dma_start, dma_end;
+    clock_gettime(CLOCK_MONOTONIC, &dma_start);
+    
+    // Set up DMA buffer plane offsets for YUV420P
+    // Y plane: offset=0, pitch=width, size=width*height
+    // U plane: offset=width*height, pitch=width/2, size=width*height/4
+    // V plane: offset=width*height*5/4, pitch=width/2, size=width*height/4
+    int y_size = width * height;
+    int u_size = (width * height) / 4;
+    int v_offset = y_size + u_size;
+    int uv_pitch = width / 2;
+    
+    // For DMA buffer, use generic DRM_FORMAT_YUV420 with separate planes
+    #ifndef DRM_FORMAT_YUV420
+    #define DRM_FORMAT_YUV420 0x32315559  // 'YU12'
+    #endif
+    
+    EGLint image_attrs[] = {
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
+        // Y plane (full resolution)
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, width,
+        // U plane (quarter resolution, interleaved chroma)
+        EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT, y_size,
+        EGL_DMA_BUF_PLANE1_PITCH_EXT, uv_pitch,
+        // V plane (quarter resolution)
+        EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE2_OFFSET_EXT, v_offset,
+        EGL_DMA_BUF_PLANE2_PITCH_EXT, uv_pitch,
+        EGL_NONE
+    };
+    
+    if (!eglCreateImageKHR) {
+        fprintf(stderr, "[DMA] eglCreateImageKHR not loaded\n");
+        return;
+    }
+    
+    EGLImage egl_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                          EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL,
+                                          image_attrs);
+    
+    EGLint egl_err = eglGetError();
+    if (egl_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        fprintf(stderr, "[DMA] ✗ EGL import failed (error 0x%x) - using CPU upload fallback\n", egl_err);
+        return;
+    }
+    
+    printf("[DMA] ✓ EGL DMA buffer imported successfully (FD=%d, %dx%d)\n", dma_fd, width, height);
+    
+    clock_gettime(CLOCK_MONOTONIC, &dma_end);
+    double dma_import_time = (dma_end.tv_sec - dma_start.tv_sec) +
+                             (dma_end.tv_nsec - dma_start.tv_nsec) / 1e9;
+    
+    printf("[DMA] Zero-copy import: %.2fms (GPU memory mapping)\n", dma_import_time * 1000);
+    
+    // Bind Y plane texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)egl_image);
+    } else {
+        fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
+        if (eglDestroyImageKHR) {
+            (*eglDestroyImageKHR)(gl->egl_display, egl_image);
+        }
+        return;
+    }
+    
+    // Set texture filtering
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    
+    // Set uniform
+    glUniform1i(gl->u_texture_nv12, 0);
+    
+    // Bind keystone matrix
+    glUniformMatrix3fv(gl->u_keystone_matrix, 1, GL_FALSE, (float*)&keystone->matrix);
+    
+    // Bind VAO and render
+    glBindVertexArray(gl->vao);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+    
+    printf("[DMA] ✓ GPU rendering completed (frame rendered to screen)\n");
+    
+    // Clean up
+    if (eglDestroyImageKHR) {
+        (*eglDestroyImageKHR)(gl->egl_display, egl_image);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
 
 void gl_cleanup(gl_context_t *gl) {
     // Clean up YUV textures (video 1)

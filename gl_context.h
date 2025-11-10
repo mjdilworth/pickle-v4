@@ -73,6 +73,16 @@ typedef struct {
     
     // Help overlay rendering
     GLuint help_vbo;
+    
+    // GPU sync objects for pipelining
+    GLsync gpu_fence;
+    
+    // EGL DMA buffer zero-copy support
+    bool supports_egl_image;         // True if EGL_EXT_image_dma_buf_import supported
+    EGLImage egl_image_y;            // EGL image for Y plane (DMA-backed)
+    EGLImage egl_image_uv;           // EGL image for UV plane (DMA-backed) - NV12 packed
+    EGLImage egl_image_y2;           // EGL image for Y plane (video 2)
+    EGLImage egl_image_uv2;          // EGL image for UV plane (video 2)
 } gl_context_t;
 
 // OpenGL ES functions
@@ -89,6 +99,10 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
+
+// DMA buffer zero-copy rendering (NV12 format)
+void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
+                        struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 
 // Shader source code
 extern const char *vertex_shader_source;

@@ -25,22 +25,25 @@ SOURCES = pickel.c video_player.c drm_display.c gl_context.c video_decoder.c key
 OBJECTS = $(SOURCES:.c=.o)
 
 # Library dependencies for RPi4
+# UPDATED: Use official Debian FFmpeg 7.1.2 from apt
+# This version includes all necessary V4L2 M2M and DRM support
+LDFLAGS = -Wl,-rpath,/usr/lib/aarch64-linux-gnu -L/usr/lib/aarch64-linux-gnu -Wl,--no-as-needed
 LIBS = -ldrm -lgbm -lEGL -lGLESv2 -lavformat -lavcodec -lavutil -lswscale -lpthread -lm
 
-# Include paths
-INCLUDES = -I/usr/include/libdrm -I/usr/include/ffmpeg
+# Include paths - use system FFmpeg from apt
+INCLUDES = -I/usr/include -I/usr/include/libdrm
 
 # PKG-config for better library detection
-PKG_CFLAGS = $(shell pkg-config --cflags libdrm gbm egl glesv2 libavformat libavcodec libavutil libswscale 2>/dev/null)
-PKG_LIBS = $(shell pkg-config --libs libdrm gbm egl glesv2 libavformat libavcodec libavutil libswscale 2>/dev/null)
+PKG_CFLAGS = $(shell pkg-config --cflags libdrm gbm egl glesv2 libavcodec libavformat libavutil libswscale 2>/dev/null)
+PKG_LIBS = $(shell pkg-config --libs libdrm gbm egl glesv2 libavcodec libavformat libavutil libswscale 2>/dev/null)
 
-# Use pkg-config if available, fallback to manual libs
+# Use pkg-config for all libraries
 ifneq ($(PKG_LIBS),)
     LIBS = $(PKG_LIBS) -lpthread -lm
 endif
 
 ifneq ($(PKG_CFLAGS),)
-    INCLUDES += $(PKG_CFLAGS)
+    INCLUDES = $(PKG_CFLAGS)
 endif
 
 # Default target
@@ -48,7 +51,7 @@ all: $(TARGET)
 
 # Build the executable with optimizations
 $(TARGET): $(OBJECTS)
-	$(CC) $(CFLAGS) -Wl,--gc-sections -Wl,-O1 -o $(TARGET) $(OBJECTS) $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -Wl,--gc-sections -Wl,-O1 -o $(TARGET) $(OBJECTS) $(LIBS)
 
 # Compile source files
 %.o: %.c
@@ -106,12 +109,12 @@ show-flags:
 # Release build with maximum optimization
 release: CFLAGS = -Wall -Wextra -std=c99 -O3 -DNDEBUG
 release: CFLAGS += $(ARCH_FLAGS) $(RPi4_FLAGS)
-release: CFLAGS += -flto=auto -fvisibility=hidden -ffunction-sections -fdata-sections
+release: CFLAGS += -flto=auto -ffunction-sections -fdata-sections
 # RPi4-specific release optimizations
 ifeq ($(shell uname -m),aarch64)
 release: CFLAGS += -march=armv8-a+crc+simd -mtune=cortex-a72 -mcpu=cortex-a72
 endif
-release: LDFLAGS = -Wl,--gc-sections,-s -flto=auto
+release: LDFLAGS = -Wl,--gc-sections,-s -flto=auto -L/usr/local/lib -Wl,-rpath,/usr/local/lib
 release: clean $(TARGET)
 	@echo "Release build complete: $(TARGET)"
 	@ls -lh $(TARGET)

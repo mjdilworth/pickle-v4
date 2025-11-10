@@ -57,6 +57,7 @@ int main(int argc, char *argv[]) {
     bool show_timing = false;
     bool debug_gamepad = false;
     bool advanced_diagnostics = false;
+    bool force_software_decode = false;
     char *video_file = NULL;
     char *video_file2 = NULL;
     
@@ -71,6 +72,9 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--hw-debug") == 0) {
             advanced_diagnostics = true;
             printf("Advanced hardware decoder diagnostics enabled\n");
+        } else if (strcmp(argv[i], "--nh") == 0) {
+            force_software_decode = true;
+            printf("Hardware decode disabled (--nh flag set)\n");
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stderr, "Usage: %s [options] <video_file1.mp4> [video_file2.mp4]\n", argv[0]);
             fprintf(stderr, "\nOptions:\n");
@@ -78,6 +82,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  --timing         Show frame timing information\n");
             fprintf(stderr, "  --debug-gamepad  Log gamepad button presses\n");
             fprintf(stderr, "  --hw-debug       Enable detailed hardware decoder diagnostics\n");
+            fprintf(stderr, "  --nh             Disable hardware decode (force software)\n");
             fprintf(stderr, "  -h, --help       Show this help message\n");
             fprintf(stderr, "\nKeyboard Controls:\n");
             fprintf(stderr, "  q/ESC    Quit\n");
@@ -135,7 +140,7 @@ int main(int argc, char *argv[]) {
     setup_signal_handlers();
     
     // Initialize and run the video player
-    if (app_init(&app, video_file, video_file2, loop_playback, show_timing, debug_gamepad, advanced_diagnostics) != 0) {
+    if (app_init(&app, video_file, video_file2, loop_playback, show_timing, debug_gamepad, advanced_diagnostics, force_software_decode) != 0) {
         fprintf(stderr, "Failed to initialize application\n");
         g_app = NULL;  // Clear global reference
         return 1;

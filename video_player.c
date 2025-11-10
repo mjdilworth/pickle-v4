@@ -261,7 +261,7 @@ bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
 }
 
 int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, 
-            bool show_timing, bool debug_gamepad, bool advanced_diagnostics) {
+            bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool force_software_decode) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
     
@@ -332,7 +332,7 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     }
 
     // Initialize video decoder
-    if (video_init(app->video, video_file, app->advanced_diagnostics) != 0) {
+    if (video_init(app->video, video_file, app->advanced_diagnostics, force_software_decode) != 0) {
         fprintf(stderr, "Failed to initialize video decoder\n");
         app_cleanup(app);
         return -1;
@@ -353,7 +353,7 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
 
     // Initialize second video decoder if provided
     if (video_file2) {
-        if (video_init(app->video2, video_file2, app->advanced_diagnostics) != 0) {
+        if (video_init(app->video2, video_file2, app->advanced_diagnostics, force_software_decode) != 0) {
             fprintf(stderr, "Failed to initialize second video decoder\n");
             app_cleanup(app);
             return -1;
@@ -488,6 +488,12 @@ void app_run(app_context_t *app) {
     struct timespec decode_start, decode_end;
     double total_decode_time = 0, total_render_time = 0;
     int diagnostic_frame_count = 0;
+    
+    // Frame timing analysis buffers
+    double *decode_times = malloc(300 * sizeof(double));  // Last 300 frames
+    double *render_times = malloc(300 * sizeof(double));  // Last 300 frames
+    int timing_buffer_idx = 0;
+    int timing_samples = 0;
     
     // Add a timer to ensure we print timing data periodically regardless of frame counts
     struct timespec last_timing_report;
@@ -1055,20 +1061,53 @@ void app_run(app_context_t *app) {
         uint8_t *nv12_data = video_get_nv12_data(app->video);
         int nv12_stride = video_get_nv12_stride(app->video);
         
-        // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
-        if (false && nv12_data) {
-            // Render with NV12 packed format (faster - single texture upload)
-            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone, true, 0);
-        } else {
-            // Fallback to original YUV rendering (for compatibility)
-            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-            
-            if (y_data && u_data && v_data) {
-                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+        // Check if DMA buffer is available for zero-copy rendering
+        bool has_dma = video_has_dma_buffer(app->video);
+        if (has_dma) {
+            int dma_fd = video_get_dma_fd(app->video);
+            static int dma_render_count = 0;
+            if (frame_count == 1 || (dma_render_count < 3)) {
+                printf("[RENDER_TRACE] Frame %d: has_dma=true, dma_fd=%d\n", frame_count, dma_fd);
+                dma_render_count++;
+            }
+            if (dma_fd >= 0) {
+                // Use zero-copy DMA rendering (GPU memory mapping, no CPU transfer)
+                if (frame_count == 1) {
+                    printf("[RENDER_TRACE] ✓ Using zero-copy DMA rendering (FD=%d)\n", dma_fd);
+                }
+                gl_render_frame_dma(app->gl, dma_fd, video_width, video_height,
+                                   app->drm, app->keystone, true, 0);
             } else {
-                gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                              0, 0, 0, app->drm, app->keystone, true, 0);
+                // DMA FD not available, fall back to CPU upload
+                printf("[RENDER_TRACE] ⚠ has_dma=true but dma_fd=%d (fallback to CPU)\n", dma_fd);
+                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                if (y_data && u_data && v_data) {
+                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+                } else {
+                    gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
+                                  0, 0, 0, app->drm, app->keystone, true, 0);
+                }
+            }
+        } else {
+            if (frame_count == 1) {
+                printf("[RENDER_TRACE] has_dma=false (CPU rendering path)\n");
+            }
+            // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
+            if (false && nv12_data) {
+                // Render with NV12 packed format (faster - single texture upload)
+                gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone, true, 0);
+            } else {
+                // Fallback to original YUV rendering (for compatibility)
+                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                
+                if (y_data && u_data && v_data) {
+                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+                } else {
+                    gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
+                                  0, 0, 0, app->drm, app->keystone, true, 0);
+                }
             }
         }
         
@@ -1244,6 +1283,52 @@ void app_run(app_context_t *app) {
                      (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
         
         total_render_time += render_time;
+        
+        // Store timing samples for analysis
+        if (timing_samples < 300) {
+            decode_times[timing_buffer_idx] = decode_time;
+            render_times[timing_buffer_idx] = render_time;
+            timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+            timing_samples++;
+        } else {
+            decode_times[timing_buffer_idx] = decode_time;
+            render_times[timing_buffer_idx] = render_time;
+            timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+        }
+        
+        // Detailed frame timing analysis every 30 frames
+        if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0) {
+            double avg_decode = 0, min_decode = 999, max_decode = 0;
+            double avg_render = 0, min_render = 999, max_render = 0;
+            int samples = timing_samples < 300 ? timing_samples : 300;
+            
+            for (int i = 0; i < samples; i++) {
+                avg_decode += decode_times[i];
+                avg_render += render_times[i];
+                if (decode_times[i] < min_decode) min_decode = decode_times[i];
+                if (decode_times[i] > max_decode) max_decode = decode_times[i];
+                if (render_times[i] < min_render) min_render = render_times[i];
+                if (render_times[i] > max_render) max_render = render_times[i];
+            }
+            
+            avg_decode /= samples;
+            avg_render /= samples;
+            
+            printf("\n[TIMING ANALYSIS - Frame %d]\n", diagnostic_frame_count);
+            printf("  DECODE:  Avg: %.2fms, Min: %.2fms, Max: %.2fms (samples: %d)\n",
+                   avg_decode * 1000, min_decode * 1000, max_decode * 1000, samples);
+            printf("  RENDER:  Avg: %.2fms, Min: %.2fms, Max: %.2fms\n",
+                   avg_render * 1000, min_render * 1000, max_render * 1000);
+            printf("  Target frame time: %.2fms\n", target_frame_time * 1000);
+            printf("  Hardware decode: %s\n", video_is_hardware_decoded(app->video) ? "YES" : "NO");
+            printf("  Total time: %.2fms (decode + render)\n", (avg_decode + avg_render) * 1000);
+            
+            if (avg_decode + avg_render > target_frame_time * 1.1) {
+                printf("  ⚠ WARNING: Frame taking %.0f%% of budget!\n", 
+                       ((avg_decode + avg_render) / target_frame_time) * 100);
+            }
+            fflush(stdout);
+        }
 
         // Process keystone movement immediately after input update
         process_keystone_movement(app, delta_time, target_frame_time);
@@ -1286,6 +1371,10 @@ void app_run(app_context_t *app) {
             }
         }
     }  // End while (app->running)
+    
+    // Cleanup timing buffers
+    if (decode_times) free(decode_times);
+    if (render_times) free(render_times);
 }
 
 void app_cleanup(app_context_t *app) {

@@ -14,28 +14,67 @@
 static void drm_handle_pending_flips(display_ctx_t *drm);
 
 static const char *drm_device_paths[] = {
-    "/dev/dri/card1",       // Working display card (detected by diagnostics)
-    "/dev/dri/card0",       // Fallback display card
-    "/dev/dri/renderD128",  // Render node (for compute only)
-    "/dev/dri/renderD129",  // Additional render nodes
+    "/dev/dri/card1",       // Primary display on this Pi 4 (tested working)
+    "/dev/dri/card0",       // Secondary/alternate display
+    "/dev/dri/renderD128",  // Render node (compute only, no display output)
     NULL
 };
 
 static int find_drm_device(void) {
     for (int i = 0; drm_device_paths[i]; i++) {
         int fd = open(drm_device_paths[i], O_RDWR | O_CLOEXEC);
-        if (fd >= 0) {
+        if (fd < 0) {
+            printf("⊗ %s: Cannot open (%s)\n", drm_device_paths[i], strerror(errno));
+            continue;
+        }
+        
+        printf("✓ %s: Opened successfully, checking resources...\n", drm_device_paths[i]);
+        
+        // Test if this device actually works (has display resources)
+        drmModeRes *resources = drmModeGetResources(fd);
+        if (resources) {
+            printf("✓ Found working DRM device: %s\n", drm_device_paths[i]);
+            printf("  - Connectors: %d\n", resources->count_connectors);
+            printf("  - Encoders: %d\n", resources->count_encoders);
+            printf("  - CRTCs: %d\n", resources->count_crtcs);
+            drmModeFreeResources(resources);
             return fd;
         }
+        
+        // This device didn't work, get more details
+        printf("⊗ %s opened but drmModeGetResources failed\n", drm_device_paths[i]);
+        
+        // Try to get driver info
+        drmVersion *version = drmGetVersion(fd);
+        if (version) {
+            printf("  Driver: %s (version %d.%d.%d)\n", 
+                   version->name, version->version_major, 
+                   version->version_minor, version->version_patchlevel);
+            drmFreeVersion(version);
+        }
+        
+        // Check capabilities
+        uint64_t cap_dumb = 0;
+        drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &cap_dumb);
+        printf("  DRM_CAP_DUMB_BUFFER: %s\n", cap_dumb ? "yes" : "no");
+        
+        uint64_t cap_prime = 0;
+        drmGetCap(fd, DRM_CAP_PRIME, &cap_prime);
+        printf("  DRM_CAP_PRIME: %s\n", cap_prime ? "yes" : "no");
+        
+        close(fd);
     }
     
     printf("\nTroubleshooting:\n");
     printf("1. Make sure you're in the 'render' group: groups | grep render\n");
     printf("2. If not, run: sudo usermod -a -G render $USER && logout\n");
     printf("3. Or try with sudo: sudo ./pickel <video>\n");
+    printf("\nDevice details (try manually):\n");
+    printf("  modetest -c\n");
+    printf("  lspci | grep VGA\n");
+    printf("  dmesg | grep -i drm\n");
     return -1;
 }
-
 static drmModeConnector* find_connector(display_ctx_t *drm) {
     drmModeRes *resources = drmModeGetResources(drm->drm_fd);
     if (!resources) {

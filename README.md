@@ -175,3 +175,28 @@ sudo apt-get update && sudo apt-get install cloudflared
 
 
 03444930787
+
+./configure \
+    --extra-cflags="-I/usr/local/include" \
+    --extra-ldflags="-L/usr/local/lib" \
+    --extra-libs="-lpthread -lm -latomic" \
+    --arch=armel \
+    --target-os=linux \
+    --enable-pic \
+    --enable-gpl \
+    --enable-nonfree \
+    --enable-version3 \
+    --enable-pthreads \
+    --enable-libdrm \
+    --enable-v4l2-m2m \
+    --enable-mmal \
+    --enable-libx264 \
+    --enable-libx265 \
+    --enable-shared \
+    --enable-libopus \
+    --enable-libvorbis \
+    --disable-ffplay \
+    --disable-ffprobe
+
+
+    /dev/mmcblk0p3: LABEL_FATBOOT="SHARED" LABEL="SHARED" UUID="6C38-CE7E" BLOCK_SIZE="512" TYPE="vfat" PARTUUID="f8623b50-03"
