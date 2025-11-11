@@ -96,4 +96,7 @@ int video_get_dma_fd(video_context_t *video);
 int video_get_dma_offset(video_context_t *video);
 size_t video_get_dma_size(video_context_t *video);
 
+// Debug flag for hardware decoder diagnostics
+extern bool hw_debug_enabled;
+
 #endif // VIDEO_DECODER_H

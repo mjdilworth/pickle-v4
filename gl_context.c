@@ -2,6 +2,7 @@
 #include "gl_context.h"
 #include "drm_display.h"
 #include "keystone.h"
+#include "video_decoder.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -461,7 +462,9 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
     const char *egl_extensions = eglQueryString(gl->egl_display, EGL_EXTENSIONS);
     if (egl_extensions && strstr(egl_extensions, "EGL_EXT_image_dma_buf_import")) {
         gl->supports_egl_image = true;
-        printf("[EGL] DMA buffer import supported - zero-copy rendering enabled!\n");
+        if (hw_debug_enabled) {
+            printf("[EGL] DMA buffer import supported - zero-copy rendering enabled!\n");
+        }
         
         // Load EGL extension function pointers
         eglCreateImageKHR = (eglCreateImageKHR_func)eglGetProcAddress("eglCreateImageKHR");
@@ -471,10 +474,10 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES || !eglDestroyImageKHR) {
             fprintf(stderr, "[EGL] Failed to load DMA buffer extension functions\n");
             gl->supports_egl_image = false;
-        } else {
+        } else if (hw_debug_enabled) {
             printf("[EGL] ✓ Extension functions loaded successfully\n");
         }
-    } else {
+    } else if (hw_debug_enabled) {
         printf("[EGL] DMA buffer import NOT supported, using standard texture upload\n");
     }
     
@@ -923,7 +926,7 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         frame_rendered[video_index]++;
     } else if (frame_rendered[video_index] == 0) {
         // Skip test pattern for now - YUV textures need proper initialization
-        printf("Waiting for video data...\n");
+        // (Don't print "Waiting for video data..." - it's just noise)
     }
     
     clock_gettime(CLOCK_MONOTONIC, &tex_end);

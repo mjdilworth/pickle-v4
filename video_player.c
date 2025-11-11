@@ -323,6 +323,13 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         app_cleanup(app);
         return -1;
     }
+    
+    // Initialize KMS video overlay plane (optional, for hardware zero-copy)
+    if (drm_init_video_plane(app->drm) == 0) {
+        printf("[KMS] Video overlay plane initialized successfully\n");
+    } else {
+        printf("[KMS] Video overlay plane not available (will use OpenGL fallback)\n");
+    }
 
     // Initialize OpenGL context
     if (gl_init(app->gl, app->drm) != 0) {
@@ -487,11 +494,22 @@ void app_run(app_context_t *app) {
     // Timing measurement variables (render_start/render_end now local to render section)
     struct timespec decode_start, decode_end;
     double total_decode_time = 0, total_render_time = 0;
-    int diagnostic_frame_count = 0;
+    int diagnostic_frame_count = 0;  // Counts successful decodes
+    int render_frame_count = 0;       // Counts every frame rendered (for accurate avg)
     
     // Frame timing analysis buffers
     double *decode_times = malloc(300 * sizeof(double));  // Last 300 frames
     double *render_times = malloc(300 * sizeof(double));  // Last 300 frames
+    
+    // Critical: Check malloc success before using
+    if (!decode_times || !render_times) {
+        fprintf(stderr, "Failed to allocate timing buffers\n");
+        free(decode_times);
+        free(render_times);
+        decode_times = NULL;
+        render_times = NULL;
+    }
+    
     int timing_buffer_idx = 0;
     int timing_samples = 0;
     
@@ -955,14 +973,6 @@ void app_run(app_context_t *app) {
                 // Measure decode time (removed old code)
                 // clock_gettime(CLOCK_MONOTONIC, &decode_start);
                     
-                    // Show diagnostic info periodically
-                    if (app->show_timing && diagnostic_frame_count % 30 == 0) {
-                        double avg_decode_time = total_decode_time / diagnostic_frame_count;
-                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms, Frame count: %d\n",
-                               avg_decode_time * 1000, target_frame_time * 1000, diagnostic_frame_count);
-                        fflush(stdout);
-                    }
-                    
                                         // We now clear the arrow keys ONLY if we've successfully processed a movement
             // This allows for continued movement if a corner is not selected
             
@@ -1057,27 +1067,70 @@ void app_run(app_context_t *app) {
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
         
-        // Render first video with first keystone (clear screen)
-        uint8_t *nv12_data = video_get_nv12_data(app->video);
-        int nv12_stride = video_get_nv12_stride(app->video);
-        
         // Check if DMA buffer is available for zero-copy rendering
-        // DMA path requires both a valid FD and DRM_PRIME format
+        // Try KMS direct scanout first, then fall back to OpenGL if not available
         bool has_dma = video_has_dma_buffer(app->video);
-        if (has_dma) {
+        bool used_kms_overlay = false;  // Track if we used KMS path (no GL work needed)
+        
+        // CRITICAL: Check if any overlays are visible BEFORE deciding rendering path
+        // KMS overlay plane is opaque and will hide OpenGL-rendered borders/corners!
+        // Must use OpenGL path when overlays need to be visible
+        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners || 
+                                                     app->keystone->show_border || 
+                                                     app->keystone->show_help));
+        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners || 
+                                                       app->keystone2->show_border || 
+                                                       app->keystone2->show_help));
+        bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
+        
+        if (has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
+            // KMS DIRECT SCANOUT PATH (bypasses OpenGL entirely)
+            int dma_fd = video_get_dma_fd(app->video);
+            if (dma_fd >= 0) {
+                static bool kms_init_done = false;
+                if (!kms_init_done && frame_count == 1) {
+                    printf("[KMS] ✓ Using KMS overlay plane for zero-copy hardware video\n");
+                    kms_init_done = true;
+                }
+                
+                // Get actual plane layout from hardware decoder
+                int plane_offsets[3] = {0, 0, 0};
+                int plane_pitches[3] = {0, 0, 0};
+                video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
+                
+                // Create framebuffer from DMA buffer
+                uint32_t fb_id = 0;
+                if (drm_create_video_fb(app->drm, dma_fd, video_width, video_height,
+                                       plane_offsets, plane_pitches, &fb_id) == 0) {
+                    // Display on overlay plane (hardware scanout, true zero-copy)
+                    // NOTE: drmModeSetPlane waits for vblank (~12-16ms on 60Hz display)
+                    // This is expected behavior for tear-free presentation
+                    drm_display_video_frame(app->drm, fb_id, 0, 0, video_width, video_height);
+                    used_kms_overlay = true;  // Successfully used KMS path
+                }
+                
+                // Note: When using KMS overlay, video is on hardware plane
+                // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
+                // This is handled in the standard overlay rendering section below
+            }
+        } else if (has_dma && !need_opengl_for_overlays) {
+            // OPENGL DMA PATH (when KMS overlay not available BUT no overlays needed)
+            // NOTE: On Pi 4, EGL DMA import has driver issues (GL error 0x502)
+            // Skip this path when overlays are visible - use CPU path instead
             int dma_fd = video_get_dma_fd(app->video);
             static int dma_render_count = 0;
             if (frame_count == 1 || (dma_render_count < 3)) {
-                printf("[RENDER_TRACE] Frame %d: has_dma=true, dma_fd=%d\n", frame_count, dma_fd);
+                printf("[RENDER_TRACE] Frame %d: has_dma=true, dma_fd=%d (OpenGL DMA path - no overlays)\n", frame_count, dma_fd);
                 dma_render_count++;
             }
             if (dma_fd >= 0) {
-                // Use zero-copy DMA rendering (GPU memory mapping, no CPU transfer)
+                // Use OpenGL EGL DMA rendering (may have driver issues on Pi 4)
                 if (frame_count == 1) {
-                    printf("[RENDER_TRACE] ✓ Using zero-copy DMA rendering (FD=%d)\n", dma_fd);
+                    printf("[RENDER_TRACE] ✓ Using OpenGL EGL DMA rendering (FD=%d) - may have issues\n", dma_fd);
                 }
                 // Get actual plane layout from hardware decoder
-                int plane_offsets[3], plane_pitches[3];
+                int plane_offsets[3] = {0, 0, 0};
+                int plane_pitches[3] = {0, 0, 0};
                 video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
                 gl_render_frame_dma(app->gl, dma_fd, video_width, video_height,
                                    plane_offsets, plane_pitches,
@@ -1095,24 +1148,27 @@ void app_run(app_context_t *app) {
                 }
             }
         } else {
-            if (frame_count == 1) {
-                printf("[RENDER_TRACE] has_dma=false (CPU rendering path)\n");
-            }
-            // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
-            if (false && nv12_data) {
-                // Render with NV12 packed format (faster - single texture upload)
-                gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone, true, 0);
-            } else {
-                // Fallback to original YUV rendering (for compatibility)
-                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-                
-                if (y_data && u_data && v_data) {
-                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+            // CPU RENDERING PATH
+            // Used when: no DMA buffers, OR overlays visible (need CPU path for compositing)
+            static int cpu_path_logged = 0;
+            if (cpu_path_logged < 3) {
+                if (need_opengl_for_overlays) {
+                    printf("[RENDER_TRACE] Using CPU upload path (overlays visible, skip broken EGL DMA)\n");
                 } else {
-                    gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                                  0, 0, 0, app->drm, app->keystone, true, 0);
+                    printf("[RENDER_TRACE] Using CPU upload path (no DMA available)\n");
                 }
+                cpu_path_logged++;
+            }
+            
+            // Fetch YUV data from decoder (with format conversion if needed)
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+            
+            if (y_data && u_data && v_data) {
+                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+            } else {
+                gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
+                              0, 0, 0, app->drm, app->keystone, true, 0);
             }
         }
         
@@ -1138,10 +1194,11 @@ void app_run(app_context_t *app) {
         
         // OPTIMIZED: Only render overlays when actually needed
         // Render overlays for first keystone
-        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners || 
-                                                     app->keystone->show_border || 
-                                                     app->keystone->show_help));
+        // NOTE: Overlay visibility was already checked above to determine rendering path
         if (any_overlay_visible) {
+            // No special GL setup needed - overlays render on top of video
+            // (we already switched to OpenGL path if overlays are visible)
+            
             // Only render the overlays that are actually visible
             if (app->keystone->show_corners) {
                 gl_render_corners(app->gl, app->keystone);
@@ -1163,9 +1220,7 @@ void app_run(app_context_t *app) {
         }
         
         // Render overlays for second keystone
-        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners || 
-                                                       app->keystone2->show_border || 
-                                                       app->keystone2->show_help));
+        // NOTE: Overlay visibility was already checked above to determine rendering path
         if (any_overlay_visible2) {
             // If keystone1 has a selected corner, temporarily deselect keystone2's corner
             // This ensures only one keystone's corners appear highlighted at a time
@@ -1200,8 +1255,11 @@ void app_run(app_context_t *app) {
         // Time buffer swapping
         clock_gettime(CLOCK_MONOTONIC, &swap_start);
         
-        // Swap buffers after all rendering is complete
-        gl_swap_buffers(app->gl, app->drm);
+        // Only swap buffers if we rendered something in OpenGL
+        // When using KMS overlay without GL overlays, skip the swap (no vsync wait needed)
+        if (!used_kms_overlay || any_overlay_visible || any_overlay_visible2) {
+            gl_swap_buffers(app->gl, app->drm);
+        }
         
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
         
@@ -1223,9 +1281,6 @@ void app_run(app_context_t *app) {
             
             if (predecode_result == 0) {
                 next_frame_ready = true;
-                if (app->show_timing && frame_count < 5) {
-                    printf("Pre-decoded next frame in %.1fms (during swap/VSync)\n", predecode_time * 1000);
-                }
             } else if (video_is_eof(app->video)) {
                 // EOF during pre-decode - will be handled in main decode section next iteration
                 next_frame_ready = false;
@@ -1244,95 +1299,93 @@ void app_run(app_context_t *app) {
                              (overlay_end.tv_nsec - overlay_start.tv_nsec) / 1e9;
         double swap_time = (swap_end.tv_sec - swap_start.tv_sec) + 
                           (swap_end.tv_nsec - swap_start.tv_nsec) / 1e9;
-                          
-        // Check if we should do a time-based timing report (every 2 seconds)
-        if (app->show_timing) {
-            struct timespec current_report_time;
-            clock_gettime(CLOCK_MONOTONIC, &current_report_time);
-            double time_since_report = (current_report_time.tv_sec - last_timing_report.tv_sec) + 
-                                      (current_report_time.tv_nsec - last_timing_report.tv_nsec) / 1e9;
-                                      
-            if (time_since_report >= 2.0) {  // Every 2 seconds
-                printf("\n[TIME-BASED] Frames decoded: %d, Diagnostic frames: %d\n",
-                       frame_count, diagnostic_frame_count);
-                printf("[TIME-BASED] Last decode: %.1fms, Last render: %.1fms, Swap: %.1fms\n",
-                       decode_time * 1000, render_time * 1000, swap_time * 1000);
-                       
-                // Log to file as well
-                FILE *timing_log = fopen("timing_log.txt", "a");
-                if (timing_log) {
-                    fprintf(timing_log, "[%d] Frames: %d, Decode: %.1fms, Render: %.1fms\n",
-                           (int)current_report_time.tv_sec, frame_count, 
-                           decode_time * 1000, render_time * 1000);
-                    fclose(timing_log);
-                }
-                
-                // Reset the timer
-                last_timing_report = current_report_time;
-                fflush(stdout);
-            }
-        }
-        
-        // Report detailed timing for long frames
-        if (app->show_timing) {
-            static int detailed_timing_count = 0;
-            if (swap_time > 0.050 || (detailed_timing_count++ % 60 == 0)) { // Every second or if swap > 50ms
-                printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
-                       gl_time * 1000, overlay_time * 1000, swap_time * 1000);
-                fflush(stdout);
-            }
-        }
         
         // Update render_time from actual local timestamps (don't redeclare - use outer scope variable)
         render_time = (render_end.tv_sec - render_start.tv_sec) +
                      (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
         
         total_render_time += render_time;
+        render_frame_count++;  // Increment frame counter for every rendered frame
         
-        // Store timing samples for analysis
-        if (timing_samples < 300) {
-            decode_times[timing_buffer_idx] = decode_time;
-            render_times[timing_buffer_idx] = render_time;
-            timing_buffer_idx = (timing_buffer_idx + 1) % 300;
-            timing_samples++;
-        } else {
-            decode_times[timing_buffer_idx] = decode_time;
-            render_times[timing_buffer_idx] = render_time;
-            timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+        // FRAME DROP DETECTION: Check if render time indicates dropped frames
+        static struct timespec last_frame_time = {0, 0};
+        static int frame_drop_count = 0;
+        static int frame_drop_reports = 0;
+        
+        struct timespec current_time;
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+        
+        if (last_frame_time.tv_sec != 0) {
+            double time_since_last = (current_time.tv_sec - last_frame_time.tv_sec) +
+                                   (current_time.tv_nsec - last_frame_time.tv_nsec) / 1e9;
+            
+            // At 60fps, frames should arrive every ~16.7ms
+            // If we see >25ms, we may have dropped a frame
+            if (time_since_last > 0.025 && render_frame_count > 10) {
+                frame_drop_count++;
+                if (frame_drop_reports < 10) {  // Report first 10 occurrences
+                    printf("⚠ [FRAME DROP] Frame %d: %.1fms since last frame (expected ~16.7ms)\n",
+                           render_frame_count, time_since_last * 1000);
+                    frame_drop_reports++;
+                }
+            }
+        }
+        last_frame_time = current_time;
+        
+        // Store timing samples for analysis (only if buffers allocated successfully)
+        if (decode_times && render_times) {
+            if (timing_samples < 300) {
+                decode_times[timing_buffer_idx] = decode_time;
+                render_times[timing_buffer_idx] = render_time;
+                timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+                timing_samples++;
+            } else {
+                decode_times[timing_buffer_idx] = decode_time;
+                render_times[timing_buffer_idx] = render_time;
+                timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+            }
         }
         
         // Detailed frame timing analysis every 30 frames
-        if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0) {
-            double avg_decode = 0, min_decode = 999, max_decode = 0;
-            double avg_render = 0, min_render = 999, max_render = 0;
-            int samples = timing_samples < 300 ? timing_samples : 300;
+        if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0 && decode_times && render_times) {
+            static int last_reported_frame = -1;
             
-            for (int i = 0; i < samples; i++) {
-                avg_decode += decode_times[i];
-                avg_render += render_times[i];
-                if (decode_times[i] < min_decode) min_decode = decode_times[i];
-                if (decode_times[i] > max_decode) max_decode = decode_times[i];
-                if (render_times[i] < min_render) min_render = render_times[i];
-                if (render_times[i] > max_render) max_render = render_times[i];
+            // Only print once per unique frame milestone
+            if (diagnostic_frame_count != last_reported_frame) {
+                last_reported_frame = diagnostic_frame_count;
+                
+                double avg_decode = 0, min_decode = 999, max_decode = 0;
+                double avg_render = 0, min_render = 999, max_render = 0;
+                int samples = timing_samples < 300 ? timing_samples : 300;
+                
+                for (int i = 0; i < samples; i++) {
+                    avg_decode += decode_times[i];
+                    avg_render += render_times[i];
+                    if (decode_times[i] < min_decode) min_decode = decode_times[i];
+                    if (decode_times[i] > max_decode) max_decode = decode_times[i];
+                    if (render_times[i] < min_render) min_render = render_times[i];
+                    if (render_times[i] > max_render) max_render = render_times[i];
+                }
+                
+                avg_decode /= samples;
+                avg_render /= samples;
+                
+                printf("\n[TIMING ANALYSIS - Frame %d]\n", diagnostic_frame_count);
+                printf("  DECODE:  Avg: %.3fms, Min: %.3fms, Max: %.3fms (samples: %d)\n",
+                       avg_decode * 1000, min_decode * 1000, max_decode * 1000, samples);
+                printf("  RENDER:  Avg: %.3fms, Min: %.3fms, Max: %.3fms\n",
+                       avg_render * 1000, min_render * 1000, max_render * 1000);
+                printf("  Target frame time: %.2fms\n", target_frame_time * 1000);
+                printf("  Hardware decode: %s\n", video_is_hardware_decoded(app->video) ? "YES" : "NO");
+                printf("  Total time: %.3fms (decode + render)\n", (avg_decode + avg_render) * 1000);
+                printf("  Note: Low times indicate worker thread and pre-decode optimizations working\n");
+                
+                if (avg_decode + avg_render > target_frame_time * 1.1) {
+                    printf("  ⚠ WARNING: Frame taking %.0f%% of budget!\n", 
+                           ((avg_decode + avg_render) / target_frame_time) * 100);
+                }
+                fflush(stdout);
             }
-            
-            avg_decode /= samples;
-            avg_render /= samples;
-            
-            printf("\n[TIMING ANALYSIS - Frame %d]\n", diagnostic_frame_count);
-            printf("  DECODE:  Avg: %.2fms, Min: %.2fms, Max: %.2fms (samples: %d)\n",
-                   avg_decode * 1000, min_decode * 1000, max_decode * 1000, samples);
-            printf("  RENDER:  Avg: %.2fms, Min: %.2fms, Max: %.2fms\n",
-                   avg_render * 1000, min_render * 1000, max_render * 1000);
-            printf("  Target frame time: %.2fms\n", target_frame_time * 1000);
-            printf("  Hardware decode: %s\n", video_is_hardware_decoded(app->video) ? "YES" : "NO");
-            printf("  Total time: %.2fms (decode + render)\n", (avg_decode + avg_render) * 1000);
-            
-            if (avg_decode + avg_render > target_frame_time * 1.1) {
-                printf("  ⚠ WARNING: Frame taking %.0f%% of budget!\n", 
-                       ((avg_decode + avg_render) / target_frame_time) * 100);
-            }
-            fflush(stdout);
         }
 
         // Process keystone movement immediately after input update
@@ -1342,20 +1395,20 @@ void app_run(app_context_t *app) {
         double total_frame_time = decode_time + render_time;
         double remaining_time = adaptive_frame_time - total_frame_time;
         
-        if (remaining_time > 0.001) { // Only sleep if >1ms remaining
+        // CRITICAL: When using KMS overlay, drmModeSetPlane() already waits for vsync
+        // Don't add additional sleep - it causes judder and frame pacing issues
+        // Only sleep for frame pacing when NOT using KMS (i.e., using OpenGL path)
+        // NOTE: used_kms_overlay is set during rendering above, NOT video_has_dma_buffer()
+        // because overlays may force CPU path even with DMA buffers available
+        
+        if (!used_kms_overlay && remaining_time > 0.001) { // Only sleep if >1ms remaining AND not using KMS
             // OPTIMIZED: Use nanosleep for better precision
             struct timespec sleep_time;
             sleep_time.tv_sec = 0;
             sleep_time.tv_nsec = (long)(remaining_time * 1000000000);
             nanosleep(&sleep_time, NULL);
-            
-            // Show render diagnostics periodically
-            if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0) {
-                double avg_render_time = total_render_time / diagnostic_frame_count;
-                printf("Render timing - Avg render: %.1fms, Total frame: %.1fms, Frames: %d\n",
-                       avg_render_time * 1000, total_frame_time * 1000, diagnostic_frame_count);
-                fflush(stdout);
-            }
+        } else if (used_kms_overlay) {
+            // KMS vsync already handled frame timing - no sleep needed
         } else {
             // We're running behind - no sleep, but don't make timing worse
             if (app->show_timing) {
@@ -1364,15 +1417,19 @@ void app_run(app_context_t *app) {
                 fflush(stdout);
             }
             
-            // FIXED: Only increase timing slightly if consistently overrunning
-            static int overrun_count = 0;
-            overrun_count++;
-            if (overrun_count > 5) { // Only after 5 consecutive overruns
-                adaptive_frame_time += 0.001; // Add 1ms, don't multiply
-                if (adaptive_frame_time > min_frame_time * 2) {
-                    adaptive_frame_time = min_frame_time * 2; // Max 33ms for 30fps
+            // CRITICAL: Don't adjust adaptive timing when using KMS vsync
+            // Hardware controls frame timing, not software
+            if (!used_kms_overlay) {
+                // Only increase timing when NOT using KMS (OpenGL/CPU paths only)
+                static int overrun_count = 0;
+                overrun_count++;
+                if (overrun_count > 5) { // Only after 5 consecutive overruns
+                    adaptive_frame_time += 0.001; // Add 1ms, don't multiply
+                    if (adaptive_frame_time > min_frame_time * 2) {
+                        adaptive_frame_time = min_frame_time * 2; // Max 33ms for 30fps
+                    }
+                    overrun_count = 0;
                 }
-                overrun_count = 0;
             }
         }
     }  // End while (app->running)
@@ -1413,6 +1470,8 @@ void app_cleanup(app_context_t *app) {
         free(app->gl);
     }
     if (app->drm) {
+        // Clean up KMS video overlay before general DRM cleanup
+        drm_hide_video_plane(app->drm);
         drm_cleanup(app->drm);
         free(app->drm);
     }
