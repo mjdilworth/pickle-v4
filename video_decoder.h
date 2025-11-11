@@ -59,6 +59,10 @@ typedef struct {
     int dma_fd;                      // DMA buffer file descriptor for current frame (-1 if unavailable)
     int dma_offset;                  // Byte offset within DMA buffer where frame data starts
     size_t dma_size;                 // Total size of DMA buffer
+    
+    // DMA plane layout (for YUV420P zero-copy rendering)
+    int dma_plane_offset[3];         // Byte offsets for Y, U, V planes
+    int dma_plane_pitch[3];          // Pitch (stride) for Y, U, V planes
 } video_context_t;
 
 // Video decoder functions
@@ -86,6 +90,8 @@ void video_set_loop(video_context_t *video, bool loop);
 
 // DMA buffer zero-copy support
 bool video_has_dma_buffer(video_context_t *video);
+int video_get_dma_fd(video_context_t *video);
+void video_get_dma_plane_layout(video_context_t *video, int offsets[3], int pitches[3]);
 int video_get_dma_fd(video_context_t *video);
 int video_get_dma_offset(video_context_t *video);
 size_t video_get_dma_size(video_context_t *video);

@@ -893,9 +893,17 @@ int video_decode_frame(video_context_t *video) {
                             
                             // Show layer information (Y/UV planes)
                             for (int layer = 0; layer < drm_desc->nb_layers; layer++) {
-                                AVDRMPlaneDescriptor *plane = &drm_desc->layers[layer].planes[0];
-                                printf("[ZERO-COPY]   Layer %d: offset=%u, pitch=%u\n", 
-                                       layer, plane->offset, plane->pitch);
+                                AVDRMLayerDescriptor *layer_desc = &drm_desc->layers[layer];
+                                printf("[ZERO-COPY]   Layer %d: format=0x%08x, %d planes\n",
+                                       layer, layer_desc->format, layer_desc->nb_planes);
+                                for (int p = 0; p < layer_desc->nb_planes && p < 3; p++) {
+                                    AVDRMPlaneDescriptor *plane = &layer_desc->planes[p];
+                                    printf("[ZERO-COPY]     Plane %d: offset=%d, pitch=%d\n",
+                                           p, plane->offset, plane->pitch);
+                                    // Store plane layout for zero-copy rendering
+                                    video->dma_plane_offset[p] = plane->offset;
+                                    video->dma_plane_pitch[p] = plane->pitch;
+                                }
                             }
                         }
                         
@@ -1516,13 +1524,27 @@ bool video_has_dma_buffer(video_context_t *video) {
     }
     
     // Check if we have a valid DMA FD from DRM PRIME frame extraction
-    // This is set during video_decode_frame() when DRM_PRIME frames are extracted
-    if (video->use_hardware_decode && video->dma_fd >= 0) {
+    // AND verify the frame format is actually DRM_PRIME
+    if (video->use_hardware_decode && 
+        video->dma_fd >= 0 && 
+        video->frame->format == AV_PIX_FMT_DRM_PRIME) {
         // We have a valid DMA file descriptor ready for GPU import
+        // CPU pointers (data[1], data[2]) will be NULL for DRM_PRIME - that's expected
         return true;
     }
     
     return false;
+}
+
+void video_get_dma_plane_layout(video_context_t *video, int offsets[3], int pitches[3]) {
+    if (!video || !offsets || !pitches) {
+        return;
+    }
+    
+    for (int i = 0; i < 3; i++) {
+        offsets[i] = video->dma_plane_offset[i];
+        pitches[i] = video->dma_plane_pitch[i];
+    }
 }
 
 int video_get_dma_fd(video_context_t *video) {

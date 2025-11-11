@@ -114,6 +114,10 @@ static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
 #define DRM_FORMAT_NV12 0x3231564e  // 'NV12'
 #endif
 
+#ifndef DRM_FORMAT_R8
+#define DRM_FORMAT_R8 0x20203852  // 'R8  '
+#endif
+
 // OpenGL ES 3.0 constants for single-channel textures
 #ifndef GL_R8
 #define GL_R8 0x8229
@@ -1889,14 +1893,15 @@ void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
 // Imports hardware-decoded frame via DMA buffer file descriptor
 // Uses eglCreateImageKHR and glEGLImageTargetTexture2DOES for zero-copy binding
 void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
+                        int plane_offsets[3], int plane_pitches[3],
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
     if (!gl || dma_fd < 0) {
-        fprintf(stderr, "[DMA] Invalid arguments for DMA rendering\n");
+        fprintf(stderr, "[DMA] Invalid arguments (gl=%p, fd=%d)\n", (void*)gl, dma_fd);
         return;
     }
     
     if (!gl->supports_egl_image) {
-        fprintf(stderr, "[DMA] EGL DMA buffer import not supported, falling back to CPU upload\n");
+        fprintf(stderr, "[DMA] EGL image not supported\n");
         return;
     }
     
@@ -1909,101 +1914,152 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     
     glUseProgram(gl->program);
     
-    // NV12 format via DMA buffer (Y plane + UV packed plane)
-    // Y plane: 1920x1080
-    // UV plane: 960x540 (2x2 chroma subsampling)
+    // YUV420P format via DMA buffer (3 separate planes)
+    // Use actual plane layout from hardware decoder
+    int uv_width = plane_pitches[1];   // U plane pitch = width
+    int uv_height = (plane_offsets[2] - plane_offsets[1]) / plane_pitches[1];  // Calculate from offsets
     
     struct timespec dma_start, dma_end;
     clock_gettime(CLOCK_MONOTONIC, &dma_start);
-    
-    // Set up DMA buffer plane offsets for YUV420P
-    // Y plane: offset=0, pitch=width, size=width*height
-    // U plane: offset=width*height, pitch=width/2, size=width*height/4
-    // V plane: offset=width*height*5/4, pitch=width/2, size=width*height/4
-    int y_size = width * height;
-    int u_size = (width * height) / 4;
-    int v_offset = y_size + u_size;
-    int uv_pitch = width / 2;
-    
-    // For DMA buffer, use generic DRM_FORMAT_YUV420 with separate planes
-    #ifndef DRM_FORMAT_YUV420
-    #define DRM_FORMAT_YUV420 0x32315559  // 'YU12'
-    #endif
-    
-    EGLint image_attrs[] = {
-        EGL_WIDTH, width,
-        EGL_HEIGHT, height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
-        // Y plane (full resolution)
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, width,
-        // U plane (quarter resolution, interleaved chroma)
-        EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE1_OFFSET_EXT, y_size,
-        EGL_DMA_BUF_PLANE1_PITCH_EXT, uv_pitch,
-        // V plane (quarter resolution)
-        EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE2_OFFSET_EXT, v_offset,
-        EGL_DMA_BUF_PLANE2_PITCH_EXT, uv_pitch,
-        EGL_NONE
-    };
     
     if (!eglCreateImageKHR) {
         fprintf(stderr, "[DMA] eglCreateImageKHR not loaded\n");
         return;
     }
     
-    EGLImage egl_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
-                                          EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL,
-                                          image_attrs);
+    // Create Y plane EGL image using actual hardware layout
+    EGLint y_attrs[] = {
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
+        EGL_NONE
+    };
     
+    EGLImage y_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, y_attrs);
     EGLint egl_err = eglGetError();
-    if (egl_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        fprintf(stderr, "[DMA] ✗ EGL import failed (error 0x%x) - using CPU upload fallback\n", egl_err);
-        return;
-    }
-    
-    printf("[DMA] ✓ EGL DMA buffer imported successfully (FD=%d, %dx%d)\n", dma_fd, width, height);
-    
-    clock_gettime(CLOCK_MONOTONIC, &dma_end);
-    double dma_import_time = (dma_end.tv_sec - dma_start.tv_sec) +
-                             (dma_end.tv_nsec - dma_start.tv_nsec) / 1e9;
-    
-    printf("[DMA] Zero-copy import: %.2fms (GPU memory mapping)\n", dma_import_time * 1000);
-    
-    // Bind Y plane texture
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)egl_image);
-    } else {
-        fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
-        if (eglDestroyImageKHR) {
-            (*eglDestroyImageKHR)(gl->egl_display, egl_image);
+    if (y_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[DMA] Y plane import failed: 0x%x\n", egl_err);
+            err_count++;
         }
         return;
     }
     
-    // Set texture filtering
+    // Create U plane EGL image using actual hardware layout
+    EGLint u_attrs[] = {
+        EGL_WIDTH, uv_width,
+        EGL_HEIGHT, uv_height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[1],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[1],
+        EGL_NONE
+    };
+    
+    EGLImage u_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, u_attrs);
+    egl_err = eglGetError();
+    if (u_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[DMA] U plane import failed: 0x%x\n", egl_err);
+            err_count++;
+        }
+        if (eglDestroyImageKHR) {
+            (*eglDestroyImageKHR)(gl->egl_display, y_image);
+        }
+        return;
+    }
+    
+    // Create V plane EGL image using actual hardware layout
+    EGLint v_attrs[] = {
+        EGL_WIDTH, uv_width,
+        EGL_HEIGHT, uv_height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[2],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[2],
+        EGL_NONE
+    };
+    
+    EGLImage v_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, v_attrs);
+    egl_err = eglGetError();
+    if (v_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[DMA] V plane import failed: 0x%x\n", egl_err);
+            err_count++;
+        }
+        if (eglDestroyImageKHR) {
+            (*eglDestroyImageKHR)(gl->egl_display, y_image);
+            (*eglDestroyImageKHR)(gl->egl_display, u_image);
+        }
+        return;
+    }
+    
+    // Bind Y plane to texture unit 0
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)y_image);
+    } else {
+        fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
+        goto cleanup_dma;
+    }
+    // Set texture parameters for completeness
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(gl->u_texture_y, 0);
     
-    // Set uniform
-    glUniform1i(gl->u_texture_nv12, 0);
+    // Bind U plane to texture unit 1
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_u);
+    (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)u_image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(gl->u_texture_u, 1);
     
-    // Bind keystone matrix
+    // Bind V plane to texture unit 2
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)v_image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(gl->u_texture_v, 2);
+    
+    // Bind keystone matrix and render
     glUniformMatrix3fv(gl->u_keystone_matrix, 1, GL_FALSE, (float*)&keystone->matrix);
-    
-    // Bind VAO and render
     glBindVertexArray(gl->vao);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
     
-    printf("[DMA] ✓ GPU rendering completed (frame rendered to screen)\n");
+    // Check for GL errors (only report first few)
+    GLenum err = glGetError();
+    static int gl_err_count = 0;
+    if (err != GL_NO_ERROR && gl_err_count < 3) {
+        fprintf(stderr, "[DMA] GL error after draw: 0x%x\n", err);
+        gl_err_count++;
+    }
     
-    // Clean up
+    clock_gettime(CLOCK_MONOTONIC, &dma_end);
+    
+cleanup_dma:
+    // Clean up EGL images
     if (eglDestroyImageKHR) {
-        (*eglDestroyImageKHR)(gl->egl_display, egl_image);
+        (*eglDestroyImageKHR)(gl->egl_display, y_image);
+        (*eglDestroyImageKHR)(gl->egl_display, u_image);
+        (*eglDestroyImageKHR)(gl->egl_display, v_image);
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 }

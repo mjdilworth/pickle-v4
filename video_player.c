@@ -1062,6 +1062,7 @@ void app_run(app_context_t *app) {
         int nv12_stride = video_get_nv12_stride(app->video);
         
         // Check if DMA buffer is available for zero-copy rendering
+        // DMA path requires both a valid FD and DRM_PRIME format
         bool has_dma = video_has_dma_buffer(app->video);
         if (has_dma) {
             int dma_fd = video_get_dma_fd(app->video);
@@ -1075,7 +1076,11 @@ void app_run(app_context_t *app) {
                 if (frame_count == 1) {
                     printf("[RENDER_TRACE] ✓ Using zero-copy DMA rendering (FD=%d)\n", dma_fd);
                 }
+                // Get actual plane layout from hardware decoder
+                int plane_offsets[3], plane_pitches[3];
+                video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
                 gl_render_frame_dma(app->gl, dma_fd, video_width, video_height,
+                                   plane_offsets, plane_pitches,
                                    app->drm, app->keystone, true, 0);
             } else {
                 // DMA FD not available, fall back to CPU upload

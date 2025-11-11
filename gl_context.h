@@ -102,6 +102,7 @@ void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
 
 // DMA buffer zero-copy rendering (NV12 format)
 void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
+                        int plane_offsets[3], int plane_pitches[3],
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 
 // Shader source code
