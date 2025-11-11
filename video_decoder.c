@@ -298,9 +298,10 @@ static int init_hw_accel_context(video_context_t *video) {
     }
     printf("[HWACCEL] ✓ DRM device context created using %s\n", drm_device);
     
-    // Diagnostic: Check device context internals
-    AVDRMDeviceContext *drm_ctx = (AVDRMDeviceContext *)video->hw_device_ctx->data;
-    if (drm_ctx) {
+    // Diagnostic: Check device context internals (access through AVHWDeviceContext)
+    AVHWDeviceContext *hw_dev_ctx = (AVHWDeviceContext *)video->hw_device_ctx->data;
+    if (hw_dev_ctx && hw_dev_ctx->hwctx) {
+        AVDRMDeviceContext *drm_ctx = (AVDRMDeviceContext *)hw_dev_ctx->hwctx;
         printf("[HWACCEL] DRM context fd=%d\n", drm_ctx->fd);
     }
     
@@ -315,9 +316,10 @@ static int init_hw_accel_context(video_context_t *video) {
     printf("[HWACCEL] ✓ Device context assigned to codec\n");
     printf("[HWACCEL] ✓ V4L2 M2M will use V4L2_MEMORY_DMABUF mode internally in avcodec_open2()\n");
     
-    // For V4L2 M2M with DRM PRIME, we MUST create and initialize frames context
-    // This tells FFmpeg to configure the kernel driver for GEM-backed DMABUF allocation
-    printf("[HWACCEL] Creating and initializing hardware frames context...\n");
+    // For V4L2 M2M with DRM PRIME: Create frames context but DO NOT initialize it
+    // V4L2 M2M kernel driver will initialize its own buffer pool during avcodec_open2()
+    // We just need to create and configure the context so FFmpeg knows to request drm_prime
+    printf("[HWACCEL] Creating hardware frames context (will NOT initialize)...\n");
     
     video->hw_frames_ctx = av_hwframe_ctx_alloc(video->hw_device_ctx);
     if (!video->hw_frames_ctx) {
@@ -331,12 +333,11 @@ static int init_hw_accel_context(video_context_t *video) {
     
     // CRITICAL: Set both hardware and software format
     // Hardware: DRM_PRIME (what GPU will receive)
-    // Software: NV12 (what V4L2 M2M decoder will output internally)
+    // Software: YUV420P (what bcm2835-codec V4L2 M2M decoder outputs - YU12 format)
     frames_ctx->format = AV_PIX_FMT_DRM_PRIME;        // Output format: GPU texture
-    frames_ctx->sw_format = AV_PIX_FMT_NV12;          // Input format: RPi V3D prefers NV12
+    frames_ctx->sw_format = AV_PIX_FMT_YUV420P;       // Input format: bcm2835-codec uses YU12 (yuv420p)
     
-    // Use actual codec dimensions (not hardcoded)
-    // BUT: codec_ctx->width might be 0 at initialization - use stream dimensions as fallback
+    // Use actual codec dimensions
     int frame_width = video->codec_ctx->width;
     int frame_height = video->codec_ctx->height;
     
@@ -347,73 +348,40 @@ static int init_hw_accel_context(video_context_t *video) {
             if (stream && stream->codecpar) {
                 frame_width = stream->codecpar->width;
                 frame_height = stream->codecpar->height;
-                printf("[HWACCEL] Using stream dimensions as codec dims not ready: %dx%d\n", frame_width, frame_height);
+                printf("[HWACCEL] Using stream dimensions: %dx%d\n", frame_width, frame_height);
             }
         }
     }
     
-    // Validate dimensions are reasonable
+    // Validate dimensions
     if (frame_width <= 0 || frame_height <= 0) {
-        printf("[HWACCEL] ⚠ Warning: Invalid frame dimensions %dx%d, using safe defaults\n", frame_width, frame_height);
+        printf("[HWACCEL] ⚠ Warning: Invalid frame dimensions %dx%d, using 1920x1080\n", frame_width, frame_height);
         frame_width = 1920;
         frame_height = 1080;
     }
     
     frames_ctx->width = frame_width;
     frames_ctx->height = frame_height;
-    
-    // Buffer pool size: REDUCED to avoid memory constraints on RPi4
-    // V4L2 M2M doesn't actually use this pool (kernel manages buffers)
-    // but having a small value avoids EINVAL on resource-constrained systems
-    frames_ctx->initial_pool_size = 4;
+    frames_ctx->initial_pool_size = 0;  // Let V4L2 M2M manage its own pool
     
     printf("[HWACCEL] Frames context config:\n");
     printf("[HWACCEL]   format (GPU):  %s (%d)\n", av_get_pix_fmt_name(frames_ctx->format), frames_ctx->format);
-    printf("[HWACCEL]   sw_format:    %s (%d) - RPi V3D preference\n", av_get_pix_fmt_name(frames_ctx->sw_format), frames_ctx->sw_format);
-    printf("[HWACCEL]   dimensions:   %dx%d (from codec)\n", frames_ctx->width, frames_ctx->height);
-    printf("[HWACCEL]   pool size:    %d buffers\n", frames_ctx->initial_pool_size);
-    fflush(stdout);
+    printf("[HWACCEL]   sw_format:    %s (%d) - bcm2835-codec YU12 output\n", av_get_pix_fmt_name(frames_ctx->sw_format), frames_ctx->sw_format);
+    printf("[HWACCEL]   dimensions:   %dx%d\n", frames_ctx->width, frames_ctx->height);
+    printf("[HWACCEL]   pool size:    %d (V4L2 M2M manages own pool)\n", frames_ctx->initial_pool_size);
     
-    // Initialize frames context - CRITICAL POINT
-    // This MUST succeed for zero-copy to work
-    printf("[HWACCEL] About to call av_hwframe_ctx_init()...\n");
-    fflush(stdout);
+    // CRITICAL: Do NOT call av_hwframe_ctx_init() for V4L2 M2M
+    // Just assign the uninitialized context to the codec
+    // FFmpeg's V4L2 wrapper will see this and request drm_prime capture format
+    printf("[HWACCEL] Skipping av_hwframe_ctx_init() - V4L2 M2M initializes during avcodec_open2()\n");
     
-    ret = av_hwframe_ctx_init(video->hw_frames_ctx);
-    
-    printf("[HWACCEL] av_hwframe_ctx_init() returned: %d\n", ret);
-    fflush(stdout);
-    
-    if (ret < 0) {
-        printf("[HWACCEL] ✗ av_hwframe_ctx_init() failed: %s (ret=%d)\n", av_err2str(ret), ret);
-        printf("[HWACCEL] ⚠ This is EXPECTED for V4L2 M2M (kernel manages buffers, not FFmpeg)\n");
-        printf("[HWACCEL] ⚠ But we still ASSIGN the uninitialized context to the codec\n");
-        printf("[HWACCEL] ⚠ This signals to FFmpeg that hardware acceleration is available\n");
-        printf("[HWACCEL] ⚠ V4L2 M2M will export DMA buffers directly via kernel buffer management\n");
-        
-        // CRITICAL: Even though init failed, assign the frames context to codec
-        // This tells FFmpeg that hardware acceleration is configured
-        // The kernel driver will manage its own buffers independently
-        if (video->hw_frames_ctx) {
-            video->codec_ctx->hw_frames_ctx = av_buffer_ref(video->hw_frames_ctx);
-            if (video->codec_ctx->hw_frames_ctx) {
-                printf("[HWACCEL] ✓ Uninitialized frames context assigned to codec (format callback will use this)\n");
-            } else {
-                printf("[HWACCEL] ⚠ Could not assign frames context reference to codec\n");
-            }
-        }
-    } else {
-        printf("[HWACCEL] ✓ HW frames context initialized successfully!\n");
-        printf("[HWACCEL] ✓ Kernel driver configured for GEM-backed DMABUF allocation\n");
-        
-        // Assign to codec for buffer management
-        video->codec_ctx->hw_frames_ctx = av_buffer_ref(video->hw_frames_ctx);
-        if (!video->codec_ctx->hw_frames_ctx) {
-            printf("[HWACCEL] Could not assign frames context to codec\n");
-        } else {
-            printf("[HWACCEL] ✓ Frames context assigned to codec\n");
-        }
+    video->codec_ctx->hw_frames_ctx = av_buffer_ref(video->hw_frames_ctx);
+    if (!video->codec_ctx->hw_frames_ctx) {
+        fprintf(stderr, "[HWACCEL] Failed to assign frames context to codec\n");
+        return -1;
     }
+    printf("[HWACCEL] ✓ Uninitialized frames context assigned to codec\n");
+    printf("[HWACCEL] ✓ This signals V4L2 wrapper to request drm_prime capture format\n");
     
     // Critical: Set pixel format hint for DRM_PRIME output
     // This must be done BEFORE codec opening
@@ -430,7 +398,6 @@ static int init_hw_accel_context(video_context_t *video) {
     
     return 0;
 }
-
 
 int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool force_software_decode) {
     memset(video, 0, sizeof(*video));
@@ -733,8 +700,16 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         }
         printf("[HW_DECODE] ✓ DRM PRIME hwaccel enabled - zero-copy ready!\n");
         
+        // Enable FFmpeg debug logging to see V4L2 M2M internals
+        av_log_set_level(AV_LOG_DEBUG);
+        printf("[DEBUG] FFmpeg log level set to DEBUG to trace V4L2 M2M format negotiation\n");
+        
         // Open codec with V4L2 options
         int ret = avcodec_open2(video->codec_ctx, video->codec, &codec_opts);
+        
+        // Reset log level after codec open
+        av_log_set_level(AV_LOG_INFO);
+        
         av_dict_free(&codec_opts);
         
         if (ret < 0) {

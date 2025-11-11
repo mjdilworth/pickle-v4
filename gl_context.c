@@ -444,12 +444,12 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
-    // OPTIMIZATION: Configure VSync for smooth frame pacing
-    // Set swap interval to 1 for VSync (reduces buffer swap timing variance)
-    if (!eglSwapInterval(gl->egl_display, 1)) {
-        printf("Warning: Could not enable VSync (swap interval), may have frame timing issues\n");
+    // OPTIMIZATION: Disable VSync for maximum frame rate (60 FPS)
+    // Set swap interval to 0 to disable VSync and allow uncapped frame rate
+    if (!eglSwapInterval(gl->egl_display, 0)) {
+        printf("Warning: Could not disable VSync (swap interval)\n");
     } else {
-        printf("VSync enabled for smooth frame pacing\n");
+        printf("VSync disabled for maximum frame rate (60 FPS target)\n");
     }
 
     // Detect EGL DMA buffer import support (zero-copy rendering)
