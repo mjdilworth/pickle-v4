@@ -1139,8 +1139,14 @@ void app_run(app_context_t *app) {
                                                        app->keystone2->show_help));
         bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
         
-        if (has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
-            // KMS DIRECT SCANOUT PATH (bypasses OpenGL entirely)
+        // PRODUCTION FIX: Always use CPU/OpenGL path for hardware decode
+        // KMS overlay plane cannot apply keystone correction (no transformation matrix)
+        // Keystone correction is a core feature, so we must use OpenGL rendering
+        // This means hardware decoded frames are uploaded to GPU textures via CPU
+        if (false && has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
+            // KMS DIRECT SCANOUT PATH - DISABLED for keystone support
+            // This path bypasses OpenGL and cannot apply keystone transformation
+            // Keeping code for reference, but disabled to ensure keystone always works
             int dma_fd = video_get_dma_fd(app->video);
             if (dma_fd >= 0) {
                 static bool kms_init_done = false;
@@ -1148,12 +1154,12 @@ void app_run(app_context_t *app) {
                     printf("[KMS] ✓ Using KMS overlay plane for zero-copy hardware video\n");
                     kms_init_done = true;
                 }
-                
+
                 // Get actual plane layout from hardware decoder
                 int plane_offsets[3] = {0, 0, 0};
                 int plane_pitches[3] = {0, 0, 0};
                 video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
-                
+
                 // Create framebuffer from DMA buffer
                 uint32_t fb_id = 0;
                 if (drm_create_video_fb(app->drm, dma_fd, video_width, video_height,
@@ -1164,12 +1170,12 @@ void app_run(app_context_t *app) {
                     drm_display_video_frame(app->drm, fb_id, 0, 0, video_width, video_height);
                     used_kms_overlay = true;  // Successfully used KMS path
                 }
-                
+
                 // Note: When using KMS overlay, video is on hardware plane
                 // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
                 // This is handled in the standard overlay rendering section below
             }
-        } else if (has_dma && !need_opengl_for_overlays) {
+        } else if (false && has_dma && !need_opengl_for_overlays) {
             // OPENGL DMA PATH (when KMS overlay not available BUT no overlays needed)
             // NOTE: On Pi 4, EGL DMA import has driver issues (GL error 0x502)
             // Skip this path when overlays are visible - use CPU path instead
@@ -1481,8 +1487,10 @@ void app_run(app_context_t *app) {
         double total_frame_time = decode_time + render_time;
         double remaining_time = target_frame_time - total_frame_time;
 
-        // Always sleep to maintain frame rate (KMS path lacks vsync throttling)
-        if (used_kms_overlay && remaining_time > 0.001) {
+        // PRODUCTION FIX: Frame pacing to prevent jumpiness
+        // Hardware decode is very fast (<1ms), we must enforce proper frame timing
+        // to match video FPS and display refresh rate
+        if (remaining_time > 0.0005) {  // Sleep if we have at least 0.5ms remaining
             struct timespec sleep_time;
             sleep_time.tv_sec = 0;
             sleep_time.tv_nsec = (long)(remaining_time * 1000000000);

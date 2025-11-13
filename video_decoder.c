@@ -785,24 +785,25 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             printf("[HW_DECODE] V4L2: Note - decoder may buffer 20-30 packets before first frame\n");
         }
         
-        // Initialize FFmpeg hardware acceleration API for zero-copy DMA buffers
-        // This enables DRM PRIME mode and GEM-backed buffers recognized by EGL
-        // CRITICAL: This MUST succeed for zero-copy to work
+        // PRODUCTION FIX: Skip DRM PRIME hardware acceleration setup
+        // We're using CPU/OpenGL upload path (not zero-copy DMA) because:
+        // 1. KMS overlay plane cannot apply keystone transformation
+        // 2. OpenGL overlays (corners/borders/help) require CPU compositing
+        // 3. DRM_PRIME frames have NULL data[1]/data[2] pointers (U/V planes)
+        //    which causes solid green video when trying to upload to GPU
+        //
+        // By NOT calling init_hw_accel_context(), V4L2 M2M will output YUV420P
+        // to system RAM (mmap mode), giving us CPU-accessible Y/U/V pointers
+        // that work with the OpenGL texture upload path.
+        //
+        // Hardware decode still provides performance benefits:
+        // - H.264 decode offloaded to bcm2835-codec (saves CPU)
+        // - Only the texture upload uses CPU (which is fast with SIMD)
+        // - Much better than software decode + texture upload
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] Attempting to initialize DRM PRIME hardware acceleration...\n");
-        }
-        if (init_hw_accel_context(video) != 0) {
-            fprintf(stderr, "[HW_DECODE] ✗ CRITICAL: DRM PRIME hwaccel initialization FAILED\n");
-            fprintf(stderr, "[HW_DECODE] This is the gateway to zero-copy rendering\n");
-            fprintf(stderr, "[HW_DECODE] Without this, V4L2 M2M will output system RAM (slow)\n");
-            fprintf(stderr, "[HW_DECODE] Check the errors above and fix the DRM/V4L2 configuration\n");
-            avcodec_free_context(&video->codec_ctx);
-            avformat_close_input(&video->format_ctx);
-            av_packet_free(&video->packet);
-            return -1;
-        }
-        if (hw_debug_enabled) {
-            printf("[HW_DECODE] ✓ DRM PRIME hwaccel enabled - zero-copy ready!\n");
+            printf("[HW_DECODE] Using V4L2 M2M with CPU-accessible YUV buffers (mmap mode)\n");
+            printf("[HW_DECODE] This enables keystone correction and overlay rendering\n");
+            printf("[HW_DECODE] Hardware decode still provides significant performance benefits\n");
         }
         
         // Enable FFmpeg debug logging to see V4L2 M2M internals (only in debug mode)

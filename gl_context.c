@@ -206,7 +206,7 @@ const char *vertex_shader_source =
 
 // Optimized YUV→RGB conversion fragment shader (OpenGL ES 3.1)
 // Keep highp precision for color accuracy (mediump causes color shift)
-const char *fragment_shader_source = 
+const char *fragment_shader_source =
     "#version 310 es\n"
     "precision highp float;\n"  // KEEP highp for color accuracy
     "in vec2 v_texcoord;\n"
@@ -225,6 +225,7 @@ const char *fragment_shader_source =
     "    float v = texture(u_texture_v, v_texcoord).r;\n"
     "    \n"
     "    // BT.709 TV range (16-235 for Y, 16-240 for UV) to RGB conversion\n"
+    "    // Decoder outputs: Color space: bt709, Color range: tv\n"
     "    // First expand from TV range to full range\n"
     "    y = (y * 255.0 - 16.0) / 219.0;\n"
     "    u = (u * 255.0 - 16.0) / 224.0;\n"
@@ -1425,23 +1426,25 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     float help_vertices[60000]; // Large buffer for text vertices with color
     int vertex_count = 0;
     
-    // Large centered background with semi-transparent black color
+    // Large centered background with darker semi-transparent black for better readability
     // Bottom-left
     help_vertices[0] = -0.9f; help_vertices[1] = -0.7f;
-    help_vertices[2] = 0.0f; help_vertices[3] = 0.0f; help_vertices[4] = 0.0f; help_vertices[5] = 0.8f;
+    help_vertices[2] = 0.0f; help_vertices[3] = 0.0f; help_vertices[4] = 0.0f; help_vertices[5] = 0.95f;
     // Bottom-right
     help_vertices[6] = 0.9f; help_vertices[7] = -0.7f;
-    help_vertices[8] = 0.0f; help_vertices[9] = 0.0f; help_vertices[10] = 0.0f; help_vertices[11] = 0.8f;
+    help_vertices[8] = 0.0f; help_vertices[9] = 0.0f; help_vertices[10] = 0.0f; help_vertices[11] = 0.95f;
     // Top-right
     help_vertices[12] = 0.9f; help_vertices[13] = 0.7f;
-    help_vertices[14] = 0.0f; help_vertices[15] = 0.0f; help_vertices[16] = 0.0f; help_vertices[17] = 0.8f;
+    help_vertices[14] = 0.0f; help_vertices[15] = 0.0f; help_vertices[16] = 0.0f; help_vertices[17] = 0.95f;
     // Top-left
     help_vertices[18] = -0.9f; help_vertices[19] = 0.7f;
-    help_vertices[20] = 0.0f; help_vertices[21] = 0.0f; help_vertices[22] = 0.0f; help_vertices[23] = 0.8f;
+    help_vertices[20] = 0.0f; help_vertices[21] = 0.0f; help_vertices[22] = 0.0f; help_vertices[23] = 0.95f;
     vertex_count = 4;
     
     // Compact help text - keyboard and gamepad controls
-    const char* help_text = 
+    const char* help_text =
+        "Copyright Dilworth Creative LLC\n"
+        "\n"
         "PICKLE KEYSTONE\n"
         "\n"
         "KEYBOARD\n"
@@ -1513,12 +1516,12 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
     glDisableVertexAttribArray(1); // Disable color attribute
     
-    // Create cyan/white color vertices for text (manually set color for each vertex)
+    // Create bright white color vertices for text (better readability)
     float colored_vertices[180000]; // Large buffer with colors (30000 * 6)
     for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
         colored_vertices[i * 6 + 0] = text_vertices[i * 2 + 0]; // x
         colored_vertices[i * 6 + 1] = text_vertices[i * 2 + 1]; // y
-        colored_vertices[i * 6 + 2] = 0.0f; // r - cyan color
+        colored_vertices[i * 6 + 2] = 1.0f; // r - bright white
         colored_vertices[i * 6 + 3] = 1.0f; // g
         colored_vertices[i * 6 + 4] = 1.0f; // b
         colored_vertices[i * 6 + 5] = 1.0f; // a
@@ -1554,19 +1557,19 @@ void gl_render_notification_overlay(gl_context_t *gl, const char *message) {
     float notify_vertices[1000]; // Buffer for background vertices with color
     int vertex_count = 0;
 
-    // Centered notification box with semi-transparent green background (success color)
+    // Centered notification box with darker green background for better readability
     // Bottom-left
     notify_vertices[0] = -0.35f; notify_vertices[1] = -0.15f;
-    notify_vertices[2] = 0.2f; notify_vertices[3] = 0.8f; notify_vertices[4] = 0.2f; notify_vertices[5] = 0.9f;
+    notify_vertices[2] = 0.0f; notify_vertices[3] = 0.6f; notify_vertices[4] = 0.0f; notify_vertices[5] = 0.95f;
     // Bottom-right
     notify_vertices[6] = 0.35f; notify_vertices[7] = -0.15f;
-    notify_vertices[8] = 0.2f; notify_vertices[9] = 0.8f; notify_vertices[10] = 0.2f; notify_vertices[11] = 0.9f;
+    notify_vertices[8] = 0.0f; notify_vertices[9] = 0.6f; notify_vertices[10] = 0.0f; notify_vertices[11] = 0.95f;
     // Top-right
     notify_vertices[12] = 0.35f; notify_vertices[13] = 0.15f;
-    notify_vertices[14] = 0.2f; notify_vertices[15] = 0.8f; notify_vertices[16] = 0.2f; notify_vertices[17] = 0.9f;
+    notify_vertices[14] = 0.0f; notify_vertices[15] = 0.6f; notify_vertices[16] = 0.0f; notify_vertices[17] = 0.95f;
     // Top-left
     notify_vertices[18] = -0.35f; notify_vertices[19] = 0.15f;
-    notify_vertices[20] = 0.2f; notify_vertices[21] = 0.8f; notify_vertices[22] = 0.2f; notify_vertices[23] = 0.9f;
+    notify_vertices[20] = 0.0f; notify_vertices[21] = 0.6f; notify_vertices[22] = 0.0f; notify_vertices[23] = 0.95f;
     vertex_count = 4;
 
     // Upload background geometry
