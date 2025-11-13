@@ -39,7 +39,7 @@ typedef struct {
     bool loop_playback;
     bool using_drm_prime;
     bool advanced_diagnostics; // Flag for detailed diagnostics output
-    bool force_software_decode; // Flag to disable hardware decode (--nh flag)
+    bool enable_hardware_decode; // Flag to enable hardware decode (--hw flag)
     
     // 2-stage Bitstream filter chain for V4L2 M2M: avcC→Annex-B + AUD insertion
     AVBSFContext *bsf_annexb_ctx;    // Stage 1: h264_mp4toannexb (avcC to Annex-B conversion)
@@ -66,7 +66,7 @@ typedef struct {
 } video_context_t;
 
 // Video decoder functions
-int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool force_software_decode);
+int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool enable_hardware_decode);
 void video_cleanup(video_context_t *video);
 int video_decode_frame(video_context_t *video);
 uint8_t* video_get_rgb_data(video_context_t *video);  // Legacy - for fallback

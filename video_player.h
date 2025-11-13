@@ -44,10 +44,16 @@ typedef struct {
     bool advanced_diagnostics; // Flag to enable detailed hardware decoder diagnostics
     int active_keystone;     // 0 for first keystone, 1 for second
     int gamepad_corner_cycle_index; // Track position in corner cycling (1-8 mode)
+
+    // Notification message overlay
+    char notification_message[256];  // Message to display
+    double notification_start_time;  // When message was shown (monotonic time)
+    double notification_duration;    // How long to show (seconds)
+    bool notification_active;        // Whether message is currently showing
 } app_context_t;
 
 // Main application functions
-int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool force_software_decode);
+int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback, bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode);
 void app_run(app_context_t *app);
 void app_cleanup(app_context_t *app);
 

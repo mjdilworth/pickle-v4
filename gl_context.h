@@ -98,6 +98,7 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
 void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);
+void gl_render_notification_overlay(gl_context_t *gl, const char *message);
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
 
 // DMA buffer zero-copy rendering (NV12 format)

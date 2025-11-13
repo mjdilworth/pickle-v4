@@ -451,16 +451,16 @@ static int init_hw_accel_context(video_context_t *video) {
     return 0;
 }
 
-int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool force_software_decode) {
+int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool enable_hardware_decode) {
     memset(video, 0, sizeof(*video));
-    
+
     // Set global debug flag for hardware decode diagnostics
     hw_debug_enabled = advanced_diagnostics;
-    
+
     // Store advanced diagnostics flag
     video->advanced_diagnostics = advanced_diagnostics;
-    video->force_software_decode = force_software_decode;
-    
+    video->enable_hardware_decode = enable_hardware_decode;
+
     // Initialize DMA buffer fields
     video->supports_dma_export = false;
     video->dma_fd = -1;
@@ -468,10 +468,12 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     video->dma_size = 0;
     video->v4l2_fd = -1;  // V4L2 device FD not yet available
     video->v4l2_buffer_index = 0;  // V4L2 output buffer index
-    
+
     // Print decode mode
-    if (force_software_decode) {
-        printf("[CONFIG] Software decode forced via --nh flag\n");
+    if (enable_hardware_decode) {
+        printf("[CONFIG] Hardware decode enabled via --hw flag\n");
+    } else {
+        printf("[CONFIG] Software decode (default, use --hw for hardware acceleration)\n");
     }
 
     // Allocate packet
@@ -533,13 +535,12 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     video->hw_decode_type = HW_DECODE_NONE;
     
     // HARDWARE DECODE ENABLED with automatic software fallback
-    // Will attempt V4L2 M2M hardware decoder first
+    // Hardware decode is opt-in via --hw command-line flag
+    // By default, uses reliable software decoder
+    // Hardware decoder (V4L2 M2M) provides better performance but may have issues
     // If hardware decoder hangs (no frames after 10 packets), automatically falls back to software
-    // This provides best performance when hardware works, with reliability when it doesn't
-    //
-    // Can be disabled via --nh command-line flag or force_software_decode parameter
-    
-    if (!force_software_decode) {
+
+    if (enable_hardware_decode) {
         if (hw_debug_enabled) {
             printf("[HW_DECODE] Attempting hardware decoder detection...\n");
             printf("[HW_DECODE] Codec ID: %d\n", codecpar->codec_id);
@@ -611,9 +612,8 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             printf("[HW_DECODE] ✓ Using software decoder: %s\n", video->codec->name);
         }
     } else {
-        // Hardware decode disabled via --nh flag - use software decoder only
-        printf("[CONFIG] Software decode forced via --nh flag\n");
-        printf("[HW_DECODE] Using software decoder (hardware decode disabled)\n");
+        // Software decode (default) - reliable and compatible
+        printf("[HW_DECODE] Using software decoder (use --hw flag for hardware acceleration)\n");
         video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
         if (!video->codec) {
             fprintf(stderr, "[HW_DECODE] ✗ Failed to find software decoder for codec ID %d\n", codecpar->codec_id);
@@ -1330,7 +1330,7 @@ int video_restart_playback(video_context_t *video) {
         
         // Save settings for reinit
         bool advanced_diag = video->advanced_diagnostics;
-        bool force_software = video->force_software_decode;
+        bool enable_hardware = video->enable_hardware_decode;
         
         // Clean up current decoder state
         if (video->bsf_annexb_ctx) av_bsf_free(&video->bsf_annexb_ctx);
@@ -1341,7 +1341,7 @@ int video_restart_playback(video_context_t *video) {
         if (video->format_ctx) avformat_close_input(&video->format_ctx);
         
         // Reinitialize from scratch
-        int result = video_init(video, url, advanced_diag, force_software);
+        int result = video_init(video, url, advanced_diag, enable_hardware);
         free(url);
         
         if (result < 0) {

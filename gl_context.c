@@ -449,12 +449,12 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
-    // OPTIMIZATION: Disable VSync for maximum frame rate (60 FPS)
-    // Set swap interval to 0 to disable VSync and allow uncapped frame rate
-    if (!eglSwapInterval(gl->egl_display, 0)) {
-        printf("Warning: Could not disable VSync (swap interval)\n");
+    // FIXED: Enable VSync for smooth, tear-free playback
+    // Set swap interval to 1 to sync with display refresh (eliminates jitter)
+    if (!eglSwapInterval(gl->egl_display, 1)) {
+        printf("Warning: Could not enable VSync (swap interval) - playback may be jittery\n");
     } else {
-        printf("VSync disabled for maximum frame rate (60 FPS target)\n");
+        printf("VSync enabled for smooth playback (synced to display refresh)\n");
     }
 
     // Detect EGL DMA buffer import support (zero-copy rendering)
@@ -850,8 +850,9 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         bool v_direct = (v_stride == uv_width);
         bool size_changed = (width != last_width[video_index] || height != last_height[video_index] || frame_rendered[video_index] == 0);
         
-        if (size_changed) {
-            printf("YUV strides: Y=%d U=%d V=%d (dimensions: %dx%d, UV: %dx%d)\n", 
+        // PRODUCTION: Only log on first frame to reduce console spam
+        if (size_changed && frame_rendered[video_index] == 0) {
+            printf("YUV strides: Y=%d U=%d V=%d (dimensions: %dx%d, UV: %dx%d)\n",
                    y_stride, u_stride, v_stride, width, height, uv_width, uv_height);
             printf("Direct upload: Y=%s U=%s V=%s\n", y_direct?"YES":"NO", u_direct?"YES":"NO", v_direct?"YES":"NO");
         }
@@ -877,42 +878,43 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             storage_initialized[video_index] = true;
         }
         
+        // PRODUCTION OPTIMIZATION: Allocate buffers once before all texture uploads
+        // This avoids 3 allocation checks per frame
+        if (!y_direct || !u_direct || !v_direct) {
+            int needed_size = width * height;  // Y plane size
+            allocate_yuv_buffers(needed_size);
+        }
+
         // Y texture - OPTIMIZED: Direct upload (avoid PBO overhead)
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex_y);
-        
+
         if (y_direct) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
         } else {
             // Stride copy path (for padded data)
-            int needed_size = width * height;
-            allocate_yuv_buffers(needed_size);
             copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
         }
-        
+
         // U texture - OPTIMIZED: Direct upload
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, tex_u);
-        
+
         if (u_direct) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
         } else {
-            int needed_size = uv_width * uv_height;
-            allocate_yuv_buffers(needed_size);
             copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
         }
-        
+
         // V texture - OPTIMIZED: Direct upload
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, tex_v);
-        
+
         if (v_direct) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
         } else {
-            int needed_size = uv_width * uv_height;
-            allocate_yuv_buffers(needed_size);
             copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
         }
@@ -942,13 +944,15 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     clock_gettime(CLOCK_MONOTONIC, &draw_end);
     double draw_time = (draw_end.tv_sec - draw_start.tv_sec) + (draw_end.tv_nsec - draw_start.tv_nsec) / 1e9;
     
-    // Diagnostic output
+    // PRODUCTION: Diagnostic output only on first 3 slow frames
     static int frame_diag = 0;
-    if (frame_diag < 5 && (tex_upload_time > 0.005 || draw_time > 0.010)) {
-        printf("[RENDER_DETAIL] Video%d - TexUpload: %.2fms, DrawCall: %.2fms, Total: %.2fms\n",
-               video_index, tex_upload_time * 1000, draw_time * 1000, 
-               (tex_upload_time + draw_time) * 1000);
+    if (frame_diag < 3 && (tex_upload_time > 0.008 || draw_time > 0.010)) {
+        printf("[Render] Video%d - Upload: %.1fms, Draw: %.1fms\n",
+               video_index, tex_upload_time * 1000, draw_time * 1000);
         frame_diag++;
+        if (frame_diag == 3) {
+            printf("  (Further render timing available with --timing flag)\n");
+        }
     }
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
@@ -995,27 +999,57 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     if (!keystone || !keystone->show_corners) {
         return; // Don't render corners if not visible
     }
-    
-    // Pre-allocated static buffer for corners (initialized once)
-    static float corner_vertices[10000];  // Enough for position+color data
-    static GLuint corner_vbo = 0;
+
+    // PRODUCTION FIX: Separate VBOs and state tracking for each keystone
+    // This prevents flickering when rendering corners for dual keystones
+    static float corner_vertices1[10000];  // Keystone 1 vertex buffer
+    static float corner_vertices2[10000];  // Keystone 2 vertex buffer
+    static GLuint corner_vbo1 = 0;
+    static GLuint corner_vbo2 = 0;
     static bool vbo_initialized = false;
-    static int cached_selected_corner = -2;  // Track which corner was selected
-    static bool last_show_corners = false;  // Track visibility toggle
-    
-    // Initialize VBO once on first call
+
+    // Per-keystone state tracking (indexed by keystone: 0 = first seen, 1 = second seen)
+    static keystone_context_t *keystone_ptrs[2] = {NULL, NULL};
+    static int cached_selected_corners[2] = {-2, -2};
+    static bool last_show_corners[2] = {false, false};
+
+    // Initialize VBOs once on first call
     if (!vbo_initialized) {
-        glGenBuffers(1, &corner_vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices), NULL, GL_DYNAMIC_DRAW);
+        glGenBuffers(1, &corner_vbo1);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo1);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices1), NULL, GL_DYNAMIC_DRAW);
+
+        glGenBuffers(1, &corner_vbo2);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo2);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices2), NULL, GL_DYNAMIC_DRAW);
+
         vbo_initialized = true;
     }
-    
-    // Force update if visibility toggled or selection changed
-    bool visibility_changed = (last_show_corners != keystone->show_corners);
-    bool selection_changed = (cached_selected_corner != keystone->selected_corner);
+
+    // Determine which keystone index (0 or 1) based on pointer
+    int keystone_idx = -1;
+    if (keystone == keystone_ptrs[0] || keystone_ptrs[0] == NULL) {
+        keystone_idx = 0;
+        keystone_ptrs[0] = keystone;
+    } else if (keystone == keystone_ptrs[1] || keystone_ptrs[1] == NULL) {
+        keystone_idx = 1;
+        keystone_ptrs[1] = keystone;
+    } else {
+        // Fallback: use index 0 if pointer doesn't match either
+        keystone_idx = 0;
+    }
+
+    // Select the appropriate VBO and vertex buffer for this keystone
+    GLuint corner_vbo = (keystone_idx == 0) ? corner_vbo1 : corner_vbo2;
+    float *corner_vertices = (keystone_idx == 0) ? corner_vertices1 : corner_vertices2;
+
+    // Check if update needed for THIS specific keystone
+    bool visibility_changed = (last_show_corners[keystone_idx] != keystone->show_corners);
+    bool selection_changed = (cached_selected_corners[keystone_idx] != keystone->selected_corner);
     bool needs_update = keystone->corners_dirty || visibility_changed || selection_changed;
-    last_show_corners = keystone->show_corners;
+
+    // Update cached state for THIS keystone
+    last_show_corners[keystone_idx] = keystone->show_corners;
     
     // Always prepare corner colors (outside needs_update so available for rendering)
     float corner_colors[4][4];
@@ -1036,7 +1070,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     }
     
     if (needs_update) {
-        cached_selected_corner = keystone->selected_corner;
+        cached_selected_corners[keystone_idx] = keystone->selected_corner;
         keystone->corners_dirty = false;  // Clear dirty flag
         
         // Create corner positions (small squares)
@@ -1508,8 +1542,99 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
-    
+
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void gl_render_notification_overlay(gl_context_t *gl, const char *message) {
+    if (!gl || !message) return;
+
+    // Create notification overlay with background and text
+    float notify_vertices[1000]; // Buffer for background vertices with color
+    int vertex_count = 0;
+
+    // Centered notification box with semi-transparent green background (success color)
+    // Bottom-left
+    notify_vertices[0] = -0.35f; notify_vertices[1] = -0.15f;
+    notify_vertices[2] = 0.2f; notify_vertices[3] = 0.8f; notify_vertices[4] = 0.2f; notify_vertices[5] = 0.9f;
+    // Bottom-right
+    notify_vertices[6] = 0.35f; notify_vertices[7] = -0.15f;
+    notify_vertices[8] = 0.2f; notify_vertices[9] = 0.8f; notify_vertices[10] = 0.2f; notify_vertices[11] = 0.9f;
+    // Top-right
+    notify_vertices[12] = 0.35f; notify_vertices[13] = 0.15f;
+    notify_vertices[14] = 0.2f; notify_vertices[15] = 0.8f; notify_vertices[16] = 0.2f; notify_vertices[17] = 0.9f;
+    // Top-left
+    notify_vertices[18] = -0.35f; notify_vertices[19] = 0.15f;
+    notify_vertices[20] = 0.2f; notify_vertices[21] = 0.8f; notify_vertices[22] = 0.2f; notify_vertices[23] = 0.9f;
+    vertex_count = 4;
+
+    // Upload background geometry
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), notify_vertices, GL_DYNAMIC_DRAW);
+
+    // Use corner shader program
+    glUseProgram(gl->corner_program);
+
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float); // x, y, r, g, b, a
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Set identity matrix for MVP
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+
+    // Enable blending for transparency
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+
+    // Draw notification background
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+    // Render notification text centered
+    float text_vertices[3000];
+    int text_vertex_count = 0;
+    draw_text_simple(text_vertices, &text_vertex_count, message, -0.32f, 0.02f, 0.035f);
+
+    // Create colored vertices for text (white color)
+    float colored_vertices[18000]; // 3000 * 6
+    for (int i = 0; i < text_vertex_count && i * 6 < 18000; i++) {
+        colored_vertices[i * 6 + 0] = text_vertices[i * 2 + 0]; // x
+        colored_vertices[i * 6 + 1] = text_vertices[i * 2 + 1]; // y
+        colored_vertices[i * 6 + 2] = 1.0f; // r - white color
+        colored_vertices[i * 6 + 3] = 1.0f; // g
+        colored_vertices[i * 6 + 4] = 1.0f; // b
+        colored_vertices[i * 6 + 5] = 1.0f; // a
+    }
+
+    // Upload text with colors
+    glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 6 * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Draw text pixels
+    int text_pixels = text_vertex_count / 4;
+    for (int i = 0; i < text_pixels; i++) {
+        glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+    }
+
+    // Restore GL state
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 

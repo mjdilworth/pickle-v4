@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  // For pthread_timedjoin_np
 #define _POSIX_C_SOURCE 199309L
 // KMS video overlay plane implementation for hardware zero-copy video playback
 // This bypasses OpenGL/EGL entirely and uses DRM/KMS direct scanout
@@ -49,7 +50,19 @@ static void* plane_worker_thread_func(void* arg) {
         clock_gettime(CLOCK_MONOTONIC, &plane_t2);
         double plane_ms = (plane_t2.tv_sec - plane_t1.tv_sec) * 1000.0 +
                           (plane_t2.tv_nsec - plane_t1.tv_nsec) / 1000000.0;
-        
+
+        // Frame timing tracking (disabled unless debugging jitter)
+        // static struct timespec last_present_time = {0, 0};
+        // if (last_present_time.tv_sec != 0) {
+        //     double frame_interval_ms = (plane_t2.tv_sec - last_present_time.tv_sec) * 1000.0 +
+        //                                (plane_t2.tv_nsec - last_present_time.tv_nsec) / 1000000.0;
+        //     if (frame_interval_ms > 20.0 || frame_interval_ms < 13.0) {
+        //         printf("[JITTER] Frame interval: %.1fms (vsync wait: %.1fms)\n",
+        //                frame_interval_ms, plane_ms);
+        //     }
+        // }
+        // last_present_time = plane_t2;
+
         if (hw_debug_enabled && plane_ms > 5.0) {
             printf("[KMS-WORKER] drmModeSetPlane took %.1fms (plane=%u, crtc=%u, fb=%u)\n",
                    plane_ms, drm->video_plane_id, drm->crtc_id, fb_id);
@@ -70,7 +83,7 @@ static void* plane_worker_thread_func(void* arg) {
             drm->video_fb_id = fb_id;
         }
     }
-    
+
     pthread_mutex_unlock(&drm->plane_mutex);
     return NULL;
 }
@@ -331,21 +344,34 @@ int drm_display_video_frame(display_ctx_t *drm, uint32_t fb_id, uint32_t x, uint
     if (width > crtc_w) width = crtc_w;
     if (height > crtc_h) height = crtc_h;
     
-    // If worker thread is running, submit update to the worker (non-blocking)
+    // If worker thread is running, submit update to the worker
     if (drm->plane_worker_running) {
         pthread_mutex_lock(&drm->plane_mutex);
-        
-        // Update the pending plane update (overwrite if one is already pending)
+
+        // Non-blocking: overwrite pending update if worker is still processing
+        // This allows decode to run ahead of display, maintaining smooth 60fps
+        // The single-mailbox design naturally rate-limits to vsync timing
+
+        // Frame overwrite tracking (disabled - handled by frame pacing now)
+        // static int overwrite_count = 0;
+        // if (drm->plane_update.pending) {
+        //     overwrite_count++;
+        //     if (overwrite_count % 100 == 0) {
+        //         printf("[WARN] %d frames overwritten\n", overwrite_count);
+        //     }
+        // }
+
+        // Submit new plane update (overwrites pending if worker is busy)
         drm->plane_update.fb_id = fb_id;
         drm->plane_update.x = x;
         drm->plane_update.y = y;
         drm->plane_update.width = width;
         drm->plane_update.height = height;
         drm->plane_update.pending = true;
-        
+
         // Signal the worker thread
         pthread_cond_signal(&drm->plane_cond);
-        
+
         pthread_mutex_unlock(&drm->plane_mutex);
         return 0;
     }
@@ -396,13 +422,27 @@ void drm_hide_video_plane(display_ctx_t *drm) {
         drm->plane_worker_shutdown = true;
         pthread_cond_signal(&drm->plane_cond);
         pthread_mutex_unlock(&drm->plane_mutex);
-        
-        pthread_join(drm->plane_worker_thread, NULL);
-        
+
+        // PRODUCTION: Use timed join with 100ms timeout for fast shutdown
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_nsec += 100000000;  // 100ms
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec++;
+            timeout.tv_nsec -= 1000000000;
+        }
+
+        int result = pthread_timedjoin_np(drm->plane_worker_thread, NULL, &timeout);
+        if (result != 0) {
+            // Thread didn't exit in time - cancel it forcefully
+            pthread_cancel(drm->plane_worker_thread);
+            pthread_join(drm->plane_worker_thread, NULL);
+        }
+
         pthread_mutex_destroy(&drm->plane_mutex);
         pthread_cond_destroy(&drm->plane_cond);
         drm->plane_worker_running = false;
-        
+
         if (hw_debug_enabled) {
             printf("[KMS] Worker thread stopped\n");
         }
