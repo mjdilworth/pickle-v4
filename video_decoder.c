@@ -1052,11 +1052,21 @@ int video_decode_frame(video_context_t *video) {
                     }
                 } else if (video->use_hardware_decode && frame_count == 1 && video->frame->format != AV_PIX_FMT_DRM_PRIME) {
                     // Not a DRM PRIME frame - still using system memory
-                    printf("[ZERO-COPY] ⚠ Frame is %s, not DRM_PRIME (system RAM fallback)\n", 
+                    printf("[ZERO-COPY] ⚠ Frame is %s, not DRM_PRIME (system RAM fallback)\n",
                            av_get_pix_fmt_name(video->frame->format));
                 }
             }
-            
+
+            // CRITICAL OPTIMIZATION: Copy V4L2 uncached buffers to cached memory NOW
+            // Don't wait until render time - do it immediately after decode
+            // This prevents the memcpy from blocking the render/VSync path
+            if (video->use_hardware_decode && video->frame->data[0]) {
+                // Trigger the memcpy by calling the getters (which cache the data)
+                video_get_y_data(video);
+                video_get_u_data(video);
+                video_get_v_data(video);
+            }
+
             return 0;  // SUCCESS - Frame ready for caller to use
         }
         
@@ -1242,38 +1252,103 @@ int video_decode_frame(video_context_t *video) {
     return -1; // Failed to decode even with software fallback
 }
 
+// Cached memory buffers for V4L2 M2M frames (speeds up GL texture upload)
+// V4L2 mmap buffers are uncached/write-combined which is very slow for CPU reads
+static uint8_t *cached_y_buffer = NULL;
+static uint8_t *cached_u_buffer = NULL;
+static uint8_t *cached_v_buffer = NULL;
+static size_t cached_y_size = 0;
+static size_t cached_u_size = 0;
+static size_t cached_v_size = 0;
+static void *last_y_source = NULL;  // Track if we already copied this frame
+static void *last_u_source = NULL;
+static void *last_v_source = NULL;
+
 uint8_t* video_get_y_data(video_context_t *video) {
     if (!video->frame) return NULL;
-    
-    // Debug: Print first few pixel values on first call
-    static bool debug_printed = false;
-    if (!debug_printed && video->frame->data[0]) {
-        printf("DEBUG: Y[0-3]: %02x %02x %02x %02x\n", 
-               video->frame->data[0][0], video->frame->data[0][1], 
-               video->frame->data[0][2], video->frame->data[0][3]);
-        if (video->frame->data[1]) {
-            printf("DEBUG: U[0-3]: %02x %02x %02x %02x\n", 
-                   video->frame->data[1][0], video->frame->data[1][1], 
-                   video->frame->data[1][2], video->frame->data[1][3]);
+
+    // OPTIMIZATION: For hardware decode, copy to cached memory for faster GL upload
+    // V4L2 M2M mmap buffers are uncached (optimized for DMA, slow for CPU reads)
+    // Memcpy to cached RAM is ~5x faster than reading uncached memory repeatedly
+    if (video->use_hardware_decode && video->frame->data[0]) {
+        // Check if we already copied this frame (avoid duplicate memcpy)
+        if (last_y_source == video->frame->data[0] && cached_y_buffer) {
+            return cached_y_buffer;
         }
-        if (video->frame->data[2]) {
-            printf("DEBUG: V[0-3]: %02x %02x %02x %02x\n", 
-                   video->frame->data[2][0], video->frame->data[2][1], 
-                   video->frame->data[2][2], video->frame->data[2][3]);
+
+        size_t y_size = video->frame->linesize[0] * video->height;
+
+        // Allocate cached buffer if needed
+        if (cached_y_size < y_size) {
+            free(cached_y_buffer);
+            cached_y_buffer = malloc(y_size);
+            cached_y_size = cached_y_buffer ? y_size : 0;
+            if (!cached_y_buffer) return video->frame->data[0]; // Fallback
+            printf("[PERF] Allocated %zu KB cached Y buffer for hardware decode\n", y_size / 1024);
         }
-        debug_printed = true;
+
+        // Copy to cached memory (fast memcpy, then fast GL upload)
+        memcpy(cached_y_buffer, video->frame->data[0], y_size);
+        last_y_source = video->frame->data[0];
+        return cached_y_buffer;
     }
-    
+
     return video->frame->data[0];
 }
 
 uint8_t* video_get_u_data(video_context_t *video) {
     if (!video->frame) return NULL;
+
+    // OPTIMIZATION: For hardware decode, copy to cached memory
+    if (video->use_hardware_decode && video->frame->data[1]) {
+        // Check if we already copied this frame (avoid duplicate memcpy)
+        if (last_u_source == video->frame->data[1] && cached_u_buffer) {
+            return cached_u_buffer;
+        }
+
+        int uv_height = video->height / 2;
+        size_t u_size = video->frame->linesize[1] * uv_height;
+
+        if (cached_u_size < u_size) {
+            free(cached_u_buffer);
+            cached_u_buffer = malloc(u_size);
+            cached_u_size = cached_u_buffer ? u_size : 0;
+            if (!cached_u_buffer) return video->frame->data[1]; // Fallback
+        }
+
+        memcpy(cached_u_buffer, video->frame->data[1], u_size);
+        last_u_source = video->frame->data[1];
+        return cached_u_buffer;
+    }
+
     return video->frame->data[1];
 }
 
 uint8_t* video_get_v_data(video_context_t *video) {
     if (!video->frame) return NULL;
+
+    // OPTIMIZATION: For hardware decode, copy to cached memory
+    if (video->use_hardware_decode && video->frame->data[2]) {
+        // Check if we already copied this frame (avoid duplicate memcpy)
+        if (last_v_source == video->frame->data[2] && cached_v_buffer) {
+            return cached_v_buffer;
+        }
+
+        int uv_height = video->height / 2;
+        size_t v_size = video->frame->linesize[2] * uv_height;
+
+        if (cached_v_size < v_size) {
+            free(cached_v_buffer);
+            cached_v_buffer = malloc(v_size);
+            cached_v_size = cached_v_buffer ? v_size : 0;
+            if (!cached_v_buffer) return video->frame->data[2]; // Fallback
+        }
+
+        memcpy(cached_v_buffer, video->frame->data[2], v_size);
+        last_v_source = video->frame->data[2];
+        return cached_v_buffer;
+    }
+
     return video->frame->data[2];
 }
 
