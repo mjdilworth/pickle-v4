@@ -4,6 +4,11 @@
 #include <string.h>
 #include <math.h>
 
+// Allow keystone quads to shrink dramatically while still rejecting
+// truly degenerate (near-zero area) configurations.
+#define KEYSTONE_MIN_AREA_MOVE   0.001f  // ~0.025% of full quad
+#define KEYSTONE_MIN_AREA_MATRIX 0.0005f // Keep solver guard slightly tighter
+
 // Matrix math utilities for perspective transformation
 static void matrix_identity(float *matrix) {
     memset(matrix, 0, 16 * sizeof(float));
@@ -111,7 +116,7 @@ static void calculate_perspective_matrix(float *matrix, const point_t corners[4]
     area = 0.5f * fabs(area);
     
     // If area is too small, use identity matrix to prevent instability
-    if (area < 0.01f) {
+    if (area < KEYSTONE_MIN_AREA_MATRIX) {
         // printf("Warning: Near-degenerate keystone configuration detected (area: %f). Using identity.\n", area);
         matrix_identity(matrix);
         return;
@@ -250,7 +255,7 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
         area = 0.5f * fabs(area);
         
         // If the resulting area is too small, revert the movement
-        if (area < 0.1f) {
+        if (area < KEYSTONE_MIN_AREA_MOVE) {
             // printf("Invalid keystone configuration prevented (area too small)\n");
             corner->x = prev_x;
             corner->y = prev_y;
