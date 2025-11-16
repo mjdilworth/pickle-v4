@@ -393,9 +393,10 @@ static int init_hw_accel_context(video_context_t *video) {
     
     // Validate dimensions
     if (frame_width <= 0 || frame_height <= 0) {
-        if (hw_debug_enabled) {
-            printf("[HWACCEL] ⚠ Warning: Invalid frame dimensions %dx%d, using 1920x1080\n", frame_width, frame_height);
-        }
+        fprintf(stderr, "[HWACCEL] ⚠ ERROR: Could not determine video dimensions from codec or stream!\n");
+        fprintf(stderr, "[HWACCEL] Codec dimensions: %dx%d, Stream dimensions: unknown\n",
+                video->codec_ctx->width, video->codec_ctx->height);
+        fprintf(stderr, "[HWACCEL] Using safe fallback: 1920x1080 (video may not display correctly)\n");
         frame_width = 1920;
         frame_height = 1080;
     }

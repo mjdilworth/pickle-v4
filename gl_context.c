@@ -510,6 +510,33 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
     return 0;
 }
 
+// Calculate aspect-ratio-preserving MVP matrix
+// Prevents video stretching by letterboxing/pillarboxing as needed
+static void calculate_aspect_ratio_matrix(float *mvp_matrix,
+                                         int video_width, int video_height,
+                                         int display_width, int display_height) {
+    // Calculate aspect ratios
+    float video_aspect = (float)video_width / (float)video_height;
+    float display_aspect = (float)display_width / (float)display_height;
+
+    // Initialize as identity matrix
+    for (int i = 0; i < 16; i++) {
+        mvp_matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;  // 1 on diagonal, 0 elsewhere
+    }
+
+    // Scale to preserve aspect ratio
+    if (video_aspect > display_aspect) {
+        // Video is wider than display - add pillarbox (black bars left/right)
+        // Scale Y to fit, X stays at 1.0
+        mvp_matrix[5] = display_aspect / video_aspect;  // scale_y
+    } else if (video_aspect < display_aspect) {
+        // Video is taller than display - add letterbox (black bars top/bottom)
+        // Scale X to fit, Y stays at 1.0
+        mvp_matrix[0] = video_aspect / display_aspect;  // scale_x
+    }
+    // else: aspects match perfectly, no scaling needed (identity matrix)
+}
+
 void gl_setup_buffers(gl_context_t *gl) {
     // Quad vertices (position + texture coordinates)  
     float vertices[] = {
@@ -793,13 +820,9 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
         glEnableVertexAttribArray(1);
         
-        // Set MVP matrix (identity - only once)
-        float mvp_matrix[16] = {
-            1, 0, 0, 0,
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            0, 0, 0, 1
-        };
+        // Set MVP matrix with aspect ratio preservation
+        float mvp_matrix[16];
+        calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
         glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
         
         // Explicitly disable blending - overlays might have enabled it
@@ -2092,13 +2115,9 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
 
-    // Set MVP matrix (identity)
-    float mvp_matrix[16] = {
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1
-    };
+    // Set MVP matrix with aspect ratio preservation
+    float mvp_matrix[16];
+    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
 
     // Disable blending and depth test

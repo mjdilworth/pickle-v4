@@ -1,9 +1,10 @@
 #ifndef PRODUCTION_CONFIG_H
 #define PRODUCTION_CONFIG_H
 
-// Production safety limits
-#define MAX_VIDEO_WIDTH 3840
-#define MAX_VIDEO_HEIGHT 2160
+// Production safety limits - Support up to 8K for future-proofing
+// Raspberry Pi 4 can decode 4K at 60fps, but we allow higher for flexibility
+#define MAX_VIDEO_WIDTH 7680   // 8K width
+#define MAX_VIDEO_HEIGHT 4320  // 8K height
 #define MAX_FRAME_SIZE (MAX_VIDEO_WIDTH * MAX_VIDEO_HEIGHT * 3 / 2)
 #define MAX_DECODE_ATTEMPTS 3
 #define DECODE_TIMEOUT_MS 5000
