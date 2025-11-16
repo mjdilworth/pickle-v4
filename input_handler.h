@@ -39,8 +39,7 @@ typedef struct {
     bool gamepad_increase_step;         // R1: increase step size
     bool gamepad_reset_keystone;        // SELECT: reset keystone
     bool gamepad_toggle_mode;           // START: toggle keystone mode
-    bool gamepad_toggle_all_corners;    // Y button: toggle corners on ALL keystones
-    bool gamepad_toggle_all_borders;    // B button: toggle borders on ALL keystones
+    bool gamepad_toggle_corner_border;  // B button: toggle both borders and corners
     uint64_t gamepad_start_select_time; // For START+SELECT hold detection
     bool debug_gamepad;                 // Debug flag for logging button presses
 } input_context_t;

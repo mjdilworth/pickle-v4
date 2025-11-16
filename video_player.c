@@ -884,30 +884,18 @@ void app_run(app_context_t *app) {
                 app->input->gamepad_toggle_mode = false;
             }
             
-            // A button: Toggle corners on ALL keystones
-            if (app->input->gamepad_toggle_all_corners) {
+            // B button: Toggle both corners and borders on all keystones
+            if (app->input->gamepad_toggle_corner_border) {
                 if (app->keystone2) {
-                    // Two videos: toggle BOTH keystones
                     app->keystone->show_corners = !app->keystone->show_corners;
-                    app->keystone2->show_corners = !app->keystone2->show_corners;
-                } else {
-                    // Single video: toggle only keystone 1
-                    app->keystone->show_corners = !app->keystone->show_corners;
-                }
-                app->input->gamepad_toggle_all_corners = false;
-            }
-            
-            // B button: Toggle borders on ALL keystones
-            if (app->input->gamepad_toggle_all_borders) {
-                if (app->keystone2) {
-                    // Two videos: toggle BOTH keystones
                     app->keystone->show_border = !app->keystone->show_border;
+                    app->keystone2->show_corners = !app->keystone2->show_corners;
                     app->keystone2->show_border = !app->keystone2->show_border;
                 } else {
-                    // Single video: toggle only keystone 1
+                    app->keystone->show_corners = !app->keystone->show_corners;
                     app->keystone->show_border = !app->keystone->show_border;
                 }
-                app->input->gamepad_toggle_all_borders = false;
+                app->input->gamepad_toggle_corner_border = false;
             }
         }
 

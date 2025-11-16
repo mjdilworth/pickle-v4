@@ -581,9 +581,7 @@ void input_update(input_context_t *input) {
                         if (js.number == JS_BUTTON_X) {  // Button 3 = TOP button (X)
                             input->gamepad_cycle_corner = true;
                         } else if (js.number == JS_BUTTON_B) {  // Button 0 = BOTTOM button (B)
-                            input->gamepad_toggle_all_borders = true;
-                        } else if (js.number == JS_BUTTON_A) {  // Button 1 = RIGHT button (A)
-                            input->gamepad_toggle_all_corners = true;
+                            input->gamepad_toggle_corner_border = true;
                         } else if (js.number == JS_BUTTON_Y) {  // Button 4 = LEFT button (Y)
                             input->toggle_help = true;
                         } else if (js.number == JS_BUTTON_L1) {
