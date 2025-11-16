@@ -1110,21 +1110,29 @@ void app_run(app_context_t *app) {
         
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
-        
+
+        // Initialize overlay visibility flags (needed for goto skip path)
+        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners ||
+                                                     app->keystone->show_border));
+        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners ||
+                                                       app->keystone2->show_border));
+
+        // OPTIMIZATION: Blank video when help overlay is displayed (cleaner, faster, no flicker)
+        bool help_visible = (app->keystone && app->keystone->show_help) ||
+                           (app->keystone2 && app->keystone2->show_help);
+
+        if (help_visible) {
+            // Just render black screen when help is up
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            // Skip video rendering entirely - will render help overlay below
+            goto skip_video_render;
+        }
+
         // Check if DMA buffer is available for zero-copy rendering
         // Try KMS direct scanout first, then fall back to OpenGL if not available
         bool has_dma = video_has_dma_buffer(app->video);
         bool used_kms_overlay = false;  // Track if we used KMS path (no GL work needed)
-        
-        // CRITICAL: Check if any overlays are visible BEFORE deciding rendering path
-        // KMS overlay plane is opaque and will hide OpenGL-rendered borders/corners!
-        // Must use OpenGL path when overlays need to be visible
-        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners || 
-                                                     app->keystone->show_border || 
-                                                     app->keystone->show_help));
-        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners || 
-                                                       app->keystone2->show_border || 
-                                                       app->keystone2->show_help));
         bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
         
         // PRODUCTION FIX: Always use CPU/OpenGL path for hardware decode
@@ -1163,10 +1171,10 @@ void app_run(app_context_t *app) {
                 // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
                 // This is handled in the standard overlay rendering section below
             }
-        } else if (false && has_dma && !need_opengl_for_overlays) {
-            // OPENGL DMA PATH (when KMS overlay not available BUT no overlays needed)
-            // NOTE: On Pi 4, EGL DMA import has driver issues (GL error 0x502)
-            // Skip this path when overlays are visible - use CPU path instead
+        } else if (has_dma) {
+            // OPENGL DMA PATH - Zero-copy rendering with DRM PRIME
+            // Works perfectly with overlays - they're rendered on top after video
+            // Keystone correction works fine - it's a GPU shader transformation
             int dma_fd = video_get_dma_fd(app->video);
             static int dma_render_count = 0;
             if (frame_count == 1 || (dma_render_count < 3)) {
@@ -1199,15 +1207,11 @@ void app_run(app_context_t *app) {
             }
         } else {
             // CPU RENDERING PATH
-            // Used when: no DMA buffers, OR overlays visible (need CPU path for compositing)
+            // Used only when: no DMA buffers available (software decode)
             // PRODUCTION: Only log once on startup
             static bool cpu_path_logged = false;
             if (!cpu_path_logged) {
-                if (need_opengl_for_overlays) {
-                    printf("[Render] Using CPU upload path (overlays visible)\n");
-                } else {
-                    printf("[Render] Using CPU upload path (software decode)\n");
-                }
+                printf("[Render] Using CPU upload path (software decode)\n");
                 cpu_path_logged = true;
             }
             
@@ -1240,7 +1244,9 @@ void app_run(app_context_t *app) {
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
-        
+
+skip_video_render:  // Jump here when help is visible to skip video rendering
+
         // Time overlay rendering
         clock_gettime(CLOCK_MONOTONIC, &overlay_start);
         
@@ -1284,7 +1290,16 @@ void app_run(app_context_t *app) {
                 // Clear error queue
             }
         }
-        
+
+        // ALWAYS render help overlay if visible (even when other overlays aren't)
+        // This allows help to display on blank screen when video is hidden
+        if (app->keystone && app->keystone->show_help) {
+            gl_render_help_overlay(app->gl, app->keystone);
+        }
+        if (app->keystone2 && app->keystone2->show_help) {
+            gl_render_help_overlay(app->gl, app->keystone2);
+        }
+
         // Render overlays for second keystone
         // PRODUCTION FIX: Only render keystone2 overlays when video2 has valid frame data
         // This prevents flickering during initial startup before first frame is decoded

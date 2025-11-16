@@ -1421,70 +1421,79 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     if (!keystone || !keystone->show_help) {
         return; // Don't render help overlay if not visible
     }
+
+    // OPTIMIZATION: Cache text geometry - only generate once on first display
+    static bool help_initialized = false;
+    static float help_bg_vertices[24]; // Background rectangle
+    static float help_text_vertices[30000]; // Text geometry
+    static int text_vertex_count = 0;
+
+    if (!help_initialized) {
+        // Generate background vertices (only once)
+        // Bottom-left
+        help_bg_vertices[0] = -0.9f; help_bg_vertices[1] = -0.7f;
+        help_bg_vertices[2] = 0.0f; help_bg_vertices[3] = 0.0f; help_bg_vertices[4] = 0.0f; help_bg_vertices[5] = 0.95f;
+        // Bottom-right
+        help_bg_vertices[6] = 0.9f; help_bg_vertices[7] = -0.7f;
+        help_bg_vertices[8] = 0.0f; help_bg_vertices[9] = 0.0f; help_bg_vertices[10] = 0.0f; help_bg_vertices[11] = 0.95f;
+        // Top-right
+        help_bg_vertices[12] = 0.9f; help_bg_vertices[13] = 0.7f;
+        help_bg_vertices[14] = 0.0f; help_bg_vertices[15] = 0.0f; help_bg_vertices[16] = 0.0f; help_bg_vertices[17] = 0.95f;
+        // Top-left
+        help_bg_vertices[18] = -0.9f; help_bg_vertices[19] = 0.7f;
+        help_bg_vertices[20] = 0.0f; help_bg_vertices[21] = 0.0f; help_bg_vertices[22] = 0.0f; help_bg_vertices[23] = 0.95f;
     
-    // Create help overlay with text - using vertex colors (x, y, r, g, b, a)
-    float help_vertices[60000]; // Large buffer for text vertices with color
-    int vertex_count = 0;
-    
-    // Large centered background with darker semi-transparent black for better readability
-    // Bottom-left
-    help_vertices[0] = -0.9f; help_vertices[1] = -0.7f;
-    help_vertices[2] = 0.0f; help_vertices[3] = 0.0f; help_vertices[4] = 0.0f; help_vertices[5] = 0.95f;
-    // Bottom-right
-    help_vertices[6] = 0.9f; help_vertices[7] = -0.7f;
-    help_vertices[8] = 0.0f; help_vertices[9] = 0.0f; help_vertices[10] = 0.0f; help_vertices[11] = 0.95f;
-    // Top-right
-    help_vertices[12] = 0.9f; help_vertices[13] = 0.7f;
-    help_vertices[14] = 0.0f; help_vertices[15] = 0.0f; help_vertices[16] = 0.0f; help_vertices[17] = 0.95f;
-    // Top-left
-    help_vertices[18] = -0.9f; help_vertices[19] = 0.7f;
-    help_vertices[20] = 0.0f; help_vertices[21] = 0.0f; help_vertices[22] = 0.0f; help_vertices[23] = 0.95f;
-    vertex_count = 4;
-    
-    // Compact help text - keyboard and gamepad controls
-    const char* help_text =
-        "Copyright Dilworth Creative LLC\n"
-        "\n"
-        "PICKLE KEYSTONE\n"
-        "\n"
-        "KEYBOARD\n"
-        "1234   Corner Select\n"
-        "Arrows Move Corner\n"
-        "S      Save\n"
-        "R      Reset\n"
-        "C      Toggle Corners\n"
-        "B      Toggle Border\n"
-        "W      WiFi Connect\n"
-        "H      Toggle Help\n"
-        "Q      Quit\n"
-        "\n"
-        "GAMEPAD\n"
-        "X      Cycle Corner\n"
-        "DPAD   Move Corner\n"
-        "A      Show Corners\n"
-        "B      Show Border\n"
-        "Y      Show Help\n"
-        "L1     Step Down\n"
-        "R1     Step Up\n"
-        "START  Save\n"
-        "SELECT Reset";
-    
-    // Update help VBO with background geometry
+        // Generate text geometry (only once)
+        const char* help_text =
+            "Copyright Dilworth Creative LLC\n"
+            "\n"
+            "PICKLE KEYSTONE\n"
+            "\n"
+            "KEYBOARD\n"
+            "1234   Corner Select\n"
+            "Arrows Move Corner\n"
+            "S      Save\n"
+            "R      Reset\n"
+            "C      Toggle Corners\n"
+            "B      Toggle Border\n"
+            "W      WiFi Connect\n"
+            "H      Toggle Help\n"
+            "Q      Quit\n"
+            "\n"
+            "GAMEPAD\n"
+            "X      Cycle Corner\n"
+            "DPAD   Move Corner\n"
+            "A      Show Corners\n"
+            "B      Show Border\n"
+            "Y      Show Help\n"
+            "L1     Step Down\n"
+            "R1     Step Up\n"
+            "START  Save\n"
+            "SELECT Reset";
+
+        draw_text_simple(help_text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
+        help_initialized = true;
+        printf("[HELP] Text geometry generated: %d vertices (cached for reuse)\n", text_vertex_count);
+    }
+
+    // Now render the cached geometry (fast!)
     glBindBuffer(GL_ARRAY_BUFFER, gl->help_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), help_vertices, GL_DYNAMIC_DRAW);
     
+    // Upload cached background geometry
+    glBufferData(GL_ARRAY_BUFFER, 4 * 6 * sizeof(float), help_bg_vertices, GL_DYNAMIC_DRAW);
+
     // Use corner shader program for help overlay rendering
     glUseProgram(gl->corner_program);
-    
+
     // Set up vertex attributes (interleaved position + color)
     int stride = 6 * sizeof(float); // x, y, r, g, b, a
     glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
-    
+
     // Color attribute at location 1
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
-    
+
     // Set identity matrix for MVP
     float identity[16] = {
         1, 0, 0, 0,
@@ -1493,51 +1502,78 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
         0, 0, 0, 1
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
-    
+
     // Enable blending for transparency
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    
+
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
-    
+
     // Draw help overlay background (semi-transparent black from vertex colors)
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4); // Background rectangle
-    
-    // Now render text with better formatting
-    float text_vertices[30000]; // Increased buffer size for longer help text
-    int text_vertex_count = 0;
-    draw_text_simple(text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
-    
-    // Upload text geometry with 2-float format
-    glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 2 * sizeof(float), text_vertices, GL_DYNAMIC_DRAW);
-    
-    // Update vertex attribute for 2-float format
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-    glDisableVertexAttribArray(1); // Disable color attribute
-    
-    // Create bright white color vertices for text (better readability)
-    float colored_vertices[180000]; // Large buffer with colors (30000 * 6)
-    for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
-        colored_vertices[i * 6 + 0] = text_vertices[i * 2 + 0]; // x
-        colored_vertices[i * 6 + 1] = text_vertices[i * 2 + 1]; // y
-        colored_vertices[i * 6 + 2] = 1.0f; // r - bright white
-        colored_vertices[i * 6 + 3] = 1.0f; // g
-        colored_vertices[i * 6 + 4] = 1.0f; // b
-        colored_vertices[i * 6 + 5] = 1.0f; // a
+
+    // OPTIMIZATION: Reuse cached text geometry (no regeneration every frame!)
+    // Create bright white color vertices for text using cached geometry
+    static float colored_vertices[180000]; // Persistent buffer
+    static bool colors_initialized = false;
+
+    if (!colors_initialized) {
+        // Only add colors once
+        for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
+            colored_vertices[i * 6 + 0] = help_text_vertices[i * 2 + 0]; // x
+            colored_vertices[i * 6 + 1] = help_text_vertices[i * 2 + 1]; // y
+            colored_vertices[i * 6 + 2] = 1.0f; // r - bright white
+            colored_vertices[i * 6 + 3] = 1.0f; // g
+            colored_vertices[i * 6 + 4] = 1.0f; // b
+            colored_vertices[i * 6 + 5] = 1.0f; // a
+        }
+        colors_initialized = true;
     }
-    
-    // Upload text with colors
+
+    // Upload cached text with colors (just one memcpy, no regeneration!)
     glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 6 * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
     glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
-    
-    // Draw all text pixels (each character pixel is a 4-vertex rectangle)
-    int text_pixels = text_vertex_count / 4; // Number of character pixels
-    for (int i = 0; i < text_pixels; i++) {
-        glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+
+    // OPTIMIZATION: Draw all text in ONE batched call instead of 3000+ separate calls!
+    // Each rectangle is 4 vertices (triangle fan), draw them all as quads
+    // Use GL_POINTS with point sprites would be better, but GLES doesn't support it well
+    // So we'll convert to indexed triangles for a single draw call
+    static GLuint text_indices_vbo = 0;
+    static int last_text_vertex_count = 0;
+
+    if (text_indices_vbo == 0) {
+        glGenBuffers(1, &text_indices_vbo);
     }
+
+    // Generate indices if needed (convert quads to triangles)
+    if (text_vertex_count != last_text_vertex_count) {
+        int num_quads = text_vertex_count / 4;
+        GLuint *indices = malloc(num_quads * 6 * sizeof(GLuint)); // 2 triangles per quad
+
+        for (int i = 0; i < num_quads; i++) {
+            int base = i * 4;
+            indices[i * 6 + 0] = base + 0;
+            indices[i * 6 + 1] = base + 1;
+            indices[i * 6 + 2] = base + 2;
+            indices[i * 6 + 3] = base + 0;
+            indices[i * 6 + 4] = base + 2;
+            indices[i * 6 + 5] = base + 3;
+        }
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, text_indices_vbo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, num_quads * 6 * sizeof(GLuint), indices, GL_STATIC_DRAW);
+        free(indices);
+        last_text_vertex_count = text_vertex_count;
+    } else {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, text_indices_vbo);
+    }
+
+    // Draw ALL text in ONE call!
+    int num_quads = text_vertex_count / 4;
+    glDrawElements(GL_TRIANGLES, num_quads * 6, GL_UNSIGNED_INT, 0);
     
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
@@ -2042,13 +2078,37 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
-    
+
+    // Set up VAO/VBO state (critical for rendering to work!)
     glUseProgram(gl->program);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Texture coordinate attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Set MVP matrix (identity)
+    float mvp_matrix[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+
+    // Disable blending and depth test
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
     
     // YUV420P format via DMA buffer (3 separate planes)
-    // Use actual plane layout from hardware decoder
-    int uv_width = plane_pitches[1];   // U plane pitch = width
-    int uv_height = (plane_offsets[2] - plane_offsets[1]) / plane_pitches[1];  // Calculate from offsets
+    // Use actual video dimensions, not buffer dimensions (hardware may pad buffers)
+    int uv_width = width / 2;   // UV is half resolution of Y
+    int uv_height = height / 2;
     
     struct timespec dma_start, dma_end;
     clock_gettime(CLOCK_MONOTONIC, &dma_start);
@@ -2170,10 +2230,13 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(gl->u_texture_v, 2);
     
+    // Set flip_y uniform (video is encoded upside down)
+    glUniform1f(gl->u_flip_y, 1.0f);
+
     // Bind keystone matrix and render
-    glUniformMatrix3fv(gl->u_keystone_matrix, 1, GL_FALSE, (float*)&keystone->matrix);
-    glBindVertexArray(gl->vao);
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+    const float *keystone_matrix = keystone_get_matrix(keystone);
+    glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     
     // Check for GL errors (only report first few)
     GLenum err = glGetError();

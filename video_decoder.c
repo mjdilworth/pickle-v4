@@ -785,25 +785,16 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             printf("[HW_DECODE] V4L2: Note - decoder may buffer 20-30 packets before first frame\n");
         }
         
-        // PRODUCTION FIX: Skip DRM PRIME hardware acceleration setup
-        // We're using CPU/OpenGL upload path (not zero-copy DMA) because:
-        // 1. KMS overlay plane cannot apply keystone transformation
-        // 2. OpenGL overlays (corners/borders/help) require CPU compositing
-        // 3. DRM_PRIME frames have NULL data[1]/data[2] pointers (U/V planes)
-        //    which causes solid green video when trying to upload to GPU
-        //
-        // By NOT calling init_hw_accel_context(), V4L2 M2M will output YUV420P
-        // to system RAM (mmap mode), giving us CPU-accessible Y/U/V pointers
-        // that work with the OpenGL texture upload path.
-        //
-        // Hardware decode still provides performance benefits:
-        // - H.264 decode offloaded to bcm2835-codec (saves CPU)
-        // - Only the texture upload uses CPU (which is fast with SIMD)
-        // - Much better than software decode + texture upload
-        if (hw_debug_enabled) {
-            printf("[HW_DECODE] Using V4L2 M2M with CPU-accessible YUV buffers (mmap mode)\n");
-            printf("[HW_DECODE] This enables keystone correction and overlay rendering\n");
-            printf("[HW_DECODE] Hardware decode still provides significant performance benefits\n");
+        // Initialize DRM PRIME hardware acceleration for zero-copy rendering
+        // This enables V4L2 M2M to output directly to GPU memory (DRM_PRIME format)
+        // Keystone correction will work via GPU shaders on DMA-imported textures
+        if (init_hw_accel_context(video) < 0) {
+            fprintf(stderr, "[HW_DECODE] Failed to initialize DRM PRIME context\n");
+            fprintf(stderr, "[HW_DECODE] Falling back to CPU-accessible YUV buffers (slower but compatible)\n");
+            // Continue without DRM PRIME - will use system RAM buffers
+        } else if (hw_debug_enabled) {
+            printf("[HW_DECODE] ✓ DRM PRIME hardware acceleration initialized\n");
+            printf("[HW_DECODE] Zero-copy rendering enabled - frames will be in GPU memory\n");
         }
         
         // Enable FFmpeg debug logging to see V4L2 M2M internals (only in debug mode)
@@ -1731,17 +1722,17 @@ bool video_has_dma_buffer(video_context_t *video) {
     if (!video || !video->frame) {
         return false;
     }
-    
+
     // Check if we have a valid DMA FD from DRM PRIME frame extraction
     // AND verify the frame format is actually DRM_PRIME
-    if (video->use_hardware_decode && 
-        video->dma_fd >= 0 && 
+    if (video->use_hardware_decode &&
+        video->dma_fd >= 0 &&
         video->frame->format == AV_PIX_FMT_DRM_PRIME) {
         // We have a valid DMA file descriptor ready for GPU import
         // CPU pointers (data[1], data[2]) will be NULL for DRM_PRIME - that's expected
         return true;
     }
-    
+
     return false;
 }
 
