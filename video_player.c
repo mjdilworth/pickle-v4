@@ -1049,17 +1049,32 @@ void app_run(app_context_t *app) {
                                 async_decode_request_frame(app->async_decoder);
                             }
                         }
-                    } else if (async_decode_frame_ready(app->async_decoder)) {
-                        // Async frame is ready, use it (non-blocking after first frame)
-                        video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                        
-                        if (y_data2 != NULL) {
-                            frame_count2++;
+                    } else {
+                        // CRITICAL FIX: Wait for frame to be ready (blocking, like first frame)
+                        // This prevents flickering caused by reusing stale frames
+                        // Use 50ms timeout - generous enough for async decoder but not too blocking
+                        if (async_decode_wait_frame(app->async_decoder, 50)) {
+                            video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+
+                            if (y_data2 != NULL) {
+                                frame_count2++;
+                            }
+
+                            // Request next frame from async decoder
+                            async_decode_request_frame(app->async_decoder);
+                        } else {
+                            // Timeout: async decoder is slow/stuck
+                            // If we have NO valid frame data, render black to show something
+                            static int timeout_count = 0;
+                            if (timeout_count < 5) {
+                                fprintf(stderr, "[ASYNC] Video 2 frame timeout (decoder slow)\n");
+                                timeout_count++;
+                            }
+                            // Static YUV pointers retain last valid frame data (if any)
                         }
-                        
-                        // Request next frame from async decoder
-                        async_decode_request_frame(app->async_decoder);
-                    } else if (video_is_eof(app->video2)) {
+                    }
+
+                    if (video_is_eof(app->video2)) {
                         if (app->loop_playback) {
                             video_seek(app->video2, 0);
                             first_frame_decoded2 = false;
@@ -1228,18 +1243,60 @@ void app_run(app_context_t *app) {
         }
         
         // Render second video with second keystone (don't clear screen)
-        // PRODUCTION FIX: Use static YUV pointers, not video_data2 local variable
-        // The local video_data2 is NULL when async decoder isn't ready, causing flicker
-        // The static pointers hold the last valid frame and should always render
-        if (app->video2 && app->keystone2 && y_data2) {
+        if (app->video2 && app->keystone2) {
             // Get dimensions (safe to call anytime)
             int video_width2 = app->video2->width;
             int video_height2 = app->video2->height;
+            bool video2_rendered = false;
 
-            // Use static YUV pointers that persist across frames
-            if (u_data2 && v_data2 && y_stride2 > 0) {
-                gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
-                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+            // Check if second video has DMA buffer (hardware decode)
+            bool has_dma2 = video_has_dma_buffer(app->video2);
+
+            if (has_dma2) {
+                // HARDWARE DMA PATH - Second video with zero-copy rendering
+                int dma_fd2 = video_get_dma_fd(app->video2);
+                static int dma_check_count = 0;
+                if (dma_check_count < 10) {
+                    fprintf(stderr, "[DEBUG] Video2: has_dma=%d, dma_fd=%d\n", has_dma2, dma_fd2);
+                    dma_check_count++;
+                }
+                if (dma_fd2 >= 0) {
+                    // Get actual plane layout from hardware decoder
+                    int plane_offsets2[3] = {0, 0, 0};
+                    int plane_pitches2[3] = {0, 0, 0};
+                    video_get_dma_plane_layout(app->video2, plane_offsets2, plane_pitches2);
+                    gl_render_frame_dma(app->gl, dma_fd2, video_width2, video_height2,
+                                       plane_offsets2, plane_pitches2,
+                                       app->drm, app->keystone2, false, 1);
+                    video2_rendered = true;
+                } else {
+                    // DMA FD not available, fall back to CPU upload
+                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                    if (y_data2 && u_data2 && v_data2) {
+                        gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
+                                      y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                        video2_rendered = true;
+                    }
+                }
+            } else {
+                // CPU PATH - Second video with software decode
+                // Use static YUV pointers that persist across frames
+                if (y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
+                    gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
+                                  y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                    video2_rendered = true;
+                }
+            }
+
+            // SAFETY: If video 2 failed to render, render black frame to prevent disappearing
+            if (!video2_rendered) {
+                static int black_frame_count = 0;
+                if (black_frame_count < 5) {
+                    fprintf(stderr, "[VIDEO2] No valid frame data, rendering black\n");
+                    black_frame_count++;
+                }
+                gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
+                              0, 0, 0, app->drm, app->keystone2, false, 1);
             }
         }
         

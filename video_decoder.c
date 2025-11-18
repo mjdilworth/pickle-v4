@@ -996,12 +996,25 @@ int video_decode_frame(video_context_t *video) {
                         AVDRMObjectDescriptor *obj = &drm_desc->objects[0];
                         new_dma_fd = obj->fd;
                         drm_size = obj->size;
-                        
+
+                        // CRITICAL: Extract plane layout for EVERY DRM_PRIME frame
+                        // This ensures all videos get their plane layout, not just the first video
+                        // (frame_count is a static variable shared across all videos!)
+                        for (int layer = 0; layer < drm_desc->nb_layers; layer++) {
+                            AVDRMLayerDescriptor *layer_desc = &drm_desc->layers[layer];
+                            for (int p = 0; p < layer_desc->nb_planes && p < 3; p++) {
+                                AVDRMPlaneDescriptor *plane = &layer_desc->planes[p];
+                                // Store plane layout for zero-copy rendering
+                                video->dma_plane_offset[p] = plane->offset;
+                                video->dma_plane_pitch[p] = plane->pitch;
+                            }
+                        }
+
                         if (frame_count == 1) {
                             printf("[ZERO-COPY] ✓✓✓ DRM PRIME frame detected!\n");
                             printf("[ZERO-COPY] DMA Buffer FD=%d, Size=%zu bytes\n", new_dma_fd, drm_size);
                             printf("[ZERO-COPY] Layers: %d, Objects: %d\n", drm_desc->nb_layers, drm_desc->nb_objects);
-                            
+
                             // Show layer information (Y/UV planes)
                             for (int layer = 0; layer < drm_desc->nb_layers; layer++) {
                                 AVDRMLayerDescriptor *layer_desc = &drm_desc->layers[layer];
@@ -1011,13 +1024,10 @@ int video_decode_frame(video_context_t *video) {
                                     AVDRMPlaneDescriptor *plane = &layer_desc->planes[p];
                                     printf("[ZERO-COPY]     Plane %d: offset=%ld, pitch=%ld\n",
                                            p, (long)plane->offset, (long)plane->pitch);
-                                    // Store plane layout for zero-copy rendering
-                                    video->dma_plane_offset[p] = plane->offset;
-                                    video->dma_plane_pitch[p] = plane->pitch;
                                 }
                             }
                         }
-                        
+
                         video->supports_dma_export = true;
                     } else if (frame_count == 1) {
                         printf("[ZERO-COPY] ⚠ DRM PRIME format but no descriptor objects!\n");

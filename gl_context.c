@@ -816,22 +816,23 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
         
-        // Texture coordinate attribute  
+        // Texture coordinate attribute
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
         glEnableVertexAttribArray(1);
-        
-        // Set MVP matrix with aspect ratio preservation
-        float mvp_matrix[16];
-        calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
-        glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
-        
+
         // Explicitly disable blending - overlays might have enabled it
         glDisable(GL_BLEND);
-        
+
         // Disable depth test - make sure video is always visible
         glDisable(GL_DEPTH_TEST);
     }
-    
+
+    // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
+    // This is OUTSIDE the video_index==0 block so each video gets its own aspect ratio
+    float mvp_matrix[16];
+    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
+    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+
     // Set keystone matrix (may change dynamically)
     const float *keystone_matrix = keystone_get_matrix(keystone);
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
@@ -2089,12 +2090,25 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         fprintf(stderr, "[DMA] Invalid arguments (gl=%p, fd=%d)\n", (void*)gl, dma_fd);
         return;
     }
-    
+
     if (!gl->supports_egl_image) {
         fprintf(stderr, "[DMA] EGL image not supported\n");
         return;
     }
-    
+
+    // DEBUG: Log DMA rendering
+    static int dma_render_count[2] = {0, 0};
+    if (dma_render_count[video_index] < 3) {
+        printf("[DMA_RENDER] Video %d: fd=%d, size=%dx%d, clear=%d\n",
+               video_index, dma_fd, width, height, clear_screen);
+        dma_render_count[video_index]++;
+    }
+
+    // Select appropriate texture set based on video index
+    GLuint tex_y = (video_index == 0) ? gl->texture_y : gl->texture_y2;
+    GLuint tex_u = (video_index == 0) ? gl->texture_u : gl->texture_u2;
+    GLuint tex_v = (video_index == 0) ? gl->texture_v : gl->texture_v2;
+
     // Set up rendering state
     glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
     if (clear_screen && video_index == 0) {
@@ -2102,27 +2116,30 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
 
-    // Set up VAO/VBO state (critical for rendering to work!)
-    glUseProgram(gl->program);
-    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+    // OPTIMIZATION: Only set up GL state once per frame (for video 0)
+    // Video 1 reuses the same state - only textures and matrices change
+    if (video_index == 0) {
+        glUseProgram(gl->program);
+        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
 
-    // Position attribute
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
+        // Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
 
-    // Texture coordinate attribute
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
+        // Texture coordinate attribute
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
 
-    // Set MVP matrix with aspect ratio preservation
+        // Disable blending and depth test
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+    }
+
+    // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
     float mvp_matrix[16];
     calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
-
-    // Disable blending and depth test
-    glDisable(GL_BLEND);
-    glDisable(GL_DEPTH_TEST);
     
     // YUV420P format via DMA buffer (3 separate planes)
     // Use actual video dimensions, not buffer dimensions (hardware may pad buffers)
@@ -2147,15 +2164,16 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
         EGL_NONE
     };
-    
+
     EGLImage y_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
                                          EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, y_attrs);
     EGLint egl_err = eglGetError();
     if (y_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        static int err_count = 0;
-        if (err_count < 3) {
-            fprintf(stderr, "[DMA] Y plane import failed: 0x%x\n", egl_err);
-            err_count++;
+        static int err_count[2] = {0, 0};
+        if (err_count[video_index] < 3) {
+            fprintf(stderr, "[DMA] Video %d Y plane import failed: 0x%x (fd=%d, %dx%d, offset=%d, pitch=%d)\n",
+                    video_index, egl_err, dma_fd, width, height, plane_offsets[0], plane_pitches[0]);
+            err_count[video_index]++;
         }
         return;
     }
@@ -2214,8 +2232,9 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     }
     
     // Bind Y plane to texture unit 0
+    // Bind Y plane to texture unit 0 (use selected texture based on video_index)
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
     if (glEGLImageTargetTexture2DOES) {
         (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)y_image);
     } else {
@@ -2228,20 +2247,20 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(gl->u_texture_y, 0);
-    
-    // Bind U plane to texture unit 1
+
+    // Bind U plane to texture unit 1 (use selected texture based on video_index)
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_u);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
     (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)u_image);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(gl->u_texture_u, 1);
-    
-    // Bind V plane to texture unit 2
+
+    // Bind V plane to texture unit 2 (use selected texture based on video_index)
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
     (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)v_image);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -2256,7 +2275,7 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     const float *keystone_matrix = keystone_get_matrix(keystone);
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    
+
     // Check for GL errors (only report first few)
     GLenum err = glGetError();
     static int gl_err_count = 0;
@@ -2264,16 +2283,42 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         fprintf(stderr, "[DMA] GL error after draw: 0x%x\n", err);
         gl_err_count++;
     }
-    
+
     clock_gettime(CLOCK_MONOTONIC, &dma_end);
-    
+
 cleanup_dma:
-    // Clean up EGL images
+    // Flush GL commands to GPU (non-blocking)
+    // The driver will ensure EGL images aren't freed until GPU is done with them
+    glFlush();
+
+    // CRITICAL: Unbind textures from EGL images before destroying
+    // Bind NULL/0 to each texture to detach the EGL image
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
+    // Now destroy the EGL images
     if (eglDestroyImageKHR) {
         (*eglDestroyImageKHR)(gl->egl_display, y_image);
         (*eglDestroyImageKHR)(gl->egl_display, u_image);
         (*eglDestroyImageKHR)(gl->egl_display, v_image);
     }
+
+    // Reset texture binding
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
