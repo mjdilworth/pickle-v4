@@ -1887,6 +1887,43 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Must manually pace frames to avoid overwhelming the worker thread
         double total_frame_time = decode_time + render_time;
         double remaining_time = target_frame_time - total_frame_time;
+        
+        // PRODUCTION: PTS-based drift compensation to prevent timing skew over long playback
+        // Check if current wall-clock time matches where video playback should be
+        static double first_frame_wall_time = -1.0;
+        static double first_frame_pts_time = -1.0;
+        
+        if (app->video && app->video->frame && app->video->frame->pts != AV_NOPTS_VALUE) {
+            AVStream *stream = app->video->format_ctx->streams[app->video->video_stream_index];
+            if (stream && stream->time_base.den > 0) {
+                // Calculate video PTS in seconds
+                double frame_pts_seconds = (double)app->video->frame->pts * stream->time_base.num / stream->time_base.den;
+                
+                // Initialize baseline on first frame
+                if (first_frame_wall_time < 0) {
+                    first_frame_wall_time = current_total_time;
+                    first_frame_pts_time = frame_pts_seconds;
+                }
+                
+                // Calculate how far into playback we should be
+                double intended_wall_time = first_frame_wall_time + (frame_pts_seconds - first_frame_pts_time);
+                double wall_drift = current_total_time - intended_wall_time;
+                
+                // If we're significantly ahead or behind, adjust sleep time
+                // Max adjustment is +/- 20ms per frame to avoid jitter
+                if (fabs(wall_drift) > 0.001) {  // More than 1ms drift
+                    double drift_correction = wall_drift * 0.05;  // Smooth correction (5% per frame)
+                    drift_correction = (drift_correction > 0.020) ? 0.020 : drift_correction;
+                    drift_correction = (drift_correction < -0.020) ? -0.020 : drift_correction;
+                    remaining_time -= drift_correction;
+                    
+                    if (app->advanced_diagnostics && fabs(wall_drift) > 0.050) {
+                        fprintf(stderr, "[TIMING] Drift correction: %.1fms (total drift: %.1fms)\n",
+                               drift_correction * 1000, wall_drift * 1000);
+                    }
+                }
+            }
+        }
 
         // PRODUCTION FIX: Frame pacing to prevent jumpiness
         // Hardware decode is very fast (<1ms), we must enforce proper frame timing
@@ -1895,6 +1932,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             struct timespec sleep_time;
             sleep_time.tv_sec = 0;
             sleep_time.tv_nsec = (long)(remaining_time * 1000000000);
+            if (sleep_time.tv_nsec < 0) sleep_time.tv_nsec = 0;  // Clamp to 0
             nanosleep(&sleep_time, NULL);
         }
 

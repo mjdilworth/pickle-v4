@@ -1074,7 +1074,29 @@ int video_decode_frame(video_context_t *video) {
                 video->eof_reached = true;
                 return -1;
             } else {
-                printf("Error reading packet: %s\n", av_err2str(read_result));
+                // PRODUCTION: On read error, attempt keyframe recovery instead of stopping
+                fprintf(stderr, "[RECOVERY] Read error: %s, seeking to next keyframe\n", av_err2str(read_result));
+                
+                if (video->format_ctx && video->video_stream_index >= 0) {
+                    AVStream *stream = video->format_ctx->streams[video->video_stream_index];
+                    
+                    // Seek forward by 1 second to find next keyframe
+                    int64_t current_ts = av_gettime_relative();
+                    int64_t seek_ts = (int64_t)((double)current_ts / 1e6 * stream->time_base.den / stream->time_base.num);
+                    seek_ts += stream->time_base.den;  // Add 1 second in stream time
+                    
+                    int seek_result = av_seek_frame(video->format_ctx, video->video_stream_index, 
+                                                   seek_ts, AVSEEK_FLAG_BACKWARD);
+                    if (seek_result >= 0) {
+                        // Flush decoder after seek to clear any corrupted state
+                        avcodec_flush_buffers(video->codec_ctx);
+                        fprintf(stderr, "[RECOVERY] Successfully seeked to keyframe\n");
+                        return -1;  // Retry decode on next call
+                    }
+                }
+                
+                // If seek failed or unavailable, stop playback
+                fprintf(stderr, "[RECOVERY] Seek failed or unavailable, stopping playback\n");
                 return -1;
             }
         }
