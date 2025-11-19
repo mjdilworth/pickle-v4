@@ -9,6 +9,35 @@
 #include <math.h>
 #include <time.h>
 
+// PRODUCTION: Validate EGL context before critical operations
+static bool validate_egl_context(void) {
+    EGLContext ctx = eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT) {
+        fprintf(stderr, "ERROR: EGL context lost\n");
+        return false;
+    }
+    return true;
+}
+
+// PRODUCTION: Check and clear GL errors
+__attribute__((unused))
+static void check_gl_errors(const char *operation) {
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        fprintf(stderr, "GL error in %s: 0x%x\n", operation, err);
+    }
+}
+
+// Double-buffered Pixel Buffer Objects for staging
+#define PBO_RING_COUNT 2
+#define PLANE_Y 0
+#define PLANE_U 1
+#define PLANE_V 2
+
+#ifndef GL_MAP_UNSYNCHRONIZED_BIT
+#define GL_MAP_UNSYNCHRONIZED_BIT 0x0040
+#endif
+
 // NEON SIMD optimization for stride copying on ARM
 #ifdef __ARM_NEON__
     #include <arm_neon.h>
@@ -19,28 +48,21 @@
 
 // OPTIMIZED: NEON-accelerated stride copy for YUV planes
 // Copies 'rows' rows of 'width' bytes from source to destination with strides
-static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src, 
-                                         int width, int height, 
+static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src,
+                                         int width, int height,
                                          int dst_stride, int src_stride) {
     #if HAS_NEON
-    // Use NEON 128-bit vectors for 16-byte copies (2 NEON registers per iteration)
-    int width_16 = (width / 16) * 16;  // Process 16 bytes at a time
-    
+    int width_16 = (width / 16) * 16;
     for (int row = 0; row < height; row++) {
-        // NEON fast path for 16-byte aligned chunks
         uint8_t *s = (uint8_t *)src + (row * src_stride);
         uint8_t *d = dst + (row * dst_stride);
-        
         for (int col = 0; col < width_16; col += 16) {
             uint8x16_t data = vld1q_u8(s + col);
             vst1q_u8(d + col, data);
         }
-        
-        // Scalar copy for remaining bytes
         memcpy(d + width_16, s + width_16, width - width_16);
     }
     #else
-    // Fallback to standard memcpy loop for non-ARM platforms
     for (int row = 0; row < height; row++) {
         memcpy(dst + (row * dst_stride), src + (row * src_stride), width);
     }
@@ -51,91 +73,71 @@ static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src,
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size);
 static void draw_text_simple(float *vertices, int *vertex_count, const char *text, float x, float y, float size);
 
-// GLeglImageOES type definition (in case headers don't provide it)
 #ifndef GLeglImageOES
 typedef void* GLeglImageOES;
 #endif
 
-// EGL extension function pointers for DMA buffer zero-copy rendering
 typedef EGLImage (*eglCreateImageKHR_func)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint *attrib_list);
 typedef void (*glEGLImageTargetTexture2DOES_func)(GLenum target, GLeglImageOES image);
 typedef EGLBoolean (*eglDestroyImageKHR_func)(EGLDisplay dpy, EGLImage image);
 
-// Initialize EGL extension function pointers at runtime
 static eglCreateImageKHR_func eglCreateImageKHR = NULL;
 static glEGLImageTargetTexture2DOES_func glEGLImageTargetTexture2DOES = NULL;
 static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
 
-// EGL DMA buffer extension constants (in case headers don't have them)
 #ifndef EGL_LINUX_DMA_BUF_EXT
 #define EGL_LINUX_DMA_BUF_EXT 0x3270
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE0_FD_EXT
 #define EGL_DMA_BUF_PLANE0_FD_EXT 0x3272
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE0_OFFSET_EXT
 #define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE0_PITCH_EXT
 #define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE1_FD_EXT
 #define EGL_DMA_BUF_PLANE1_FD_EXT 0x3275
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE1_OFFSET_EXT
 #define EGL_DMA_BUF_PLANE1_OFFSET_EXT 0x3276
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE1_PITCH_EXT
 #define EGL_DMA_BUF_PLANE1_PITCH_EXT 0x3277
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE2_FD_EXT
 #define EGL_DMA_BUF_PLANE2_FD_EXT 0x3278
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE2_OFFSET_EXT
 #define EGL_DMA_BUF_PLANE2_OFFSET_EXT 0x3279
 #endif
-
 #ifndef EGL_DMA_BUF_PLANE2_PITCH_EXT
 #define EGL_DMA_BUF_PLANE2_PITCH_EXT 0x327A
 #endif
-
 #ifndef EGL_LINUX_DRM_FOURCC_EXT
 #define EGL_LINUX_DRM_FOURCC_EXT 0x3271
 #endif
-
 #ifndef DRM_FORMAT_NV12
-#define DRM_FORMAT_NV12 0x3231564e  // 'NV12'
+#define DRM_FORMAT_NV12 0x3231564e
 #endif
-
 #ifndef DRM_FORMAT_R8
-#define DRM_FORMAT_R8 0x20203852  // 'R8  '
+#define DRM_FORMAT_R8 0x20203852
 #endif
-
-// OpenGL ES 3.0 constants for single-channel textures
 #ifndef GL_R8
 #define GL_R8 0x8229
 #endif
-#ifndef GL_RED  
+#ifndef GL_RED
 #define GL_RED 0x1903
 #endif
 
-// Pre-allocated YUV temp buffers for stride handling (avoids malloc/free each frame)
 typedef struct {
     uint8_t *y_temp_buffer;
     uint8_t *u_temp_buffer;
     uint8_t *v_temp_buffer;
-    int allocated_size;  // Size each buffer is allocated for
+    int allocated_size;
 } yuv_temp_buffers_t;
 
-// Global persistent buffers - allocated once, reused
 static yuv_temp_buffers_t g_yuv_buffers = {NULL, NULL, NULL, 0};
 
 static void allocate_yuv_buffers(int needed_size) {
@@ -174,6 +176,70 @@ static void free_yuv_buffers(void) {
         g_yuv_buffers.v_temp_buffer = NULL;
     }
     g_yuv_buffers.allocated_size = 0;
+}
+
+static bool ensure_pbo_capacity(gl_context_t *gl, int plane, size_t required_size) {
+    if (!gl || plane < 0 || plane > 2 || required_size == 0) {
+        return false;
+    }
+
+    if (gl->pbo_size[plane] >= required_size) {
+        return true;
+    }
+
+    for (int i = 0; i < PBO_RING_COUNT; ++i) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[i][plane]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, required_size, NULL, GL_STREAM_DRAW);
+    }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    gl->pbo_size[plane] = required_size;
+    return true;
+}
+
+static bool upload_plane_with_pbo(gl_context_t *gl, int plane, const uint8_t *src,
+                                  int width, int height, int bytes_per_pixel,
+                                  int src_stride_bytes, GLenum gl_format) {
+    if (!gl || !src || width <= 0 || height <= 0 || bytes_per_pixel <= 0) {
+        return false;
+    }
+
+    size_t row_bytes = (size_t)width * (size_t)bytes_per_pixel;
+    size_t total_bytes = row_bytes * (size_t)height;
+    if (total_bytes == 0) {
+        return false;
+    }
+
+    if (!ensure_pbo_capacity(gl, plane, total_bytes)) {
+        return false;
+    }
+
+    GLuint buffer = gl->pbo[gl->pbo_index][plane];
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer);
+
+    void *dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, total_bytes,
+                                 GL_MAP_WRITE_BIT |
+                                 GL_MAP_INVALIDATE_BUFFER_BIT |
+                                 GL_MAP_UNSYNCHRONIZED_BIT);
+    if (!dst) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return false;
+    }
+
+    if (src_stride_bytes == (int)row_bytes) {
+        memcpy(dst, src, total_bytes);
+    } else {
+        uint8_t *d = (uint8_t *)dst;
+        for (int row = 0; row < height; ++row) {
+            memcpy(d + row * row_bytes,
+                   src + (size_t)row * (size_t)src_stride_bytes,
+                   row_bytes);
+        }
+    }
+
+    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, gl_format, GL_UNSIGNED_BYTE, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    return true;
 }
 
 // Modern vertex shader for keystone correction and video rendering (OpenGL ES 3.1)
@@ -215,14 +281,26 @@ const char *fragment_shader_source =
     "uniform sampler2D u_texture_y;\n"
     "uniform sampler2D u_texture_u;\n"
     "uniform sampler2D u_texture_v;\n"
+    "uniform sampler2D u_texture_nv12;\n"
+    "uniform int u_use_nv12;\n"
     "\n"
     "out vec4 fragColor;\n"
     "\n"
     "void main() {\n"
-    "    // Sample YUV values from separate planes\n"
-    "    float y = texture(u_texture_y, v_texcoord).r;\n"
-    "    float u = texture(u_texture_u, v_texcoord).r;\n"
-    "    float v = texture(u_texture_v, v_texcoord).r;\n"
+    "    float y;\n"
+    "    float u;\n"
+    "    float v;\n"
+    "    if (u_use_nv12 > 0) {\n"
+    "        vec2 uv = texture(u_texture_nv12, v_texcoord).rg;\n"
+    "        y = texture(u_texture_y, v_texcoord).r;\n"
+    "        u = uv.r;\n"
+    "        v = uv.g;\n"
+    "    } else {\n"
+    "        // Sample YUV values from separate planes\n"
+    "        y = texture(u_texture_y, v_texcoord).r;\n"
+    "        u = texture(u_texture_u, v_texcoord).r;\n"
+    "        v = texture(u_texture_v, v_texcoord).r;\n"
+    "    }\n"
     "    \n"
     "    // BT.709 TV range (16-235 for Y, 16-240 for UV) to RGB conversion\n"
     "    // Decoder outputs: Color space: bt709, Color range: tv\n"
@@ -322,6 +400,7 @@ static int create_program(gl_context_t *gl) {
     gl->u_texture_u = glGetUniformLocation(gl->program, "u_texture_u");
     gl->u_texture_v = glGetUniformLocation(gl->program, "u_texture_v");
     gl->u_texture_nv12 = glGetUniformLocation(gl->program, "u_texture_nv12");
+    gl->u_use_nv12 = glGetUniformLocation(gl->program, "u_use_nv12");
     gl->u_keystone_matrix = glGetUniformLocation(gl->program, "u_keystone_matrix");
     gl->u_flip_y = glGetUniformLocation(gl->program, "u_flip_y");
     gl->a_position = glGetAttribLocation(gl->program, "a_position");
@@ -500,11 +579,19 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
-    // Initialize PBO for async texture uploads (OpenGL ES 3.0+)
-    // DISABLED: Direct upload is faster on RPi4 when strides match (5-8ms vs 12-17ms with PBO overhead)
-    gl->use_pbo = false;
-    glGenBuffers(3, gl->pbo);
-    // printf("PBO async texture uploads enabled\n");
+    // Initialize PBOs for async texture uploads (double-buffered per plane)
+    // DISABLED BY DEFAULT: Use only if PICKLE_ENABLE_PBO=1 (profiling builds)
+    memset(gl->pbo, 0, sizeof(gl->pbo));
+    memset(gl->pbo_size, 0, sizeof(gl->pbo_size));
+    gl->pbo_index = 0;
+    gl->pbo_warned = false;
+    const char *enable_pbo = getenv("PICKLE_ENABLE_PBO");
+    gl->use_pbo = (enable_pbo && enable_pbo[0] == '1');
+    if (gl->use_pbo) {
+        glGenBuffers(PBO_RING_COUNT * 3, &gl->pbo[0][0]);
+        printf("[Render] PBO staging enabled (PICKLE_ENABLE_PBO=1)\n");
+    }
+    printf("[Render] Using direct glTexSubImage2D uploads (simple baseline)\n");
 
     // OpenGL ES initialization complete
     return 0;
@@ -552,6 +639,10 @@ void gl_setup_buffers(gl_context_t *gl) {
         2, 3, 0   // Second triangle
     };
 
+    // Ensure tightly packed pixel transfers for YUV/NV12 uploads
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
     // Generate and bind VBO (no VAO for compatibility)
     glGenBuffers(1, &gl->vbo);
     glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
@@ -569,6 +660,7 @@ void gl_setup_buffers(gl_context_t *gl) {
     glGenTextures(1, &gl->texture_u);
     glGenTextures(1, &gl->texture_v);
     glGenTextures(1, &gl->texture_nv12);
+    glGenTextures(1, &gl->texture_nv12_2);
     
     // Generate YUV textures for video 2
     glGenTextures(1, &gl->texture_y2);
@@ -617,13 +709,13 @@ void gl_setup_buffers(gl_context_t *gl) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Setup NV12 texture (combined Y + interleaved UV at 1.5x height)
+    // Setup NV12 UV textures (interleaved U/V planes)
     glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12_2);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -645,126 +737,143 @@ void gl_setup_buffers(gl_context_t *gl) {
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
                     display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
-    (void)stride; // Unused parameter - kept for API consistency
-    (void)video_index; // NV12 not currently used for dual video
-    static int frame_rendered = 0;
-    static int last_width = 0, last_height = 0;
+    static int frame_rendered[2] = {0, 0};
+    static int last_width[2] = {0, 0};
+    static int last_height[2] = {0, 0};
     static bool gl_state_set = false;
-    
-    // Set black clear color for video background
-    if (frame_rendered == 0) {
+
+    GLuint tex_y = (video_index == 0) ? gl->texture_y : gl->texture_y2;
+    GLuint tex_uv = (video_index == 0) ? gl->texture_nv12 : gl->texture_nv12_2;
+
+    if (frame_rendered[video_index] == 0) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     }
-    
-    // Only clear screen if requested (first video clears, second doesn't)
+
     if (clear_screen) {
         glClear(GL_COLOR_BUFFER_BIT);
     }
-    
-    // Set up OpenGL state only once or when needed
+
     if (!gl_state_set) {
         glViewport(0, 0, drm->width, drm->height);
         gl_state_set = true;
     }
-    
-    // CRITICAL: Complete buffer unbinding before state restoration
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glUseProgram(0);
-    
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    
-    // Now set up the correct state for video rendering
-    glUseProgram(gl->program);
-    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
-    
-    // Position attribute
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    
-    // Texture coordinate attribute  
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    
-    // Set MVP matrix
-    float mvp_matrix[16] = {
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1
-    };
+
+    if (video_index == 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+
+        glUseProgram(gl->program);
+        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+    }
+
+    float mvp_matrix[16];
+    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
-    
-    // Explicitly disable blending and depth test
-    glDisable(GL_BLEND);
-    glDisable(GL_DEPTH_TEST);
-    
-    // Set keystone matrix
+
     const float *keystone_matrix = keystone_get_matrix(keystone);
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
-    
-    // Bind NV12 texture to texture unit 0
+    glUniform1f(gl->u_flip_y, 1.0f);
+    if (gl->u_use_nv12 >= 0) {
+        glUniform1i(gl->u_use_nv12, 1);
+    }
+
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_nv12);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    // Disable other texture units so shader uses only NV12
+    glBindTexture(GL_TEXTURE_2D, tex_y);
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindTexture(GL_TEXTURE_2D, tex_uv);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE0);
-    
-    // Set sampler uniforms
-    glUniform1i(gl->u_texture_nv12, 0);  // NV12 on unit 0
-    glUniform1i(gl->u_texture_y, 1);     // Unused (should help shader detect NV12 mode)
-    glUniform1i(gl->u_texture_u, 2);     // Unused
-    glUniform1i(gl->u_texture_v, 3);     // Unused
-    
-    // Upload NV12 data
+
+    glUniform1i(gl->u_texture_y, 0);
+    glUniform1i(gl->u_texture_nv12, 1);
+    glUniform1i(gl->u_texture_u, 2);
+    glUniform1i(gl->u_texture_v, 3);
+
     if (nv12_data) {
-        bool size_changed = (width != last_width || height != last_height || frame_rendered == 0);
-        
-        // NV12 is Y plane + interleaved UV plane = 1.5x height
-        int nv12_height = (height * 3) / 2;
-        
+        bool size_changed = (width != last_width[video_index] ||
+                             height != last_height[video_index] ||
+                             frame_rendered[video_index] == 0);
+
+        int y_stride = (stride > 0) ? stride : width;
+        uint8_t *y_plane = nv12_data;
+        uint8_t *uv_plane = nv12_data + (size_t)y_stride * height;
+        int uv_width = width / 2;
+        int uv_height = height / 2;
+
         if (size_changed) {
-            // Need full glTexImage2D for size change
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, nv12_height, 0, GL_RED, GL_UNSIGNED_BYTE, nv12_data);
-            printf("NV12 texture uploaded: %dx%d (NV12 height %d)\n", width, height, nv12_height);
-        } else {
-            // Use glTexSubImage2D for faster updates
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, nv12_height, GL_RED, GL_UNSIGNED_BYTE, nv12_data);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_uv);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, uv_width, uv_height, 0, GL_RG, GL_UNSIGNED_BYTE, NULL);
         }
-        
-        last_width = width;
-        last_height = height;
-        frame_rendered++;
+
+        bool pbo_uploaded = false;
+        if (gl->use_pbo) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
+            bool y_ok = upload_plane_with_pbo(gl, PLANE_Y, y_plane, width, height, 1, y_stride, GL_RED);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_uv);
+            int uv_row_bytes = width; // two bytes per UV sample (GL_RG)
+            bool uv_ok = upload_plane_with_pbo(gl, PLANE_U, uv_plane, uv_width, uv_height, 2, uv_row_bytes, GL_RG);
+
+            pbo_uploaded = y_ok && uv_ok;
+            if (!pbo_uploaded) {
+                gl->use_pbo = false;
+                if (!gl->pbo_warned) {
+                    printf("[Render] Disabling PBO staging (falling back to direct uploads)\n");
+                    gl->pbo_warned = true;
+                }
+            }
+        }
+
+        if (!pbo_uploaded) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_plane);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_uv);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RG, GL_UNSIGNED_BYTE, uv_plane);
+        }
+
+        last_width[video_index] = width;
+        last_height[video_index] = height;
+        frame_rendered[video_index]++;
+        if (gl->use_pbo && pbo_uploaded) {
+            gl->pbo_index = (gl->pbo_index + 1) % PBO_RING_COUNT;
+        }
     }
-    
-    // Check for OpenGL errors
-    GLenum error = glGetError();
-    if (error != GL_NO_ERROR) {
-        printf("OpenGL error (NV12): 0x%x\n", error);
-    }
-    
-    // Draw quad
+
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    
-    error = glGetError();
-    if (error != GL_NO_ERROR) {
-        printf("OpenGL error after NV12 draw: 0x%x\n", error);
-    }
 }
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
                     int width, int height, int y_stride, int u_stride, int v_stride,
                     display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render - EGL context lost\n");
+        return;
+    }
+    
     // Separate tracking for each video
     static int frame_rendered[2] = {0, 0};
     static int last_width[2] = {0, 0};
@@ -842,6 +951,9 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     
     // OPTIMIZED: Bind textures without excessive glTexParameteri calls
     // Texture parameters are set once during initialization, not per-frame
+    if (gl->u_use_nv12 >= 0) {
+        glUniform1i(gl->u_use_nv12, 0);
+    }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_y);
     
@@ -903,45 +1015,70 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
             storage_initialized[video_index] = true;
         }
         
-        // PRODUCTION OPTIMIZATION: Allocate buffers once before all texture uploads
-        // This avoids 3 allocation checks per frame
-        if (!y_direct || !u_direct || !v_direct) {
-            int needed_size = width * height;  // Y plane size
-            allocate_yuv_buffers(needed_size);
+        bool pbo_uploaded = false;
+        if (gl->use_pbo) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
+            bool y_ok = upload_plane_with_pbo(gl, PLANE_Y, y_data, width, height, 1, y_stride, GL_RED);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_u);
+            bool u_ok = upload_plane_with_pbo(gl, PLANE_U, u_data, uv_width, uv_height, 1, u_stride, GL_RED);
+
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, tex_v);
+            bool v_ok = upload_plane_with_pbo(gl, PLANE_V, v_data, uv_width, uv_height, 1, v_stride, GL_RED);
+
+            pbo_uploaded = y_ok && u_ok && v_ok;
+            if (!pbo_uploaded) {
+                gl->use_pbo = false;
+                if (!gl->pbo_warned) {
+                    printf("[Render] Disabling PBO staging (falling back to direct uploads)\n");
+                    gl->pbo_warned = true;
+                }
+            }
         }
 
-        // Y texture - OPTIMIZED: Direct upload (avoid PBO overhead)
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, tex_y);
+        if (!pbo_uploaded) {
+            // PRODUCTION OPTIMIZATION: Allocate buffers once before all texture uploads
+            // This avoids 3 allocation checks per frame
+            if (!y_direct || !u_direct || !v_direct) {
+                int needed_size = width * height;  // Y plane size
+                allocate_yuv_buffers(needed_size);
+            }
 
-        if (y_direct) {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
-        } else {
-            // Stride copy path (for padded data)
-            copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
-        }
+            // Y texture fall back path
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
 
-        // U texture - OPTIMIZED: Direct upload
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, tex_u);
+            if (y_direct) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
+            } else {
+                copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
+            }
 
-        if (u_direct) {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
-        } else {
-            copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
-        }
+            // U texture fall back path
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_u);
 
-        // V texture - OPTIMIZED: Direct upload
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, tex_v);
+            if (u_direct) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
+            } else {
+                copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
+            }
 
-        if (v_direct) {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
-        } else {
-            copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
+            // V texture fall back path
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, tex_v);
+
+            if (v_direct) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
+            } else {
+                copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
+            }
         }
         
         if (frame_rendered[video_index] == 0) {
@@ -951,6 +1088,9 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         last_height[video_index] = height;
         
         frame_rendered[video_index]++;
+        if (gl->use_pbo && pbo_uploaded) {
+            gl->pbo_index = (gl->pbo_index + 1) % PBO_RING_COUNT;
+        }
     } else if (frame_rendered[video_index] == 0) {
         // Skip test pattern for now - YUV textures need proper initialization
         // (Don't print "Waiting for video data..." - it's just noise)
@@ -1080,17 +1220,17 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     float corner_colors[4][4];
     for (int i = 0; i < 4; i++) {
         if (keystone->selected_corner == i) {
-            // Green for selected
+            // Bright green for selected
             corner_colors[i][0] = 0.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 0.0f;
             corner_colors[i][3] = 1.0f;
         } else {
-            // White for unselected
+            // White with subtle transparency for unselected (more elegant)
             corner_colors[i][0] = 1.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 1.0f;
-            corner_colors[i][3] = 1.0f;
+            corner_colors[i][3] = 0.7f;
         }
     }
     
@@ -1099,7 +1239,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         keystone->corners_dirty = false;  // Clear dirty flag
         
         // Create corner positions (small squares)
-        float corner_size = 0.015f; // 1.5% of screen size (smaller)
+        float corner_size = 0.008f; // 0.8% of screen size (refined and elegant)
         
         // Corner vertices with colors: [x, y, r, g, b, a] per vertex
         int vertex_count = 0;
@@ -1283,8 +1423,8 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Set line width for better visibility
-    glLineWidth(3.0f);
+    // Set line width for refined appearance
+    glLineWidth(2.0f);
     
     // Draw border as 4 separate lines (8 vertices with colors from vertex data)
     glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
@@ -1473,27 +1613,15 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
             "\n"
             "PICKLE KEYSTONE\n"
             "\n"
-            "KEYBOARD\n"
-            "1234   Corner Select\n"
-            "Arrows Move Corner\n"
-            "S      Save\n"
-            "R      Reset\n"
-            "C      Toggle Corners\n"
-            "B      Toggle Border\n"
-            "W      WiFi Connect\n"
-            "H      Toggle Help\n"
-            "Q      Quit\n"
-            "\n"
             "GAMEPAD\n"
             "X      Cycle Corner\n"
             "DPAD   Move Corner\n"
-            "A      Show Corners\n"
-            "B      Show Border\n"
+            "B      Show Keysone Border\n"
             "Y      Show Help\n"
             "L1     Step Down\n"
             "R1     Step Up\n"
             "START  Save\n"
-            "SELECT Reset";
+            "SELECT Reset Keystone";
 
         draw_text_simple(help_text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
         help_initialized = true;
@@ -2109,6 +2237,26 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     GLuint tex_u = (video_index == 0) ? gl->texture_u : gl->texture_u2;
     GLuint tex_v = (video_index == 0) ? gl->texture_v : gl->texture_v2;
 
+    // CRITICAL: Clear any previous EGL image bindings before rebinding
+    // This prevents GL_INVALID_OPERATION errors when reusing textures
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+    
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
     // Set up rendering state
     glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
     if (clear_screen && video_index == 0) {
@@ -2140,6 +2288,10 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     float mvp_matrix[16];
     calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+
+    if (gl->u_use_nv12 >= 0) {
+        glUniform1i(gl->u_use_nv12, 0);
+    }
     
     // YUV420P format via DMA buffer (3 separate planes)
     // Use actual video dimensions, not buffer dimensions (hardware may pad buffers)
@@ -2231,12 +2383,15 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         return;
     }
     
-    // Bind Y plane to texture unit 0
     // Bind Y plane to texture unit 0 (use selected texture based on video_index)
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_y);
     if (glEGLImageTargetTexture2DOES) {
         (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)y_image);
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            fprintf(stderr, "[DMA] Y plane bind error: 0x%x\n", err);
+        }
     } else {
         fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
         goto cleanup_dma;
@@ -2252,6 +2407,10 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_u);
     (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)u_image);
+    GLenum err_u = glGetError();
+    if (err_u != GL_NO_ERROR) {
+        fprintf(stderr, "[DMA] U plane bind error: 0x%x\n", err_u);
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2262,6 +2421,10 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_v);
     (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)v_image);
+    GLenum err_v = glGetError();
+    if (err_v != GL_NO_ERROR) {
+        fprintf(stderr, "[DMA] V plane bind error: 0x%x\n", err_v);
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2328,6 +2491,7 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
     if (gl->texture_v) glDeleteTextures(1, &gl->texture_v);
     if (gl->texture_nv12) glDeleteTextures(1, &gl->texture_nv12);
+    if (gl->texture_nv12_2) glDeleteTextures(1, &gl->texture_nv12_2);
     
     // Clean up YUV textures (video 2)
     if (gl->texture_y2) glDeleteTextures(1, &gl->texture_y2);
@@ -2335,8 +2499,9 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->texture_v2) glDeleteTextures(1, &gl->texture_v2);
     
     // Clean up PBOs
-    if (gl->use_pbo) {
-        glDeleteBuffers(3, gl->pbo);
+    if (gl->pbo[0][0] || gl->pbo[0][1] || gl->pbo[0][2] ||
+        gl->pbo[1][0] || gl->pbo[1][1] || gl->pbo[1][2]) {
+        glDeleteBuffers(PBO_RING_COUNT * 3, &gl->pbo[0][0]);
     }
     
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);

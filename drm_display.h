@@ -16,6 +16,7 @@ typedef struct display_ctx {
     drmModeConnector *connector;
     drmModeEncoder *encoder;
     drmModeCrtc *crtc;
+    drmModeCrtc *saved_crtc;         // PRODUCTION: Original CRTC state for restoration
     drmModeModeInfo mode;
     
     uint32_t connector_id;

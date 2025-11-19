@@ -10,7 +10,31 @@
 #include <errno.h>
 #include <linux/input.h>
 #include <sys/stat.h>
+#include <signal.h>
 #include "production_config.h"
+
+// Global quit flag set by async-signal-safe signal handler
+extern volatile sig_atomic_t g_quit_requested;
+
+static double timespec_diff_seconds(const struct timespec *start, const struct timespec *end) {
+    if (!start || !end) {
+        return 0.0;
+    }
+    double sec = (double)(end->tv_sec - start->tv_sec);
+    double nsec = (double)(end->tv_nsec - start->tv_nsec) / 1e9;
+    return sec + nsec;
+}
+
+static void format_metric_ms(double seconds, char *buffer, size_t length) {
+    if (!buffer || length == 0) {
+        return;
+    }
+    if (seconds < 0.0) {
+        snprintf(buffer, length, "--");
+    } else {
+        snprintf(buffer, length, "%.2f", seconds * 1000.0);
+    }
+}
 
 // Validate video file before processing
 static int validate_video_file(const char *filename) {
@@ -207,29 +231,50 @@ async_decode_t* async_decode_create(video_context_t *video) {
 void async_decode_destroy(async_decode_t *decoder) {
     if (!decoder) return;
 
-    pthread_mutex_lock(&decoder->mutex);
+    // Signal thread to exit
+    int lock_result = pthread_mutex_lock(&decoder->mutex);
+    if (lock_result != 0) {
+        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in destroy: %d\n", lock_result);
+        // Try to proceed anyway for cleanup
+    }
     decoder->should_exit = true;
-    pthread_cond_signal(&decoder->cond);
-    pthread_mutex_unlock(&decoder->mutex);
+    pthread_cond_broadcast(&decoder->cond);  // Use broadcast to wake all waiters
+    if (lock_result == 0) {
+        pthread_mutex_unlock(&decoder->mutex);
+    }
 
-    // PRODUCTION: Use timed join with 100ms timeout for fast shutdown
+    // PRODUCTION: Use timed join with 200ms timeout for safe shutdown
     struct timespec timeout;
     clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_nsec += 100000000;  // 100ms
+    timeout.tv_nsec += 200000000;  // 200ms
     if (timeout.tv_nsec >= 1000000000) {
         timeout.tv_sec++;
         timeout.tv_nsec -= 1000000000;
     }
 
-    int result = pthread_timedjoin_np(decoder->thread, NULL, &timeout);
-    if (result != 0) {
-        // Thread didn't exit in time - cancel it forcefully
-        pthread_cancel(decoder->thread);
-        pthread_join(decoder->thread, NULL);
+    if (decoder->running) {
+        int result = pthread_timedjoin_np(decoder->thread, NULL, &timeout);
+        if (result == ETIMEDOUT) {
+            fprintf(stderr, "[ASYNC] Warning: Thread join timeout, forcing cancellation\n");
+            pthread_cancel(decoder->thread);
+            // Final join without timeout after cancel
+            pthread_join(decoder->thread, NULL);
+        } else if (result != 0) {
+            fprintf(stderr, "[ASYNC] Warning: pthread_timedjoin_np failed: %d\n", result);
+        }
+        decoder->running = false;
     }
 
-    pthread_mutex_destroy(&decoder->mutex);
-    pthread_cond_destroy(&decoder->cond);
+    // Safe cleanup of synchronization primitives
+    int mutex_result = pthread_mutex_destroy(&decoder->mutex);
+    if (mutex_result != 0 && mutex_result != EINVAL) {
+        fprintf(stderr, "[ASYNC] Warning: pthread_mutex_destroy failed: %d\n", mutex_result);
+    }
+    
+    int cond_result = pthread_cond_destroy(&decoder->cond);
+    if (cond_result != 0 && cond_result != EINVAL) {
+        fprintf(stderr, "[ASYNC] Warning: pthread_cond_destroy failed: %d\n", cond_result);
+    }
 
     free(decoder);
 }
@@ -238,7 +283,12 @@ void async_decode_destroy(async_decode_t *decoder) {
 void async_decode_request_frame(async_decode_t *decoder) {
     if (!decoder) return;
     
-    pthread_mutex_lock(&decoder->mutex);
+    int lock_result = pthread_mutex_lock(&decoder->mutex);
+    if (lock_result != 0) {
+        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in request: %d\n", lock_result);
+        return;
+    }
+    
     decoder->frame_ready = false;
     decoder->decoding = true;
     pthread_cond_signal(&decoder->cond);
@@ -249,7 +299,12 @@ void async_decode_request_frame(async_decode_t *decoder) {
 bool async_decode_frame_ready(async_decode_t *decoder) {
     if (!decoder) return false;
     
-    pthread_mutex_lock(&decoder->mutex);
+    int lock_result = pthread_mutex_lock(&decoder->mutex);
+    if (lock_result != 0) {
+        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in frame_ready: %d\n", lock_result);
+        return false;
+    }
+    
     bool ready = decoder->frame_ready;
     pthread_mutex_unlock(&decoder->mutex);
     
@@ -260,7 +315,11 @@ bool async_decode_frame_ready(async_decode_t *decoder) {
 bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
     if (!decoder) return false;
     
-    pthread_mutex_lock(&decoder->mutex);
+    int lock_result = pthread_mutex_lock(&decoder->mutex);
+    if (lock_result != 0) {
+        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in wait_frame: %d\n", lock_result);
+        return false;
+    }
     
     // If already ready, return immediately
     if (decoder->frame_ready) {
@@ -388,6 +447,32 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     // Set loop playback if requested
     video_set_loop(app->video, loop_playback);
 
+    // Create async decoder for primary video (hardware path benefits too)
+    bool force_sync_hw = false;
+    const char *force_sync_env = getenv("PICKLE_FORCE_SYNC_HW");
+    if (force_sync_env && (strcmp(force_sync_env, "1") == 0 ||
+                           strcmp(force_sync_env, "true") == 0 ||
+                           strcmp(force_sync_env, "yes") == 0)) {
+        force_sync_hw = true;
+    }
+
+    bool allow_async_primary = true;
+    if (app->video->use_hardware_decode && force_sync_hw) {
+        allow_async_primary = false;
+        printf("PICKLE_FORCE_SYNC_HW=1 -> forcing hardware decode on main thread\n");
+    }
+
+    if (allow_async_primary) {
+        app->async_decoder_primary = async_decode_create(app->video);
+        if (!app->async_decoder_primary) {
+            fprintf(stderr, "Failed to create async decoder for video 1\n");
+            app_cleanup(app);
+            return -1;
+        }
+        printf("Async decoder created for video 1 (%s path)\n",
+               app->video->use_hardware_decode ? "hardware" : "software");
+    }
+
     // Initialize second video decoder if provided
     if (video_file2) {
         if (video_init(app->video2, video_file2, app->advanced_diagnostics, enable_hardware_decode) != 0) {
@@ -405,6 +490,16 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         
         printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
         video_set_loop(app->video2, loop_playback);
+
+        if (!app->video2->use_hardware_decode) {
+            app->async_decoder_secondary = async_decode_create(app->video2);
+            if (!app->async_decoder_secondary) {
+                fprintf(stderr, "Failed to create async decoder for video 2\n");
+                app_cleanup(app);
+                return -1;
+            }
+            printf("Async decoder created for video 2 (software path)\n");
+        }
     }
 
     // Initialize keystone correction
@@ -484,15 +579,6 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
                 printf("  Created pickle_keystone2.conf with default inset position\n");
             }
         }
-        
-        // Create async decoder for video 2
-        app->async_decoder = async_decode_create(app->video2);
-        if (!app->async_decoder) {
-            fprintf(stderr, "Failed to create async decoder for video 2\n");
-            app_cleanup(app);
-            return -1;
-        }
-        printf("Async decoder created for video 2\n");
     }
 
     // Initialize input handler
@@ -547,8 +633,17 @@ void app_run(app_context_t *app) {
     // Timing measurement variables (render_start/render_end now local to render section)
     struct timespec decode_start, decode_end;
     double total_decode_time = 0, total_render_time = 0;
+    double decode0_time = 0.0, decode1_time = 0.0;  // Track both video streams separately
     int diagnostic_frame_count = 0;  // Counts successful decodes
     int render_frame_count = 0;       // Counts every frame rendered (for accurate avg)
+    double nv12_interval_sum[2] = {0.0, 0.0};
+    double nv12_interval_min[2] = {1e9, 1e9};
+    double nv12_interval_max[2] = {0.0, 0.0};
+    int nv12_interval_count[2] = {0, 0};
+    double gl_upload_interval_sum[2] = {0.0, 0.0};
+    double gl_upload_interval_min[2] = {1e9, 1e9};
+    double gl_upload_interval_max[2] = {0.0, 0.0};
+    int gl_upload_interval_count[2] = {0, 0};
     
     // Frame timing analysis buffers
     double *decode_times = malloc(300 * sizeof(double));  // Last 300 frames
@@ -600,8 +695,12 @@ void app_run(app_context_t *app) {
     // Main loop starting
     double startup_time = (double)last_time.tv_sec + last_time.tv_nsec / 1e9;
     bool first_decode_attempted = false;
+    bool primary_async_requested = false;
+    bool primary_async_request_pending = false;
+    bool secondary_async_requested = false;
+    bool secondary_async_request_pending = false;
     
-    while (app->running) {
+    while (app->running && !g_quit_requested) {
         clock_gettime(CLOCK_MONOTONIC, &current_time);
         
         // Calculate frame time
@@ -610,6 +709,10 @@ void app_run(app_context_t *app) {
         
         double current_total_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
         double decode_time = 0.0, render_time = 0.0;
+        decode0_time = 0.0;  // Reset decode0 timing for this frame
+        decode1_time = 0.0;  // Reset decode1 timing for this frame
+        double nv12_frame_time[2] = {-1.0, -1.0};
+        double upload_frame_time[2] = {-1.0, -1.0};
         
         // Handle input regardless of video state
         input_update(app->input);
@@ -904,6 +1007,7 @@ void app_run(app_context_t *app) {
         static bool next_frame_ready = false;
         static bool first_frame_decoded = false;
         static bool first_frame_decoded2 = false;
+        const bool using_async_primary = (app->async_decoder_primary != NULL);
         
         // Decode video frame continuously - vsync will handle timing
         uint8_t *video_data = NULL;
@@ -914,68 +1018,102 @@ void app_run(app_context_t *app) {
         static int frame_count = 0;
         static int frame_count2 = 0;
         static uint8_t *last_video_data = NULL;
+        bool new_primary_frame_ready = false;
+        bool new_secondary_frame_ready = false;
 
         // FIXED: Always decode/render, let vsync handle frame timing
         // Old buggy logic: if (delta_time >= frame_budget) caused stuttering
         {
             // Update timing for diagnostics
             last_time = current_time;
-            
-            if (frame_count == 0 && !first_decode_attempted) {
-                printf("Attempting first frame decode...\n");
-                fflush(stdout);
-                first_decode_attempted = true;
-            }
-            
-            // Add timeout for first decode to prevent hanging
-            if (frame_count == 0 && (current_total_time - startup_time) > 5.0) {
-                printf("Video decode timeout after 5 seconds, continuing without video...\n");
-                fflush(stdout);
-                frame_count = 1; // Skip further decode attempts
-            } else {
-                // OPTIMIZATION: Use pre-decoded frame if available, then decode next
-                if (next_frame_ready && first_frame_decoded) {
-                    // Current frame was already decoded - just use it (zero decode time!)
-                    decode_time = 0.0;
-                    
-                    // Get YUV data from already-decoded frame
+
+            if (using_async_primary) {
+                decode_time = 0.0; // Decode work happens on background thread
+                if (frame_count == 0 && !first_decode_attempted) {
+                    printf("Attempting first frame decode (async)...\n");
+                    fflush(stdout);
+                    first_decode_attempted = true;
+                }
+
+                int wait_timeout_ms = first_frame_decoded ? 0 : 100;
+                if (!primary_async_requested) {
+                    async_decode_request_frame(app->async_decoder_primary);
+                    primary_async_requested = true;
+                }
+
+                if (async_decode_wait_frame(app->async_decoder_primary, wait_timeout_ms)) {
                     uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
                     int y_stride = 0, u_stride = 0, v_stride = 0;
                     video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-                    
+
                     if (y_data != NULL) {
                         video_data = y_data;
                         last_video_data = video_data;
                         frame_count++;
-                        
-                        total_decode_time += decode_time;
-                        diagnostic_frame_count++;
-                        
-                        if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
-                            fflush(stdout);
-                        }
-                        
-                        // Now decode the NEXT frame (during rendering of current frame)
-                        // This will be ready for next iteration
-                        next_frame_ready = false;
-                        // Actual decode happens after rendering (see below)
-                    }
-                } else {
-                    // Normal decode path (first frame or fallback)
-                    clock_gettime(CLOCK_MONOTONIC, &decode_start);
-                    int decode_result = video_decode_frame(app->video);
-                    clock_gettime(CLOCK_MONOTONIC, &decode_end);
-                    
-                    decode_time = (decode_end.tv_sec - decode_start.tv_sec) +
-                                (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
-                    
-                    if (decode_result == 0) {
-                        if (frame_count == 0) {
-                            printf("First frame decoded successfully\n");
+                        new_primary_frame_ready = true;
+
+                        if (!first_frame_decoded) {
+                            printf("First frame decoded successfully (async)\n");
                             first_frame_decoded = true;
                             fflush(stdout);
                         }
+
+                        diagnostic_frame_count++;
+                    }
+
+                    primary_async_requested = false;
+                    primary_async_request_pending = !video_is_eof(app->video);
+                }
+
+                if (video_is_eof(app->video)) {
+                    if (app->loop_playback) {
+                        printf("End of video reached - restarting playback (loop mode)\n");
+                        video_seek(app->video, 0);
+                        next_frame_ready = false;
+                        first_frame_decoded = false;
+                        first_decode_attempted = false;
+                        frame_count = 0;
+                        primary_async_requested = false;
+                        primary_async_request_pending = !video_is_eof(app->video);
+                        clock_gettime(CLOCK_MONOTONIC, &current_time);
+                        startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
+                    } else {
+                        printf("Playback finished.\n");
+                        app->running = false;
+                        break;
+                    }
+                }
+            } else {
+                if (frame_count == 0 && !first_decode_attempted) {
+                    printf("Attempting first frame decode...\n");
+                    fflush(stdout);
+                    first_decode_attempted = true;
+                    
+                    // Hardware decode: Pre-buffer 2 frames to prime the decoder pipeline
+                    // More buffering causes systematic lag (playback appears slower)
+                    if (app->video && video_is_hardware_decoded(app->video)) {
+                        printf("[HW_DECODE] Priming decoder pipeline...\n");
+                        for (int prebuf = 0; prebuf < 2; prebuf++) {
+                            int result = video_decode_frame(app->video);
+                            if (result != 0) break;
+                        }
+                        printf("[HW_DECODE] Decoder ready, starting playback\n");
+                        fflush(stdout);
+                    }
+                }
+
+                // Add timeout for first decode to prevent hanging
+                if (frame_count == 0 && (current_total_time - startup_time) > 5.0) {
+                    printf("Video decode timeout after 5 seconds, continuing without video...\n");
+                    fflush(stdout);
+                    frame_count = 1; // Skip further decode attempts
+                } else {
+                    // OPTIMIZATION: Use pre-decoded frame if available, then decode next
+                    if (next_frame_ready && first_frame_decoded) {
+                        // Current frame was already decoded - just use it (zero decode time!)
+                        decode_time = 0.0;
                         
+                        // Get YUV data from already-decoded frame
                         uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
                         int y_stride = 0, u_stride = 0, v_stride = 0;
                         video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
@@ -984,6 +1122,7 @@ void app_run(app_context_t *app) {
                             video_data = y_data;
                             last_video_data = video_data;
                             frame_count++;
+                            new_primary_frame_ready = true;
                             
                             total_decode_time += decode_time;
                             diagnostic_frame_count++;
@@ -992,113 +1131,153 @@ void app_run(app_context_t *app) {
                                 fflush(stdout);
                             }
                             
-                            // Mark that we should pre-decode next time
-                            next_frame_ready = true;
-                        }
-                    } else if (video_is_eof(app->video)) {
-                        if (app->loop_playback) {
-                            printf("End of video reached - restarting playback (loop mode)\n");
-                            video_seek(app->video, 0);
+                            // Now decode the NEXT frame (during rendering of current frame)
+                            // This will be ready for next iteration
                             next_frame_ready = false;
-                            first_frame_decoded = false;
-                            first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
-                            frame_count = 0;
-                            // Update startup_time to reset the 5-second timeout
-                            clock_gettime(CLOCK_MONOTONIC, &current_time);
-                            startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
-                        } else {
-                            printf("Playback finished.\n");
-                            app->running = false;
-                            break;
+                            // Actual decode happens after rendering (see below)
                         }
                     } else {
-                        if (frame_count < 10) {
-                            printf("Video decode failed: %d\n", decode_result);
-                            fflush(stdout);
-                        }
-                        video_data = last_video_data;
-                        next_frame_ready = false;
-                    }
-                }
-                
-                // Measure decode time (removed old code)
-                // clock_gettime(CLOCK_MONOTONIC, &decode_start);
-                    
-                                        // We now clear the arrow keys ONLY if we've successfully processed a movement
-            // This allows for continued movement if a corner is not selected
-            
-                // Decode second video if available
-                // Hardware decode: SYNCHRONOUS (both decoders in main thread - no competition)
-                // Software decode: ASYNC (CPU is slow, need background thread)
-                if (app->video2) {
-                    if (app->video2->use_hardware_decode) {
-                        // HARDWARE: Synchronous decode works better (no thread competition)
-                        int decode_result2 = video_decode_frame(app->video2);
-                        if (decode_result2 == 0) {
-                            frame_count2++;
-                            if (frame_count2 == 1) {
-                                printf("First frame of video 2 decoded successfully (HW sync)\n");
-                                first_frame_decoded2 = true;
+                        // Normal decode path (first frame or fallback)
+                        clock_gettime(CLOCK_MONOTONIC, &decode_start);
+                        int decode_result = video_decode_frame(app->video);
+                        clock_gettime(CLOCK_MONOTONIC, &decode_end);
+                        
+                        decode_time = (decode_end.tv_sec - decode_start.tv_sec) +
+                                    (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
+                        decode0_time = decode_time;  // Track decode0 timing
+                        
+                        if (decode_result == 0) {
+                            if (frame_count == 0) {
+                                printf("First frame decoded successfully\n");
+                                first_frame_decoded = true;
                                 fflush(stdout);
                             }
-                        }
-
-                        if (video_is_eof(app->video2)) {
-                            if (app->loop_playback) {
-                                video_seek(app->video2, 0);
-                                first_frame_decoded2 = false;
-                                frame_count2 = 0;
-                            }
-                        }
-                    } else if (app->async_decoder) {
-                        // SOFTWARE: Async decode (CPU is slow, need background thread)
-                        if (!first_frame_decoded2) {
-                            if (frame_count2 == 0) {
-                                async_decode_request_frame(app->async_decoder);
-                            }
-
-                            if (async_decode_wait_frame(app->async_decoder, 100)) {
-                                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-
-                                if (y_data2 != NULL) {
-                                    frame_count2++;
-                                    printf("First frame of video 2 decoded successfully (SW async)\n");
-                                    first_frame_decoded2 = true;
+                            
+                            uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                            int y_stride = 0, u_stride = 0, v_stride = 0;
+                            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                            
+                            if (y_data != NULL) {
+                                video_data = y_data;
+                                last_video_data = video_data;
+                                frame_count++;
+                                new_primary_frame_ready = true;
+                                
+                                total_decode_time += decode_time;
+                                diagnostic_frame_count++;
+                                
+                                if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
                                     fflush(stdout);
-                                    async_decode_request_frame(app->async_decoder);
                                 }
+                                
+                                // Mark that we should pre-decode next time
+                                next_frame_ready = true;
+                            }
+                        } else if (video_is_eof(app->video)) {
+                            if (app->loop_playback) {
+                                printf("End of video reached - restarting playback (loop mode)\n");
+                                video_seek(app->video, 0);
+                                next_frame_ready = false;
+                                first_frame_decoded = false;
+                                first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
+                                frame_count = 0;
+                                // Update startup_time to reset the 5-second timeout
+                                clock_gettime(CLOCK_MONOTONIC, &current_time);
+                                startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
+                            } else {
+                                printf("Playback finished.\n");
+                                app->running = false;
+                                break;
                             }
                         } else {
-                            // Non-blocking check for async decoder
-                            if (async_decode_wait_frame(app->async_decoder, 0)) {
-                                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                                if (y_data2 != NULL) {
-                                    frame_count2++;
-                                }
-                                async_decode_request_frame(app->async_decoder);
+                            if (frame_count < 10) {
+                                printf("Video decode failed: %d\n", decode_result);
+                                fflush(stdout);
                             }
-                        }
-
-                        if (video_is_eof(app->video2)) {
-                            if (app->loop_playback) {
-                                video_seek(app->video2, 0);
-                                first_frame_decoded2 = false;
-                                frame_count2 = 0;
-                                async_decode_request_frame(app->async_decoder);
-                            }
+                            video_data = last_video_data;
+                            next_frame_ready = false;
                         }
                     }
                 }
-                
-            if (app->keystone->selected_corner < 0) {
-                // No corner selected, clear key states to prevent movement later
-                app->input->keys_pressed[KEY_UP] = false;
-                app->input->keys_pressed[KEY_DOWN] = false;
-                app->input->keys_pressed[KEY_LEFT] = false;
-                app->input->keys_pressed[KEY_RIGHT] = false;
             }
-            }  // Close the frame decode block
         } // End of main decode/render block
+
+        // Decode second video if available
+        // Hardware decode: SYNCHRONOUS (both decoders in main thread - no competition)
+        // Software decode: ASYNC (CPU is slow, need background thread)
+        if (app->video2) {
+            struct timespec decode_start2, decode_end2;
+            
+            if (app->video2->use_hardware_decode) {
+                // HARDWARE: Synchronous decode works better (no thread competition)
+                clock_gettime(CLOCK_MONOTONIC, &decode_start2);
+                int decode_result2 = video_decode_frame(app->video2);
+                clock_gettime(CLOCK_MONOTONIC, &decode_end2);
+                decode1_time = (decode_end2.tv_sec - decode_start2.tv_sec) +
+                              (decode_end2.tv_nsec - decode_start2.tv_nsec) / 1e9;
+                if (decode_result2 == 0) {
+                    frame_count2++;
+                    new_secondary_frame_ready = true;
+                    if (frame_count2 == 1) {
+                        printf("First frame of video 2 decoded successfully (HW sync)\n");
+                        first_frame_decoded2 = true;
+                        fflush(stdout);
+                    }
+                }
+
+                if (video_is_eof(app->video2)) {
+                    if (app->loop_playback) {
+                        video_seek(app->video2, 0);
+                        first_frame_decoded2 = false;
+                        frame_count2 = 0;
+                    }
+                }
+            } else if (app->async_decoder_secondary) {
+                // SOFTWARE: Async decode (CPU is slow, need background thread)
+                int wait_timeout_ms2 = first_frame_decoded2 ? 0 : 100;
+
+                if (!secondary_async_requested) {
+                    async_decode_request_frame(app->async_decoder_secondary);
+                    secondary_async_requested = true;
+                }
+
+                if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms2)) {
+                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                       &y_stride2, &u_stride2, &v_stride2);
+
+                    if (y_data2 != NULL) {
+                        frame_count2++;
+                        if (!first_frame_decoded2) {
+                            printf("First frame of video 2 decoded successfully (SW async)\n");
+                            first_frame_decoded2 = true;
+                            fflush(stdout);
+                        }
+                        new_secondary_frame_ready = true;
+                    }
+
+                    secondary_async_requested = false;
+                    secondary_async_request_pending = !video_is_eof(app->video2);
+                }
+
+                if (video_is_eof(app->video2)) {
+                    if (app->loop_playback) {
+                        video_seek(app->video2, 0);
+                        first_frame_decoded2 = false;
+                        frame_count2 = 0;
+                        secondary_async_requested = false;
+                        secondary_async_request_pending = false;
+                    }
+                }
+            }
+        }
+
+        if (app->keystone->selected_corner < 0) {
+            // No corner selected, clear key states to prevent movement later
+            app->input->keys_pressed[KEY_UP] = false;
+            app->input->keys_pressed[KEY_DOWN] = false;
+            app->input->keys_pressed[KEY_LEFT] = false;
+            app->input->keys_pressed[KEY_RIGHT] = false;
+        }
 
         // Get video dimensions
         int video_width = 0, video_height = 0;
@@ -1191,42 +1370,9 @@ void app_run(app_context_t *app) {
                 // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
                 // This is handled in the standard overlay rendering section below
             }
-        } else if (has_dma) {
-            // OPENGL DMA PATH - Zero-copy rendering with DRM PRIME
-            // Works perfectly with overlays - they're rendered on top after video
-            // Keystone correction works fine - it's a GPU shader transformation
-            int dma_fd = video_get_dma_fd(app->video);
-            static int dma_render_count = 0;
-            if (frame_count == 1 || (dma_render_count < 3)) {
-                printf("[RENDER_TRACE] Frame %d: has_dma=true, dma_fd=%d (OpenGL DMA path - no overlays)\n", frame_count, dma_fd);
-                dma_render_count++;
-            }
-            if (dma_fd >= 0) {
-                // Use OpenGL EGL DMA rendering (may have driver issues on Pi 4)
-                if (frame_count == 1) {
-                    printf("[RENDER_TRACE] ✓ Using OpenGL EGL DMA rendering (FD=%d) - may have issues\n", dma_fd);
-                }
-                // Get actual plane layout from hardware decoder
-                int plane_offsets[3] = {0, 0, 0};
-                int plane_pitches[3] = {0, 0, 0};
-                video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
-                gl_render_frame_dma(app->gl, dma_fd, video_width, video_height,
-                                   plane_offsets, plane_pitches,
-                                   app->drm, app->keystone, true, 0);
-            } else {
-                // DMA FD not available, fall back to CPU upload
-                printf("[RENDER_TRACE] ⚠ has_dma=true but dma_fd=%d (fallback to CPU)\n", dma_fd);
-                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-                if (y_data && u_data && v_data) {
-                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
-                } else {
-                    gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                                  0, 0, 0, app->drm, app->keystone, true, 0);
-                }
-            }
         } else {
-            // CPU RENDERING PATH
+            // CPU RENDERING PATH (DMA currently broken on this hardware)
+            // Use simple direct glTexSubImage2D uploads for now
             // Used only when: no DMA buffers available (software decode)
             // PRODUCTION: Only log once on startup
             static bool cpu_path_logged = false;
@@ -1234,79 +1380,155 @@ void app_run(app_context_t *app) {
                 printf("[Render] Using CPU upload path (software decode)\n");
                 cpu_path_logged = true;
             }
-            
-            // Fetch YUV data from decoder (with format conversion if needed)
-            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-            
-            if (y_data && u_data && v_data) {
-                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
-            } else {
+
+            bool rendered = false;
+            struct timespec nv12_cpu_start = {0, 0}, nv12_cpu_end = {0, 0};
+            struct timespec gl_upload_start = {0, 0}, gl_upload_end = {0, 0};
+
+            // Split rendering path by decode type:
+            // HW decode → NV12 conversion + 2-plane upload
+            // SW decode → Direct YUV420P 3-plane upload (no conversion)
+            bool use_hw_decode = app->video->use_hardware_decode;
+
+            if (use_hw_decode && new_primary_frame_ready) {
+                // HW DECODE PATH: Convert to NV12 and upload 2 planes
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start);
+                }
+                uint8_t *nv12_data = video_get_nv12_data(app->video);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end);
+                    nv12_frame_time[0] = timespec_diff_seconds(&nv12_cpu_start, &nv12_cpu_end);
+                }
+
+                if (nv12_data) {
+                    int nv12_stride = video_get_nv12_stride(app->video);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                    }
+                    gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride,
+                                   app->drm, app->keystone, true, 0);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                        upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                    }
+                    rendered = true;
+                }
+            } else if (!use_hw_decode && new_primary_frame_ready) {
+                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
+                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                if (y_data && u_data && v_data) {
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                    }
+                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                        upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                    }
+                    rendered = true;
+                }
+            }
+
+            // Fallback: render black frame if no valid data
+            if (!rendered) {
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                }
                 gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
                               0, 0, 0, app->drm, app->keystone, true, 0);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                    upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                }
             }
         }
         
+        // Issue deferred async decode request once we finish uploading the frame
+        if (using_async_primary && primary_async_request_pending && !primary_async_requested) {
+            async_decode_request_frame(app->async_decoder_primary);
+            primary_async_requested = true;
+            primary_async_request_pending = false;
+        }
+
         // Render second video with second keystone (don't clear screen)
         if (app->video2 && app->keystone2) {
             // Get dimensions (safe to call anytime)
             int video_width2 = app->video2->width;
             int video_height2 = app->video2->height;
             bool video2_rendered = false;
+            struct timespec nv12_cpu_start2 = {0, 0}, nv12_cpu_end2 = {0, 0};
+            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
 
-            // Check if second video has DMA buffer (hardware decode)
-            bool has_dma2 = video_has_dma_buffer(app->video2);
-
-            if (has_dma2) {
-                // HARDWARE DMA PATH - Second video with zero-copy rendering
-                // Cache last valid DMA FD and layout to reuse when async decoder isn't ready
-                static int last_dma_fd2 = -1;
-                static int last_plane_offsets2[3] = {0, 0, 0};
-                static int last_plane_pitches2[3] = {0, 0, 0};
-
-                int dma_fd2 = video_get_dma_fd(app->video2);
-                static int dma_check_count = 0;
-                if (dma_check_count < 10) {
-                    fprintf(stderr, "[DEBUG] Video2: has_dma=%d, dma_fd=%d\n", has_dma2, dma_fd2);
-                    dma_check_count++;
-                }
-                if (dma_fd2 >= 0) {
-                    // New frame available - update cache
-                    int plane_offsets2[3] = {0, 0, 0};
-                    int plane_pitches2[3] = {0, 0, 0};
-                    video_get_dma_plane_layout(app->video2, plane_offsets2, plane_pitches2);
-
-                    last_dma_fd2 = dma_fd2;
-                    for (int i = 0; i < 3; i++) {
-                        last_plane_offsets2[i] = plane_offsets2[i];
-                        last_plane_pitches2[i] = plane_pitches2[i];
+        if (app->show_timing) {
+            for (int i = 0; i < 2; ++i) {
+                if (nv12_frame_time[i] >= 0.0) {
+                    nv12_interval_sum[i] += nv12_frame_time[i];
+                    if (nv12_frame_time[i] < nv12_interval_min[i]) {
+                        nv12_interval_min[i] = nv12_frame_time[i];
                     }
-
-                    gl_render_frame_dma(app->gl, dma_fd2, video_width2, video_height2,
-                                       plane_offsets2, plane_pitches2,
-                                       app->drm, app->keystone2, false, 1);
-                    video2_rendered = true;
-                } else if (last_dma_fd2 >= 0) {
-                    // No new frame, but we have cached data - reuse last frame
-                    gl_render_frame_dma(app->gl, last_dma_fd2, video_width2, video_height2,
-                                       last_plane_offsets2, last_plane_pitches2,
-                                       app->drm, app->keystone2, false, 1);
-                    video2_rendered = true;
-                } else {
-                    // No DMA data at all yet - fall back to CPU upload
-                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                    if (y_data2 && u_data2 && v_data2) {
-                        gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
-                                      y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
-                        video2_rendered = true;
+                    if (nv12_frame_time[i] > nv12_interval_max[i]) {
+                        nv12_interval_max[i] = nv12_frame_time[i];
                     }
+                    nv12_interval_count[i]++;
                 }
-            } else {
-                // CPU PATH - Second video with software decode
-                // Use static YUV pointers that persist across frames
+
+                if (upload_frame_time[i] >= 0.0) {
+                    gl_upload_interval_sum[i] += upload_frame_time[i];
+                    if (upload_frame_time[i] < gl_upload_interval_min[i]) {
+                        gl_upload_interval_min[i] = upload_frame_time[i];
+                    }
+                    if (upload_frame_time[i] > gl_upload_interval_max[i]) {
+                        gl_upload_interval_max[i] = upload_frame_time[i];
+                    }
+                    gl_upload_interval_count[i]++;
+                }
+            }
+        }
+
+            // Split rendering path by decode type:
+            // HW decode → NV12 conversion + 2-plane upload
+            // SW decode → Direct YUV420P 3-plane upload (no conversion)
+            bool use_hw_decode2 = app->video2->use_hardware_decode;
+
+            if (use_hw_decode2 && new_secondary_frame_ready) {
+                // HW DECODE PATH: Convert to NV12 and upload 2 planes
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start2);
+                }
+                uint8_t *nv12_data2 = video_get_nv12_data(app->video2);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end2);
+                    nv12_frame_time[1] = timespec_diff_seconds(&nv12_cpu_start2, &nv12_cpu_end2);
+                }
+
+                if (nv12_data2) {
+                    int nv12_stride2 = video_get_nv12_stride(app->video2);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
+                    }
+                    gl_render_nv12(app->gl, nv12_data2, video_width2, video_height2, nv12_stride2,
+                                   app->drm, app->keystone2, false, 1);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
+                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+                    }
+                    video2_rendered = true;
+                }
+            } else if (!use_hw_decode2 && new_secondary_frame_ready) {
+                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
+                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
                 if (y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
+                    }
                     gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
                                   y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
+                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+                    }
                     video2_rendered = true;
                 }
             }
@@ -1318,9 +1540,24 @@ void app_run(app_context_t *app) {
                     fprintf(stderr, "[VIDEO2] No valid frame data, rendering black\n");
                     black_frame_count++;
                 }
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
+                }
                 gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
                               0, 0, 0, app->drm, app->keystone2, false, 1);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
+                    upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+                }
             }
+        }
+
+        if (app->video2 && app->async_decoder_secondary &&
+            !app->video2->use_hardware_decode &&
+            secondary_async_request_pending && !secondary_async_requested) {
+            async_decode_request_frame(app->async_decoder_secondary);
+            secondary_async_requested = true;
+            secondary_async_request_pending = false;
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
@@ -1448,7 +1685,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // OPTIMIZATION: Pre-decode next frame DURING vsync wait (for KMS path)
         // For KMS overlay, the vsync wait happens in drm_display_video_frame (line 1104)
         // We can overlap the next frame's decode with the current frame's display
-        if (first_frame_decoded && !next_frame_ready && frame_count > 0) {
+        if (!using_async_primary && first_frame_decoded && !next_frame_ready && frame_count > 0) {
             struct timespec predecode_start, predecode_end;
             clock_gettime(CLOCK_MONOTONIC, &predecode_start);
 
@@ -1506,6 +1743,41 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         }
         last_frame_time = current_time_drop;
         
+        // Per-frame detailed timing breakdown
+        double gl_render_time = (gl_render_end.tv_sec - gl_render_start.tv_sec) +
+                                (gl_render_end.tv_nsec - gl_render_start.tv_nsec) / 1e9;
+        double overlay_time = (overlay_end.tv_sec - overlay_start.tv_sec) +
+                             (overlay_end.tv_nsec - overlay_start.tv_nsec) / 1e9;
+        double swap_time = (swap_end.tv_sec - swap_start.tv_sec) +
+                          (swap_end.tv_nsec - swap_start.tv_nsec) / 1e9;
+        double upload_time = gl_render_time; // Upload happens during gl_render_frame calls
+        double warp_draw_time = overlay_time; // Warp+draw is overlay rendering
+        double total_stage_time = decode0_time + decode1_time + upload_time + warp_draw_time + swap_time;
+        
+        // Per-frame output (every 6 frames to reduce spam, ~10 fps @ 60fps capture)
+        if (app->show_timing && frame_count > 0 && frame_count % 6 == 0) {
+            printf("[PERF] Frame %d: decode0=%.2fms decode1=%.2fms upload=%.2fms warp+draw=%.2fms swap=%.2fms total=%.2fms\n",
+                   frame_count,
+                   decode0_time * 1000,
+                   decode1_time * 1000,
+                   upload_time * 1000,
+                   warp_draw_time * 1000,
+                   swap_time * 1000,
+                   total_stage_time * 1000);
+             // Only log NV12 conversion time if using hardware decode
+             if (app->video->use_hardware_decode || (app->video2 && app->video2->use_hardware_decode)) {
+                 char nv12_ms[2][16];
+                 char upload_ms[2][16];
+                 format_metric_ms(nv12_frame_time[0], nv12_ms[0], sizeof(nv12_ms[0]));
+                 format_metric_ms(nv12_frame_time[1], nv12_ms[1], sizeof(nv12_ms[1]));
+                 format_metric_ms(upload_frame_time[0], upload_ms[0], sizeof(upload_ms[0]));
+                 format_metric_ms(upload_frame_time[1], upload_ms[1], sizeof(upload_ms[1]));
+                 printf("          nv12_cpu(ms)=%s/%s gl_upload(ms)=%s/%s\n",
+                     nv12_ms[0], nv12_ms[1], upload_ms[0], upload_ms[1]);
+             }
+            fflush(stdout);
+        }
+        
         // Store timing samples for analysis (only if buffers allocated successfully)
         if (decode_times && render_times) {
             if (timing_samples < 300) {
@@ -1553,12 +1825,58 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                 printf("  Hardware decode: %s\n", video_is_hardware_decoded(app->video) ? "YES" : "NO");
                 printf("  Total time: %.3fms (decode + render)\n", (avg_decode + avg_render) * 1000);
                 printf("  Note: Low times indicate worker thread and pre-decode optimizations working\n");
+
+                // Only report NV12 stats when hardware decode is enabled
+                bool hw_v1 = video_is_hardware_decoded(app->video);
+                bool hw_v2 = app->video2 && video_is_hardware_decoded(app->video2);
+
+                if (hw_v1 || hw_v2) {
+                    for (int vid = 0; vid < 2; ++vid) {
+                        if (nv12_interval_count[vid] == 0) {
+                            nv12_interval_min[vid] = 0.0;
+                        }
+                        if (gl_upload_interval_count[vid] == 0) {
+                            gl_upload_interval_min[vid] = 0.0;
+                        }
+                    }
+
+                    printf("  NV12 CPU:  V1 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d) | V2 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d)\n",
+                           nv12_interval_count[0] ? (nv12_interval_sum[0] / nv12_interval_count[0]) * 1000.0 : 0.0,
+                           nv12_interval_min[0] * 1000.0,
+                           nv12_interval_max[0] * 1000.0,
+                           nv12_interval_count[0],
+                           nv12_interval_count[1] ? (nv12_interval_sum[1] / nv12_interval_count[1]) * 1000.0 : 0.0,
+                           nv12_interval_min[1] * 1000.0,
+                           nv12_interval_max[1] * 1000.0,
+                           nv12_interval_count[1]);
+
+                    printf("  GL Upload: V1 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d) | V2 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d)\n",
+                           gl_upload_interval_count[0] ? (gl_upload_interval_sum[0] / gl_upload_interval_count[0]) * 1000.0 : 0.0,
+                           gl_upload_interval_min[0] * 1000.0,
+                           gl_upload_interval_max[0] * 1000.0,
+                           gl_upload_interval_count[0],
+                           gl_upload_interval_count[1] ? (gl_upload_interval_sum[1] / gl_upload_interval_count[1]) * 1000.0 : 0.0,
+                           gl_upload_interval_min[1] * 1000.0,
+                           gl_upload_interval_max[1] * 1000.0,
+                           gl_upload_interval_count[1]);
+                }
                 
                 if (avg_decode + avg_render > target_frame_time * 1.1) {
                     printf("  ⚠ WARNING: Frame taking %.0f%% of budget!\n", 
                            ((avg_decode + avg_render) / target_frame_time) * 100);
                 }
                 fflush(stdout);
+
+                for (int vid = 0; vid < 2; ++vid) {
+                    nv12_interval_sum[vid] = 0.0;
+                    nv12_interval_min[vid] = 1e9;
+                    nv12_interval_max[vid] = 0.0;
+                    nv12_interval_count[vid] = 0;
+                    gl_upload_interval_sum[vid] = 0.0;
+                    gl_upload_interval_min[vid] = 1e9;
+                    gl_upload_interval_max[vid] = 0.0;
+                    gl_upload_interval_count[vid] = 0;
+                }
             }
         }
 
@@ -1569,6 +1887,43 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Must manually pace frames to avoid overwhelming the worker thread
         double total_frame_time = decode_time + render_time;
         double remaining_time = target_frame_time - total_frame_time;
+        
+        // PRODUCTION: PTS-based drift compensation to prevent timing skew over long playback
+        // Check if current wall-clock time matches where video playback should be
+        static double first_frame_wall_time = -1.0;
+        static double first_frame_pts_time = -1.0;
+        
+        if (app->video && app->video->frame && app->video->frame->pts != AV_NOPTS_VALUE) {
+            AVStream *stream = app->video->format_ctx->streams[app->video->video_stream_index];
+            if (stream && stream->time_base.den > 0) {
+                // Calculate video PTS in seconds
+                double frame_pts_seconds = (double)app->video->frame->pts * stream->time_base.num / stream->time_base.den;
+                
+                // Initialize baseline on first frame
+                if (first_frame_wall_time < 0) {
+                    first_frame_wall_time = current_total_time;
+                    first_frame_pts_time = frame_pts_seconds;
+                }
+                
+                // Calculate how far into playback we should be
+                double intended_wall_time = first_frame_wall_time + (frame_pts_seconds - first_frame_pts_time);
+                double wall_drift = current_total_time - intended_wall_time;
+                
+                // If we're significantly ahead or behind, adjust sleep time
+                // Max adjustment is +/- 20ms per frame to avoid jitter
+                if (fabs(wall_drift) > 0.001) {  // More than 1ms drift
+                    double drift_correction = wall_drift * 0.05;  // Smooth correction (5% per frame)
+                    drift_correction = (drift_correction > 0.020) ? 0.020 : drift_correction;
+                    drift_correction = (drift_correction < -0.020) ? -0.020 : drift_correction;
+                    remaining_time -= drift_correction;
+                    
+                    if (app->advanced_diagnostics && fabs(wall_drift) > 0.050) {
+                        fprintf(stderr, "[TIMING] Drift correction: %.1fms (total drift: %.1fms)\n",
+                               drift_correction * 1000, wall_drift * 1000);
+                    }
+                }
+            }
+        }
 
         // PRODUCTION FIX: Frame pacing to prevent jumpiness
         // Hardware decode is very fast (<1ms), we must enforce proper frame timing
@@ -1577,6 +1932,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             struct timespec sleep_time;
             sleep_time.tv_sec = 0;
             sleep_time.tv_nsec = (long)(remaining_time * 1000000000);
+            if (sleep_time.tv_nsec < 0) sleep_time.tv_nsec = 0;  // Clamp to 0
             nanosleep(&sleep_time, NULL);
         }
 
@@ -1593,40 +1949,57 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
 }
 
 void app_cleanup(app_context_t *app) {
-    if (app->async_decoder) {
-        async_decode_destroy(app->async_decoder);
-        app->async_decoder = NULL;
+    if (!app) {
+        return;
     }
+    
+    // Stop async decoders first before cleaning up videos
+    if (app->async_decoder_primary) {
+        async_decode_destroy(app->async_decoder_primary);
+        app->async_decoder_primary = NULL;
+    }
+    if (app->async_decoder_secondary) {
+        async_decode_destroy(app->async_decoder_secondary);
+        app->async_decoder_secondary = NULL;
+    }
+    
     if (app->input) {
         input_cleanup(app->input);
         free(app->input);
+        app->input = NULL;
     }
     if (app->keystone) {
         // Don't auto-save on exit - only save when user presses S key
         keystone_cleanup(app->keystone);
         free(app->keystone);
+        app->keystone = NULL;
     }
     if (app->keystone2) {
         keystone_cleanup(app->keystone2);
         free(app->keystone2);
+        app->keystone2 = NULL;
     }
     if (app->video) {
         video_cleanup(app->video);
         free(app->video);
+        app->video = NULL;
     }
     if (app->video2) {
         video_cleanup(app->video2);
         free(app->video2);
+        app->video2 = NULL;
     }
     if (app->gl) {
         gl_cleanup(app->gl);
         free(app->gl);
+        app->gl = NULL;
     }
     if (app->drm) {
         // Clean up KMS video overlay before general DRM cleanup
         drm_hide_video_plane(app->drm);
         drm_cleanup(app->drm);
         free(app->drm);
+        app->drm = NULL;
     }
 
     memset(app, 0, sizeof(*app));
