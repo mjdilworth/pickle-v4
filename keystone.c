@@ -4,6 +4,11 @@
 #include <string.h>
 #include <math.h>
 
+// Allow keystone quads to shrink dramatically while still rejecting
+// truly degenerate (near-zero area) configurations.
+#define KEYSTONE_MIN_AREA_MOVE   0.001f  // ~0.025% of full quad
+#define KEYSTONE_MIN_AREA_MATRIX 0.0005f // Keep solver guard slightly tighter
+
 // Matrix math utilities for perspective transformation
 static void matrix_identity(float *matrix) {
     memset(matrix, 0, 16 * sizeof(float));
@@ -111,7 +116,7 @@ static void calculate_perspective_matrix(float *matrix, const point_t corners[4]
     area = 0.5f * fabs(area);
     
     // If area is too small, use identity matrix to prevent instability
-    if (area < 0.01f) {
+    if (area < KEYSTONE_MIN_AREA_MATRIX) {
         // printf("Warning: Near-degenerate keystone configuration detected (area: %f). Using identity.\n", area);
         matrix_identity(matrix);
         return;
@@ -189,7 +194,7 @@ int keystone_init(keystone_context_t *keystone) {
     keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f, -1.0f};  // Corner 1 (visual)
     
     keystone->selected_corner = CORNER_TOP_LEFT; // Start with top-left corner selected
-    keystone->move_step = 0.010f; // Default movement per key press (1%)
+    keystone->move_step = 0.005f; // Default movement per key press (0.5% - fine control)
     keystone->matrix_dirty = true;
     keystone->corners_dirty = true;  // Initial corners need VBO upload
     keystone->show_corners = true;  // Show corners by default
@@ -250,7 +255,7 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy) {
         area = 0.5f * fabs(area);
         
         // If the resulting area is too small, revert the movement
-        if (area < 0.1f) {
+        if (area < KEYSTONE_MIN_AREA_MOVE) {
             // printf("Invalid keystone configuration prevented (area too small)\n");
             corner->x = prev_x;
             corner->y = prev_y;
@@ -278,11 +283,23 @@ const float* keystone_get_matrix(keystone_context_t *keystone) {
 }
 
 void keystone_reset_corners(keystone_context_t *keystone) {
-    keystone->corners[CORNER_TOP_LEFT]     = (point_t){-1.0f, -1.0f};
-    keystone->corners[CORNER_TOP_RIGHT]    = (point_t){ 1.0f, -1.0f};
-    keystone->corners[CORNER_BOTTOM_RIGHT] = (point_t){ 1.0f,  1.0f};
-    keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f,  1.0f};
-    
+    keystone->corners[CORNER_TOP_LEFT]     = (point_t){-1.0f,  1.0f};
+    keystone->corners[CORNER_TOP_RIGHT]    = (point_t){ 1.0f,  1.0f};
+    keystone->corners[CORNER_BOTTOM_RIGHT] = (point_t){ 1.0f, -1.0f};
+    keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f, -1.0f};
+
+    keystone->matrix_dirty = true;
+    keystone->corners_dirty = true;  // Mark corners VBO needs update
+}
+
+void keystone_set_inset_corners(keystone_context_t *keystone, float margin) {
+    // Set corners inset from the full -1.0 to 1.0 range by the specified margin
+    // margin is in normalized coordinates (0.0 to 1.0)
+    keystone->corners[CORNER_TOP_LEFT]     = (point_t){-1.0f + margin,  1.0f - margin};
+    keystone->corners[CORNER_TOP_RIGHT]    = (point_t){ 1.0f - margin,  1.0f - margin};
+    keystone->corners[CORNER_BOTTOM_RIGHT] = (point_t){ 1.0f - margin, -1.0f + margin};
+    keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f + margin, -1.0f + margin};
+
     keystone->matrix_dirty = true;
     keystone->corners_dirty = true;  // Mark corners VBO needs update
 }
@@ -312,19 +329,21 @@ bool keystone_help_visible(keystone_context_t *keystone) {
 }
 
 void keystone_increase_step_size(keystone_context_t *keystone) {
-    keystone->move_step += 0.01f;
-    if (keystone->move_step > 0.2f) {
-        keystone->move_step = 0.2f; // Max step size
+    // PRODUCTION: Smaller increments for finer control
+    keystone->move_step += 0.001f;  // 0.1% increment (was 1%)
+    if (keystone->move_step > 0.1f) {
+        keystone->move_step = 0.1f; // Max step size (reduced from 0.2)
     }
-    printf("Keystone step size: %.3f\n", keystone->move_step);
+    printf("Keystone step size: %.4f\n", keystone->move_step);
 }
 
 void keystone_decrease_step_size(keystone_context_t *keystone) {
-    keystone->move_step -= 0.01f;
-    if (keystone->move_step < 0.005f) {
-        keystone->move_step = 0.005f; // Min step size
+    // PRODUCTION: Smaller decrements for finer control
+    keystone->move_step -= 0.001f;  // 0.1% decrement (was 1%)
+    if (keystone->move_step < 0.001f) {
+        keystone->move_step = 0.001f; // Min step size (reduced from 0.005)
     }
-    printf("Keystone step size: %.3f\n", keystone->move_step);
+    printf("Keystone step size: %.4f\n", keystone->move_step);
 }
 
 float keystone_get_step_size(keystone_context_t *keystone) {
@@ -411,8 +430,25 @@ int keystone_save_settings(keystone_context_t *keystone) {
 int keystone_load_settings(keystone_context_t *keystone) {
     const char *filename = "pickle_keystone.conf";
     if (keystone_load_from_file(keystone, filename) != 0) {
-        // No config file, use defaults
-        return -1;
+        // No config file found - create one with reset/default values
+        printf("No keystone config found, creating default pickle_keystone.conf\n");
+
+        // Reset to default corner positions
+        keystone_reset_corners(keystone);
+
+        // Set default overlay states (all off)
+        keystone->show_corners = false;
+        keystone->show_border = false;
+        keystone->show_help = false;
+
+        // Save the default config
+        if (keystone_save_to_file(keystone, filename) == 0) {
+            printf("Created default pickle_keystone.conf with reset corner positions\n");
+            return 0;
+        } else {
+            printf("Warning: Failed to create default config file\n");
+            return -1;
+        }
     }
     return 0;
 }

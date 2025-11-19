@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  // For pthread_timedjoin_np
 #define _POSIX_C_SOURCE 199309L
 #define _DEFAULT_SOURCE
 #include "video_player.h"
@@ -6,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 #include <linux/input.h>
 #include <sys/stat.h>
 #include "production_config.h"
@@ -25,7 +27,7 @@ static int validate_video_file(const char *filename) {
     }
     
     // Check file size limits
-    if (st.st_size > MAX_VIDEO_FILE_SIZE) {
+    if ((unsigned long long)st.st_size > MAX_VIDEO_FILE_SIZE) {
         fprintf(stderr, "Error: Video file too large (%lld bytes, limit: %lld bytes)\n",
                 (long long)st.st_size, (long long)MAX_VIDEO_FILE_SIZE);
         return -1;
@@ -40,10 +42,32 @@ static int validate_video_file(const char *filename) {
     return 0;
 }
 
+// Show a notification message overlay for a specified duration
+static void show_notification(app_context_t *app, const char *message, double duration) {
+    if (!app || !message) return;
+
+    strncpy(app->notification_message, message, sizeof(app->notification_message) - 1);
+    app->notification_message[sizeof(app->notification_message) - 1] = '\0';
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    app->notification_start_time = ts.tv_sec + ts.tv_nsec / 1e9;
+    app->notification_duration = duration;
+    app->notification_active = true;
+}
+
 static bool process_keystone_movement(app_context_t *app, double delta_time, double target_frame_time) {
-    if (!app || !app->keystone || !app->input) {
+    if (!app || !app->input) {
         return false;
     }
+    
+    // Get active keystone
+    keystone_context_t *active_ks = (app->active_keystone == 1 && app->keystone2) ? app->keystone2 : app->keystone;
+    if (!active_ks) {
+        return false;
+    }
+    
+
 
     bool left = input_is_key_pressed(app->input, KEY_LEFT);
     bool right = input_is_key_pressed(app->input, KEY_RIGHT);
@@ -83,12 +107,12 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         move_y = up ? 1.0f : -1.0f;
     }
 
-    if (app->keystone->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
+    if (active_ks->selected_corner < 0 || (move_x == 0.0f && move_y == 0.0f)) {
         return false;
     }
     
     // Only allow movement if border or corners are visible
-    if (!app->keystone->show_border && !app->keystone->show_corners) {
+    if (!active_ks->show_border && !active_ks->show_corners) {
         return false;
     }
 
@@ -99,13 +123,175 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
         if (speed_scale > 3.0f) speed_scale = 3.0f;
     }
 
-    keystone_move_corner(app->keystone, move_x * speed_scale, move_y * speed_scale);
+    keystone_move_corner(active_ks, move_x * speed_scale, move_y * speed_scale);
     app->needs_redraw = true;
     return true;
 }
 
-int app_init(app_context_t *app, const char *video_file, bool loop_playback, 
-            bool show_timing, bool debug_gamepad, bool advanced_diagnostics) {
+// Async decode thread function for video 2
+static void* async_decode_thread(void *arg) {
+    async_decode_t *decoder = (async_decode_t *)arg;
+    
+    while (!decoder->should_exit) {
+        pthread_mutex_lock(&decoder->mutex);
+        
+        // Wait for signal to decode
+        while (!decoder->decoding && !decoder->should_exit) {
+            pthread_cond_wait(&decoder->cond, &decoder->mutex);
+        }
+        
+        if (decoder->should_exit) {
+            pthread_mutex_unlock(&decoder->mutex);
+            break;
+        }
+        
+        decoder->decoding = false;
+        pthread_mutex_unlock(&decoder->mutex);
+        
+        // Decode frame (outside lock to allow main thread to continue)
+        int result = video_decode_frame(decoder->video);
+        
+        pthread_mutex_lock(&decoder->mutex);
+        if (result == 0) {
+            decoder->frame_ready = true;
+            // Signal that frame is ready (for async_decode_wait_frame)
+            pthread_cond_signal(&decoder->cond);
+        }
+        pthread_mutex_unlock(&decoder->mutex);
+    }
+    
+    return NULL;
+}
+
+// Create async decoder for video 2
+async_decode_t* async_decode_create(video_context_t *video) {
+    async_decode_t *decoder = (async_decode_t *)malloc(sizeof(async_decode_t));
+    if (!decoder) {
+        fprintf(stderr, "Failed to allocate async decoder\n");
+        return NULL;
+    }
+    
+    decoder->video = video;
+    decoder->frame_ready = false;
+    decoder->decoding = false;
+    decoder->should_exit = false;
+    decoder->running = false;
+    
+    if (pthread_mutex_init(&decoder->mutex, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize decoder mutex\n");
+        free(decoder);
+        return NULL;
+    }
+    
+    if (pthread_cond_init(&decoder->cond, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize decoder condition variable\n");
+        pthread_mutex_destroy(&decoder->mutex);
+        free(decoder);
+        return NULL;
+    }
+    
+    // Start decode thread
+    if (pthread_create(&decoder->thread, NULL, async_decode_thread, decoder) != 0) {
+        fprintf(stderr, "Failed to create async decode thread\n");
+        pthread_cond_destroy(&decoder->cond);
+        pthread_mutex_destroy(&decoder->mutex);
+        free(decoder);
+        return NULL;
+    }
+    
+    decoder->running = true;
+    return decoder;
+}
+
+// Destroy async decoder
+void async_decode_destroy(async_decode_t *decoder) {
+    if (!decoder) return;
+
+    pthread_mutex_lock(&decoder->mutex);
+    decoder->should_exit = true;
+    pthread_cond_signal(&decoder->cond);
+    pthread_mutex_unlock(&decoder->mutex);
+
+    // PRODUCTION: Use timed join with 100ms timeout for fast shutdown
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_nsec += 100000000;  // 100ms
+    if (timeout.tv_nsec >= 1000000000) {
+        timeout.tv_sec++;
+        timeout.tv_nsec -= 1000000000;
+    }
+
+    int result = pthread_timedjoin_np(decoder->thread, NULL, &timeout);
+    if (result != 0) {
+        // Thread didn't exit in time - cancel it forcefully
+        pthread_cancel(decoder->thread);
+        pthread_join(decoder->thread, NULL);
+    }
+
+    pthread_mutex_destroy(&decoder->mutex);
+    pthread_cond_destroy(&decoder->cond);
+
+    free(decoder);
+}
+
+// Request decode of next frame
+void async_decode_request_frame(async_decode_t *decoder) {
+    if (!decoder) return;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    decoder->frame_ready = false;
+    decoder->decoding = true;
+    pthread_cond_signal(&decoder->cond);
+    pthread_mutex_unlock(&decoder->mutex);
+}
+
+// Check if frame is ready
+bool async_decode_frame_ready(async_decode_t *decoder) {
+    if (!decoder) return false;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    bool ready = decoder->frame_ready;
+    pthread_mutex_unlock(&decoder->mutex);
+    
+    return ready;
+}
+
+// Wait for frame to be ready (with timeout in milliseconds)
+bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
+    if (!decoder) return false;
+    
+    pthread_mutex_lock(&decoder->mutex);
+    
+    // If already ready, return immediately
+    if (decoder->frame_ready) {
+        pthread_mutex_unlock(&decoder->mutex);
+        return true;
+    }
+    
+    // Wait with timeout
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    
+    while (!decoder->frame_ready && !decoder->should_exit) {
+        if (pthread_cond_timedwait(&decoder->cond, &decoder->mutex, &ts) == ETIMEDOUT) {
+            pthread_mutex_unlock(&decoder->mutex);
+            return false;
+        }
+    }
+    
+    bool ready = decoder->frame_ready;
+    pthread_mutex_unlock(&decoder->mutex);
+    return ready;
+}
+
+int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback,
+            bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode) {
     printf("app_init: Starting initialization...\n");
     fflush(stdout);
     
@@ -115,15 +301,24 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         return -1;
     }
     
+    // Validate second video file if provided
+    if (video_file2 && validate_video_file(video_file2) != 0) {
+        fprintf(stderr, "Failed to validate second video file\n");
+        return -1;
+    }
+    
     memset(app, 0, sizeof(*app));
     
     // Set all flags
     app->video_file = video_file;
+    app->video_file2 = video_file2;
     app->running = true;
     app->loop_playback = loop_playback;
     app->show_timing = show_timing;
     app->debug_gamepad = debug_gamepad;
     app->advanced_diagnostics = advanced_diagnostics;
+    app->active_keystone = 0;  // Start with first keystone active
+    app->gamepad_corner_cycle_index = -1;  // Reset corner cycle
 
     // Allocate contexts
     app->drm = calloc(1, sizeof(display_ctx_t));
@@ -131,6 +326,17 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
     app->video = calloc(1, sizeof(video_context_t));
     app->keystone = calloc(1, sizeof(keystone_context_t));
     app->input = calloc(1, sizeof(input_context_t));
+    
+    // Allocate second video and keystone if second file provided
+    if (video_file2) {
+        app->video2 = calloc(1, sizeof(video_context_t));
+        app->keystone2 = calloc(1, sizeof(keystone_context_t));
+        if (!app->video2 || !app->keystone2) {
+            fprintf(stderr, "Failed to allocate second video/keystone contexts\n");
+            app_cleanup(app);
+            return -1;
+        }
+    }
 
     if (!app->drm || !app->gl || !app->video || !app->keystone || !app->input) {
         fprintf(stderr, "Failed to allocate contexts\n");
@@ -147,6 +353,13 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         app_cleanup(app);
         return -1;
     }
+    
+    // Initialize KMS video overlay plane (optional, for hardware zero-copy)
+    if (drm_init_video_plane(app->drm) == 0) {
+        printf("[KMS] Video overlay plane initialized successfully\n");
+    } else {
+        printf("[KMS] Video overlay plane not available (will use OpenGL fallback)\n");
+    }
 
     // Initialize OpenGL context
     if (gl_init(app->gl, app->drm) != 0) {
@@ -156,7 +369,7 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
     }
 
     // Initialize video decoder
-    if (video_init(app->video, video_file, app->advanced_diagnostics) != 0) {
+    if (video_init(app->video, video_file, app->advanced_diagnostics, enable_hardware_decode) != 0) {
         fprintf(stderr, "Failed to initialize video decoder\n");
         app_cleanup(app);
         return -1;
@@ -170,10 +383,29 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         return -1;
     }
     
-    printf("Video dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
+    printf("Video 1 dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
     
     // Set loop playback if requested
     video_set_loop(app->video, loop_playback);
+
+    // Initialize second video decoder if provided
+    if (video_file2) {
+        if (video_init(app->video2, video_file2, app->advanced_diagnostics, enable_hardware_decode) != 0) {
+            fprintf(stderr, "Failed to initialize second video decoder\n");
+            app_cleanup(app);
+            return -1;
+        }
+        
+        if (app->video2->width > MAX_VIDEO_WIDTH || app->video2->height > MAX_VIDEO_HEIGHT) {
+            fprintf(stderr, "Error: Video 2 dimensions %dx%d exceed limits (%dx%d max)\n",
+                    app->video2->width, app->video2->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
+            app_cleanup(app);
+            return -1;
+        }
+        
+        printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
+        video_set_loop(app->video2, loop_playback);
+    }
 
     // Initialize keystone correction
     if (keystone_init(app->keystone) != 0) {
@@ -187,6 +419,80 @@ int app_init(app_context_t *app, const char *video_file, bool loop_playback,
         printf("Loaded saved keystone settings from pickle_keystone.conf\n");
     } else {
         printf("No saved keystone settings found, using defaults\n");
+    }
+    
+    // Force show_corners and show_border to OFF at startup (user toggles with gamepad)
+    app->keystone->show_corners = false;
+    app->keystone->show_border = false;
+    
+    // CRITICAL FIX: Verify keystone corners are in correct physical positions
+    // If they're inverted or scrambled, reset them to ensure selection matches visual corners
+    // Check if corners are in correct order: TL should have Y > BR (Y positive = UP in normalized coords)
+    float tl_y = app->keystone->corners[CORNER_TOP_LEFT].y;
+    float br_y = app->keystone->corners[CORNER_BOTTOM_RIGHT].y;
+    if (tl_y < br_y) {  // TOP_LEFT Y should be > BOTTOM_RIGHT Y (1.0 > -1.0)
+        printf("WARNING: Keystone 1 corners are inverted/scrambled! Resetting to defaults.\n");
+        printf("  TL Y=%.2f, BR Y=%.2f (expected TL > BR)\n", tl_y, br_y);
+        keystone_reset_corners(app->keystone);
+        printf("Keystone 1 reset to correct defaults\n");
+    }
+    
+    // Initialize second keystone if second video provided
+    if (video_file2) {
+        if (keystone_init(app->keystone2) != 0) {
+            fprintf(stderr, "Failed to initialize second keystone correction\n");
+            app_cleanup(app);
+            return -1;
+        }
+
+        // Try to load saved keystone2 settings
+        if (keystone_load_from_file(app->keystone2, "pickle_keystone2.conf") == 0) {
+            printf("Loaded saved keystone2 settings from pickle_keystone2.conf\n");
+            // Use saved settings as-is (borders off by default)
+            app->keystone2->show_corners = false;
+            app->keystone2->show_border = false;
+        } else {
+            // No keystone2 config found - create default dual-video setup
+            printf("No pickle_keystone2.conf found - creating default dual-video setup\n");
+
+            // Reset keystone 1 to full screen defaults
+            keystone_reset_corners(app->keystone);
+            printf("  Keystone 1 reset to full screen\n");
+
+            // Set keystone 2 to be inset inside keystone 1 with margin
+            float margin = 0.3f;  // 30% margin on each side
+            keystone_set_inset_corners(app->keystone2, margin);
+            printf("  Keystone 2 positioned inside keystone 1 with %.0f%% margin\n", margin * 100);
+
+            // Enable borders on BOTH keystones so user can see them
+            app->keystone->show_border = true;
+            app->keystone2->show_border = true;
+
+            // Disable corners and help overlay on both keystones
+            app->keystone->show_corners = false;
+            app->keystone->show_help = false;
+            app->keystone2->show_corners = false;
+            app->keystone2->show_help = false;
+
+            printf("  Borders enabled on both keystones for visibility\n");
+
+            // Save both configs
+            if (keystone_save_to_file(app->keystone, "pickle_keystone.conf") == 0) {
+                printf("  Saved default keystone 1 to pickle_keystone.conf\n");
+            }
+            if (keystone_save_to_file(app->keystone2, "pickle_keystone2.conf") == 0) {
+                printf("  Created pickle_keystone2.conf with default inset position\n");
+            }
+        }
+        
+        // Create async decoder for video 2
+        app->async_decoder = async_decode_create(app->video2);
+        if (!app->async_decoder) {
+            fprintf(stderr, "Failed to create async decoder for video 2\n");
+            app_cleanup(app);
+            return -1;
+        }
+        printf("Async decoder created for video 2\n");
     }
 
     // Initialize input handler
@@ -235,18 +541,30 @@ void app_run(app_context_t *app) {
         fflush(stdout);
     }
     
-    // IMPROVED: Simpler, more stable frame timing
-    double frame_budget = target_frame_time;  // How much time we have per frame
-    // 10% buffer for timing overhead
-    
-    // Adaptive frame timing variables
-    double min_frame_time = target_frame_time;  // Minimum frame time (target FPS)
-    double adaptive_frame_time = target_frame_time;  // Current adaptive frame time
+    // FIXED: VSync handles frame timing - no manual budgets needed
     
     // Frame timing diagnostics
-    struct timespec decode_start, decode_end, render_start, render_end;
+    // Timing measurement variables (render_start/render_end now local to render section)
+    struct timespec decode_start, decode_end;
     double total_decode_time = 0, total_render_time = 0;
-    int diagnostic_frame_count = 0;
+    int diagnostic_frame_count = 0;  // Counts successful decodes
+    int render_frame_count = 0;       // Counts every frame rendered (for accurate avg)
+    
+    // Frame timing analysis buffers
+    double *decode_times = malloc(300 * sizeof(double));  // Last 300 frames
+    double *render_times = malloc(300 * sizeof(double));  // Last 300 frames
+    
+    // Critical: Check malloc success before using
+    if (!decode_times || !render_times) {
+        fprintf(stderr, "Failed to allocate timing buffers\n");
+        free(decode_times);
+        free(render_times);
+        decode_times = NULL;
+        render_times = NULL;
+    }
+    
+    int timing_buffer_idx = 0;
+    int timing_samples = 0;
     
     // Add a timer to ensure we print timing data periodically regardless of frame counts
     struct timespec last_timing_report;
@@ -304,52 +622,137 @@ void app_run(app_context_t *app) {
             break;
         }
 
-        // Handle keystone corner selection - match visual numbering
-        // Key should select the corner with the matching visual number
+        // Handle keystone corner selection - standard clockwise numbering from top-left
+        // Keys 1-4 select corners for first keystone (video 1)
+        // Keys 5-8 select corners for second keystone (video 2)
+        // Standard layout: 1=top-left, 2=top-right, 3=bottom-right, 4=bottom-left (clockwise)
         if (input_is_key_just_pressed(app->input, KEY_1)) {
-            keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);  // Visual "1" (bottom-left)
+            keystone_select_corner(app->keystone, CORNER_TOP_LEFT);      // Key "1" = TL
+            app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_2)) {
-            keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT); // Visual "2" (bottom-right)
+            keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);     // Key "2" = TR
+            app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_3)) {
-            keystone_select_corner(app->keystone, CORNER_TOP_RIGHT);    // Visual "3" (top-right)
+            keystone_select_corner(app->keystone, CORNER_BOTTOM_RIGHT);  // Key "3" = BR
+            app->active_keystone = 0;
         } else if (input_is_key_just_pressed(app->input, KEY_4)) {
-            keystone_select_corner(app->keystone, CORNER_TOP_LEFT);     // Visual "4" (top-left)
+            keystone_select_corner(app->keystone, CORNER_BOTTOM_LEFT);   // Key "4" = BL
+            app->active_keystone = 0;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_5)) {
+            keystone_select_corner(app->keystone2, CORNER_TOP_LEFT);     // Key "5" = TL
+            app->active_keystone = 1;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_6)) {
+            keystone_select_corner(app->keystone2, CORNER_TOP_RIGHT);    // Key "6" = TR
+            app->active_keystone = 1;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_7)) {
+            keystone_select_corner(app->keystone2, CORNER_BOTTOM_RIGHT); // Key "7" = BR
+            app->active_keystone = 1;
+        } else if (app->keystone2 && input_is_key_just_pressed(app->input, KEY_8)) {
+            keystone_select_corner(app->keystone2, CORNER_BOTTOM_LEFT);  // Key "8" = BL
+            app->active_keystone = 1;
         }
         
         // Check for arrow key input (simply helps the corner movement by triggering input_is_key_pressed)
 
+        // Get active keystone
+        keystone_context_t *active_ks = (app->active_keystone == 1 && app->keystone2) ? app->keystone2 : app->keystone;
+        
         // Reset keystone to defaults
         if (input_is_key_just_pressed(app->input, KEY_R)) {
+            // Reset keystone 1 to full screen
             keystone_reset_corners(app->keystone);
-            printf("Keystone reset to defaults\n");
+            printf("Keystone 1 reset to defaults\n");
+            
+            // If second video exists, reset keystone 2 to a smaller inset area
+            if (app->keystone2) {
+                // Reset to defaults first
+                keystone_reset_corners(app->keystone2);
+                
+                // Then adjust to be slightly inset (10% margin on each side)
+                float inset = 0.10f; // 10% inset from edges
+                app->keystone2->corners[CORNER_TOP_LEFT].x = -1.0f + inset;      // TL X
+                app->keystone2->corners[CORNER_TOP_LEFT].y = 1.0f - inset;       // TL Y
+                app->keystone2->corners[CORNER_TOP_RIGHT].x = 1.0f - inset;      // TR X
+                app->keystone2->corners[CORNER_TOP_RIGHT].y = 1.0f - inset;      // TR Y
+                app->keystone2->corners[CORNER_BOTTOM_RIGHT].x = 1.0f - inset;   // BR X
+                app->keystone2->corners[CORNER_BOTTOM_RIGHT].y = -1.0f + inset;  // BR Y
+                app->keystone2->corners[CORNER_BOTTOM_LEFT].x = -1.0f + inset;   // BL X
+                app->keystone2->corners[CORNER_BOTTOM_LEFT].y = -1.0f + inset;   // BL Y
+                
+                keystone_calculate_matrix(app->keystone2);
+                printf("Keystone 2 reset to inset defaults (visible inside keystone 1)\n");
+            }
         }
         
         // Save keystone settings (S key or P key for compatibility)
         if (app->input->save_keystone) {
+            // Save both keystones
+            bool saved1 = false, saved2 = false;
+
             if (keystone_save_settings(app->keystone) == 0) {
-                printf("Keystone settings saved to pickle_keystone.conf\n");
+                printf("Keystone 1 settings saved to pickle_keystone.conf\n");
+                saved1 = true;
             } else {
-                printf("Failed to save keystone settings\n");
+                printf("Failed to save keystone 1 settings\n");
             }
+
+            if (app->keystone2) {
+                if (keystone_save_to_file(app->keystone2, "pickle_keystone2.conf") == 0) {
+                    printf("Keystone 2 settings saved to pickle_keystone2.conf\n");
+                    saved2 = true;
+                } else {
+                    printf("Failed to save keystone 2 settings\n");
+                }
+            }
+
+            // Show notification overlay
+            if (saved1 && saved2) {
+                printf("Both keystone configurations saved successfully\n");
+                show_notification(app, "Settings Saved!", 3.0);
+            } else if (saved1) {
+                show_notification(app, "Keystone 1 Saved!", 3.0);
+            } else if (saved2) {
+                show_notification(app, "Keystone 2 Saved!", 3.0);
+            } else {
+                show_notification(app, "Save Failed!", 3.0);
+            }
+
             app->input->save_keystone = false; // Reset flag
         }
         
         // Toggle corner visibility
         if (app->input->toggle_corners) {
-            keystone_toggle_corners(app->keystone);
-            app->input->toggle_corners = false; // Reset flag
+            if (app->keystone2) {
+                // Two videos: toggle BOTH keystones
+                app->keystone->show_corners = !app->keystone->show_corners;
+                app->keystone2->show_corners = !app->keystone2->show_corners;
+                printf("[TOGGLE] Corners: %s (both keystone 1 & 2)\n", 
+                       app->keystone->show_corners ? "ON" : "OFF");
+            } else {
+                // Single video: toggle only keystone 1
+                app->keystone->show_corners = !app->keystone->show_corners;
+                printf("[TOGGLE] Corners: %s (keystone 1 only)\n", 
+                       app->keystone->show_corners ? "ON" : "OFF");
+            }
+            app->input->toggle_corners = false;
         }
         
         // Toggle border visibility
         if (app->input->toggle_border) {
-            keystone_toggle_border(app->keystone);
-            printf("Border toggled: %s\n", app->keystone->show_border ? "ON" : "OFF");
-            app->input->toggle_border = false; // Reset flag
+            if (app->keystone2) {
+                // Two videos: toggle BOTH keystones
+                app->keystone->show_border = !app->keystone->show_border;
+                app->keystone2->show_border = !app->keystone2->show_border;
+            } else {
+                // Single video: toggle only keystone 1
+                app->keystone->show_border = !app->keystone->show_border;
+            }
+            app->input->toggle_border = false;
         }
         
         // Toggle help overlay visibility
         if (app->input->toggle_help) {
-            keystone_toggle_help(app->keystone);
+            keystone_toggle_help(active_ks);
             app->input->toggle_help = false; // Reset flag
         }
         
@@ -357,55 +760,142 @@ void app_run(app_context_t *app) {
         if (app->input->gamepad_enabled) {
             // X button: Cycle through corners
             if (app->input->gamepad_cycle_corner) {
-                int current = app->keystone->selected_corner;
+                // If video 2 EXISTS, cycle through all 8 corners (both keystones)
+                // Otherwise, cycle through only the 4 corners of the active keystone
                 
-                // If no corner selected, start with top-left
-                if (current < 0 || current > 3) {
-                    current = CORNER_TOP_LEFT;
-                    keystone_select_corner(app->keystone, current);
-                    printf("[X-CYCLE] Starting with index %d (TOP_LEFT)\n", current);
-                } else {
-                    // Cycle clockwise: TOP_LEFT(0) -> BOTTOM_LEFT(3) -> BOTTOM_RIGHT(2) -> TOP_RIGHT(1) -> TOP_LEFT
-                    int next;
-                    switch (current) {
-                        case CORNER_TOP_LEFT:     next = CORNER_BOTTOM_LEFT; break;
-                        case CORNER_BOTTOM_LEFT:  next = CORNER_BOTTOM_RIGHT; break;
-                        case CORNER_BOTTOM_RIGHT: next = CORNER_TOP_RIGHT; break;
-                        case CORNER_TOP_RIGHT:    next = CORNER_TOP_LEFT; break;
-                        default:                  next = CORNER_TOP_LEFT; break;
+                if (app->keystone2) {
+                    // Dual video mode - cycle through all 8 corners (1-8 mode)
+                    const char* corner_names[] = {"TL", "TR", "BR", "BL"};
+                    
+                    // Initialize index if first press
+                    if (app->gamepad_corner_cycle_index < 0 || app->gamepad_corner_cycle_index >= 8) {
+                        app->gamepad_corner_cycle_index = 0;
                     }
-                    keystone_select_corner(app->keystone, next);
-                    const char* names[] = {"TL", "TR", "BR", "BL"};
-                    printf("[X-CYCLE] %s(%.2f,%.2f) -> %s(%.2f,%.2f)\n", 
-                           names[current], app->keystone->corners[current].x, app->keystone->corners[current].y,
-                           names[next], app->keystone->corners[next].x, app->keystone->corners[next].y);
+                    
+                    // Determine which keystone and corner to select based on current index
+                    int next_index = app->gamepad_corner_cycle_index;  // Cache the index we're about to use
+                    keystone_context_t *target_keystone;
+                    int target_corner;
+                    int target_video;
+                    
+                    if (next_index < 4) {
+                        // Corners 0-3: Video 1 (corners TL, TR, BR, BL)
+                        target_keystone = app->keystone;
+                        target_corner = next_index;  // 0, 1, 2, or 3
+                        target_video = 1;
+                        app->active_keystone = 0;
+                    } else {
+                        // Corners 4-7: Video 2 (corners TL, TR, BR, BL)
+                        target_keystone = app->keystone2;
+                        target_corner = next_index - 4;  // 0, 1, 2, or 3
+                        target_video = 2;
+                        app->active_keystone = 1;
+                    }
+                    
+                    // DEBUG logging BEFORE change
+                    static int cycle_debug_count = 0;
+                    if (cycle_debug_count < 10) {  // Only log first 10 cycles
+                        printf("[X-CYCLE] Index=%d → Video %d corner %s (enum=%d)\n",
+                               next_index, target_video, corner_names[target_corner], target_corner);
+                        cycle_debug_count++;
+                    }
+                    
+                    // Select the corner
+                    keystone_select_corner(target_keystone, target_corner);
+                    target_keystone->show_corners = true;
+                    
+                    // Increment to next position for next button press
+                    app->gamepad_corner_cycle_index = (next_index + 1) % 8;
+                } else {
+                    // Single video mode - cycle through current keystone's 4 corners
+                    int current = active_ks->selected_corner;
+                    
+                    // If no corner selected, start with top-left
+                    if (current < 0 || current > 3) {
+                        current = CORNER_TOP_LEFT;
+                        keystone_select_corner(active_ks, current);
+                    } else {
+                        // Cycle clockwise: TOP_LEFT(0) -> TOP_RIGHT(1) -> BOTTOM_RIGHT(2) -> BOTTOM_LEFT(3) -> TOP_LEFT
+                        int next;
+                        switch (current) {
+                            case CORNER_TOP_LEFT:     next = CORNER_TOP_RIGHT; break;
+                            case CORNER_TOP_RIGHT:    next = CORNER_BOTTOM_RIGHT; break;
+                            case CORNER_BOTTOM_RIGHT: next = CORNER_BOTTOM_LEFT; break;
+                            case CORNER_BOTTOM_LEFT:  next = CORNER_TOP_LEFT; break;
+                            default:                  next = CORNER_TOP_LEFT; break;
+                        }
+                        keystone_select_corner(active_ks, next);
+                    }
                 }
                 app->input->gamepad_cycle_corner = false;
             }
             
             // L1/R1: Decrease/increase step size
             if (app->input->gamepad_decrease_step) {
-                keystone_decrease_step_size(app->keystone);
-                printf("[GAMEPAD] R1 - Step size decreased to %.6f\n", app->keystone->move_step);
+                keystone_decrease_step_size(active_ks);
+                printf("[GAMEPAD] R1 - Step size decreased to %.6f (keystone %d)\n", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_decrease_step = false;
             }
             if (app->input->gamepad_increase_step) {
-                keystone_increase_step_size(app->keystone);
-                printf("[GAMEPAD] L1 - Step size increased to %.6f\n", app->keystone->move_step);
+                keystone_increase_step_size(active_ks);
+                printf("[GAMEPAD] L1 - Step size increased to %.6f (keystone %d)\n", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_increase_step = false;
             }
             
             // SELECT: Reset keystone
             if (app->input->gamepad_reset_keystone) {
+                // Reset keystone 1 to full screen
                 keystone_reset_corners(app->keystone);
-                printf("Keystone reset to defaults (gamepad)\n");
+                printf("Keystone 1 reset to defaults (gamepad)\n");
+                
+                // If second video exists, reset keystone 2 to a smaller inset area
+                if (app->keystone2) {
+                    // Reset to defaults first
+                    keystone_reset_corners(app->keystone2);
+                    
+                    // Then adjust to be slightly inset (10% margin on each side)
+                    float inset = 0.10f; // 10% inset from edges
+                    app->keystone2->corners[CORNER_TOP_LEFT].x = -1.0f + inset;      // TL X
+                    app->keystone2->corners[CORNER_TOP_LEFT].y = 1.0f - inset;       // TL Y
+                    app->keystone2->corners[CORNER_TOP_RIGHT].x = 1.0f - inset;      // TR X
+                    app->keystone2->corners[CORNER_TOP_RIGHT].y = 1.0f - inset;      // TR Y
+                    app->keystone2->corners[CORNER_BOTTOM_RIGHT].x = 1.0f - inset;   // BR X
+                    app->keystone2->corners[CORNER_BOTTOM_RIGHT].y = -1.0f + inset;  // BR Y
+                    app->keystone2->corners[CORNER_BOTTOM_LEFT].x = -1.0f + inset;   // BL X
+                    app->keystone2->corners[CORNER_BOTTOM_LEFT].y = -1.0f + inset;   // BL Y
+                    
+                    keystone_calculate_matrix(app->keystone2);
+                    printf("Keystone 2 reset to inset defaults (gamepad)\n");
+                }
+                
                 app->input->gamepad_reset_keystone = false;
             }
             
             // START: Toggle keystone mode (corners visibility)
             if (app->input->gamepad_toggle_mode) {
-                keystone_toggle_corners(app->keystone);
+                if (app->keystone2) {
+                    // Two videos: toggle BOTH keystones
+                    keystone_toggle_corners(app->keystone);
+                    keystone_toggle_corners(app->keystone2);
+                } else {
+                    // Single video: toggle only keystone 1
+                    keystone_toggle_corners(app->keystone);
+                }
                 app->input->gamepad_toggle_mode = false;
+            }
+            
+            // B button: Toggle both corners and borders on all keystones
+            if (app->input->gamepad_toggle_corner_border) {
+                if (app->keystone2) {
+                    app->keystone->show_corners = !app->keystone->show_corners;
+                    app->keystone->show_border = !app->keystone->show_border;
+                    app->keystone2->show_corners = !app->keystone2->show_corners;
+                    app->keystone2->show_border = !app->keystone2->show_border;
+                } else {
+                    app->keystone->show_corners = !app->keystone->show_corners;
+                    app->keystone->show_border = !app->keystone->show_border;
+                }
+                app->input->gamepad_toggle_corner_border = false;
             }
         }
 
@@ -413,14 +903,22 @@ void app_run(app_context_t *app) {
         // This hides decode latency by overlapping decode with render/swap
         static bool next_frame_ready = false;
         static bool first_frame_decoded = false;
+        static bool first_frame_decoded2 = false;
         
-        // Decode video frame if enough time has passed
+        // Decode video frame continuously - vsync will handle timing
         uint8_t *video_data = NULL;
+        // PRODUCTION FIX: Make video2 YUV pointers static to prevent flickering
+        // These hold the last valid frame data even when async decoder isn't ready
+        static uint8_t *y_data2 = NULL, *u_data2 = NULL, *v_data2 = NULL;
+        static int y_stride2 = 0, u_stride2 = 0, v_stride2 = 0;
         static int frame_count = 0;
+        static int frame_count2 = 0;
         static uint8_t *last_video_data = NULL;
-        
-        if (delta_time >= frame_budget) {
-            // Update timing first to maintain consistent frame rate
+
+        // FIXED: Always decode/render, let vsync handle frame timing
+        // Old buggy logic: if (delta_time >= frame_budget) caused stuttering
+        {
+            // Update timing for diagnostics
             last_time = current_time;
             
             if (frame_count == 0 && !first_decode_attempted) {
@@ -454,8 +952,6 @@ void app_run(app_context_t *app) {
                         diagnostic_frame_count++;
                         
                         if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
-                            printf("DEBUG: Frame %d (pre-decoded, 0.0ms), diagnostic_frame_count=%d\n", 
-                                   frame_count, diagnostic_frame_count);
                             fflush(stdout);
                         }
                         
@@ -493,8 +989,6 @@ void app_run(app_context_t *app) {
                             diagnostic_frame_count++;
                             
                             if (app->show_timing && (frame_count % 10 == 0 || frame_count < 10)) {
-                                printf("DEBUG: Frame %d decoded (%.1fms), diagnostic_frame_count=%d\n", 
-                                       frame_count, decode_time * 1000, diagnostic_frame_count);
                                 fflush(stdout);
                             }
                             
@@ -510,7 +1004,8 @@ void app_run(app_context_t *app) {
                             first_decode_attempted = false;  // Reset to allow "Attempting first frame" message
                             frame_count = 0;
                             // Update startup_time to reset the 5-second timeout
-                            clock_gettime(CLOCK_MONOTONIC, &startup_time);
+                            clock_gettime(CLOCK_MONOTONIC, &current_time);
+                            startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
                         } else {
                             printf("Playback finished.\n");
                             app->running = false;
@@ -529,16 +1024,72 @@ void app_run(app_context_t *app) {
                 // Measure decode time (removed old code)
                 // clock_gettime(CLOCK_MONOTONIC, &decode_start);
                     
-                    // Show diagnostic info periodically
-                    if (app->show_timing && diagnostic_frame_count % 30 == 0) {
-                        double avg_decode_time = total_decode_time / diagnostic_frame_count;
-                        printf("Frame timing - Avg decode: %.1fms, Target: %.1fms, Frame count: %d\n",
-                               avg_decode_time * 1000, target_frame_time * 1000, diagnostic_frame_count);
-                        fflush(stdout);
-                    }
-                    
-                    // We now clear the arrow keys ONLY if we've successfully processed a movement
+                                        // We now clear the arrow keys ONLY if we've successfully processed a movement
             // This allows for continued movement if a corner is not selected
+            
+                // Decode second video if available
+                // Hardware decode: SYNCHRONOUS (both decoders in main thread - no competition)
+                // Software decode: ASYNC (CPU is slow, need background thread)
+                if (app->video2) {
+                    if (app->video2->use_hardware_decode) {
+                        // HARDWARE: Synchronous decode works better (no thread competition)
+                        int decode_result2 = video_decode_frame(app->video2);
+                        if (decode_result2 == 0) {
+                            frame_count2++;
+                            if (frame_count2 == 1) {
+                                printf("First frame of video 2 decoded successfully (HW sync)\n");
+                                first_frame_decoded2 = true;
+                                fflush(stdout);
+                            }
+                        }
+
+                        if (video_is_eof(app->video2)) {
+                            if (app->loop_playback) {
+                                video_seek(app->video2, 0);
+                                first_frame_decoded2 = false;
+                                frame_count2 = 0;
+                            }
+                        }
+                    } else if (app->async_decoder) {
+                        // SOFTWARE: Async decode (CPU is slow, need background thread)
+                        if (!first_frame_decoded2) {
+                            if (frame_count2 == 0) {
+                                async_decode_request_frame(app->async_decoder);
+                            }
+
+                            if (async_decode_wait_frame(app->async_decoder, 100)) {
+                                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+
+                                if (y_data2 != NULL) {
+                                    frame_count2++;
+                                    printf("First frame of video 2 decoded successfully (SW async)\n");
+                                    first_frame_decoded2 = true;
+                                    fflush(stdout);
+                                    async_decode_request_frame(app->async_decoder);
+                                }
+                            }
+                        } else {
+                            // Non-blocking check for async decoder
+                            if (async_decode_wait_frame(app->async_decoder, 0)) {
+                                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                                if (y_data2 != NULL) {
+                                    frame_count2++;
+                                }
+                                async_decode_request_frame(app->async_decoder);
+                            }
+                        }
+
+                        if (video_is_eof(app->video2)) {
+                            if (app->loop_playback) {
+                                video_seek(app->video2, 0);
+                                first_frame_decoded2 = false;
+                                frame_count2 = 0;
+                                async_decode_request_frame(app->async_decoder);
+                            }
+                        }
+                    }
+                }
+                
             if (app->keystone->selected_corner < 0) {
                 // No corner selected, clear key states to prevent movement later
                 app->input->keys_pressed[KEY_UP] = false;
@@ -546,11 +1097,8 @@ void app_run(app_context_t *app) {
                 app->input->keys_pressed[KEY_LEFT] = false;
                 app->input->keys_pressed[KEY_RIGHT] = false;
             }
-            }
-        } else {
-            // Use the last decoded frame for rendering
-            video_data = last_video_data;
-        }
+            }  // Close the frame decode block
+        } // End of main decode/render block
 
         // Get video dimensions
         int video_width = 0, video_height = 0;
@@ -565,66 +1113,253 @@ void app_run(app_context_t *app) {
         int y_stride, u_stride, v_stride;
         video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
         
-        static int debug_frame = 0;
-        if (debug_frame < 2) {
-            printf("Frame %d: YUV pointers: Y=%p U=%p V=%p\n", 
-                   debug_frame, (void*)y_data, (void*)u_data, (void*)v_data);
-            debug_frame++;
+        // PRODUCTION: Removed noisy YUV pointer debug output
+        // Only log if NULL (actual error condition)
+        static bool null_warned = false;
+        if (!y_data && !null_warned) {
+            printf("Warning: NULL YUV data pointer\n");
+            null_warned = true;
             fflush(stdout);
         }
         
-        // Measure render time with detailed breakdown
+        // CRITICAL: Start render timing RIGHT BEFORE actual GL operations
+        // Don't include async decode prep, input handling, or other non-render work
+        struct timespec render_start, render_end;
         clock_gettime(CLOCK_MONOTONIC, &render_start);
         struct timespec gl_render_start, gl_render_end, overlay_start, overlay_end, swap_start, swap_end;
         
         // Time the main GL rendering
         clock_gettime(CLOCK_MONOTONIC, &gl_render_start);
+
+        // Initialize overlay visibility flags (needed for goto skip path)
+        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners ||
+                                                     app->keystone->show_border));
+        bool any_overlay_visible2 = (app->keystone2 && (app->keystone2->show_corners ||
+                                                       app->keystone2->show_border));
+
+        // OPTIMIZATION: Blank video when help overlay is displayed (cleaner, faster, no flicker)
+        bool help_visible = (app->keystone && app->keystone->show_help) ||
+                           (app->keystone2 && app->keystone2->show_help);
+
+        if (help_visible) {
+            // Just render black screen when help is up
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            // Skip video rendering entirely - will render help overlay below
+            goto skip_video_render;
+        }
+
+        // Check if DMA buffer is available for zero-copy rendering
+        // Try KMS direct scanout first, then fall back to OpenGL if not available
+        bool has_dma = video_has_dma_buffer(app->video);
+        bool used_kms_overlay = false;  // Track if we used KMS path (no GL work needed)
+        bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
         
-        // Use NV12 format for optimized rendering
-        uint8_t *nv12_data = video_get_nv12_data(app->video);
-        int nv12_stride = video_get_nv12_stride(app->video);
-        
-        // DISABLED: NV12 rendering causes color issues - use separate YUV planes instead
-        if (false && nv12_data) {
-            // Render with NV12 packed format (faster - single texture upload)
-            gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride, app->drm, app->keystone);
+        // PRODUCTION FIX: Always use CPU/OpenGL path for hardware decode
+        // KMS overlay plane cannot apply keystone correction (no transformation matrix)
+        // Keystone correction is a core feature, so we must use OpenGL rendering
+        // This means hardware decoded frames are uploaded to GPU textures via CPU
+        if (false && has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
+            // KMS DIRECT SCANOUT PATH - DISABLED for keystone support
+            // This path bypasses OpenGL and cannot apply keystone transformation
+            // Keeping code for reference, but disabled to ensure keystone always works
+            int dma_fd = video_get_dma_fd(app->video);
+            if (dma_fd >= 0) {
+                static bool kms_init_done = false;
+                if (!kms_init_done && frame_count == 1) {
+                    printf("[KMS] ✓ Using KMS overlay plane for zero-copy hardware video\n");
+                    kms_init_done = true;
+                }
+
+                // Get actual plane layout from hardware decoder
+                int plane_offsets[3] = {0, 0, 0};
+                int plane_pitches[3] = {0, 0, 0};
+                video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
+
+                // Create framebuffer from DMA buffer
+                uint32_t fb_id = 0;
+                if (drm_create_video_fb(app->drm, dma_fd, video_width, video_height,
+                                       plane_offsets, plane_pitches, &fb_id) == 0) {
+                    // Display on overlay plane (hardware scanout, true zero-copy)
+                    // NOTE: drmModeSetPlane waits for vblank (~12-16ms on 60Hz display)
+                    // This is expected behavior for tear-free presentation
+                    drm_display_video_frame(app->drm, fb_id, 0, 0, video_width, video_height);
+                    used_kms_overlay = true;  // Successfully used KMS path
+                }
+
+                // Note: When using KMS overlay, video is on hardware plane
+                // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
+                // This is handled in the standard overlay rendering section below
+            }
+        } else if (has_dma) {
+            // OPENGL DMA PATH - Zero-copy rendering with DRM PRIME
+            // Works perfectly with overlays - they're rendered on top after video
+            // Keystone correction works fine - it's a GPU shader transformation
+            int dma_fd = video_get_dma_fd(app->video);
+            static int dma_render_count = 0;
+            if (frame_count == 1 || (dma_render_count < 3)) {
+                printf("[RENDER_TRACE] Frame %d: has_dma=true, dma_fd=%d (OpenGL DMA path - no overlays)\n", frame_count, dma_fd);
+                dma_render_count++;
+            }
+            if (dma_fd >= 0) {
+                // Use OpenGL EGL DMA rendering (may have driver issues on Pi 4)
+                if (frame_count == 1) {
+                    printf("[RENDER_TRACE] ✓ Using OpenGL EGL DMA rendering (FD=%d) - may have issues\n", dma_fd);
+                }
+                // Get actual plane layout from hardware decoder
+                int plane_offsets[3] = {0, 0, 0};
+                int plane_pitches[3] = {0, 0, 0};
+                video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
+                gl_render_frame_dma(app->gl, dma_fd, video_width, video_height,
+                                   plane_offsets, plane_pitches,
+                                   app->drm, app->keystone, true, 0);
+            } else {
+                // DMA FD not available, fall back to CPU upload
+                printf("[RENDER_TRACE] ⚠ has_dma=true but dma_fd=%d (fallback to CPU)\n", dma_fd);
+                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                if (y_data && u_data && v_data) {
+                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
+                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+                } else {
+                    gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
+                                  0, 0, 0, app->drm, app->keystone, true, 0);
+                }
+            }
         } else {
-            // Fallback to original YUV rendering (for compatibility)
+            // CPU RENDERING PATH
+            // Used only when: no DMA buffers available (software decode)
+            // PRODUCTION: Only log once on startup
+            static bool cpu_path_logged = false;
+            if (!cpu_path_logged) {
+                printf("[Render] Using CPU upload path (software decode)\n");
+                cpu_path_logged = true;
+            }
+            
+            // Fetch YUV data from decoder (with format conversion if needed)
             video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
             
             if (y_data && u_data && v_data) {
                 gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                              y_stride, u_stride, v_stride, app->drm, app->keystone);
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
             } else {
                 gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                              0, 0, 0, app->drm, app->keystone);
+                              0, 0, 0, app->drm, app->keystone, true, 0);
+            }
+        }
+        
+        // Render second video with second keystone (don't clear screen)
+        if (app->video2 && app->keystone2) {
+            // Get dimensions (safe to call anytime)
+            int video_width2 = app->video2->width;
+            int video_height2 = app->video2->height;
+            bool video2_rendered = false;
+
+            // Check if second video has DMA buffer (hardware decode)
+            bool has_dma2 = video_has_dma_buffer(app->video2);
+
+            if (has_dma2) {
+                // HARDWARE DMA PATH - Second video with zero-copy rendering
+                // Cache last valid DMA FD and layout to reuse when async decoder isn't ready
+                static int last_dma_fd2 = -1;
+                static int last_plane_offsets2[3] = {0, 0, 0};
+                static int last_plane_pitches2[3] = {0, 0, 0};
+
+                int dma_fd2 = video_get_dma_fd(app->video2);
+                static int dma_check_count = 0;
+                if (dma_check_count < 10) {
+                    fprintf(stderr, "[DEBUG] Video2: has_dma=%d, dma_fd=%d\n", has_dma2, dma_fd2);
+                    dma_check_count++;
+                }
+                if (dma_fd2 >= 0) {
+                    // New frame available - update cache
+                    int plane_offsets2[3] = {0, 0, 0};
+                    int plane_pitches2[3] = {0, 0, 0};
+                    video_get_dma_plane_layout(app->video2, plane_offsets2, plane_pitches2);
+
+                    last_dma_fd2 = dma_fd2;
+                    for (int i = 0; i < 3; i++) {
+                        last_plane_offsets2[i] = plane_offsets2[i];
+                        last_plane_pitches2[i] = plane_pitches2[i];
+                    }
+
+                    gl_render_frame_dma(app->gl, dma_fd2, video_width2, video_height2,
+                                       plane_offsets2, plane_pitches2,
+                                       app->drm, app->keystone2, false, 1);
+                    video2_rendered = true;
+                } else if (last_dma_fd2 >= 0) {
+                    // No new frame, but we have cached data - reuse last frame
+                    gl_render_frame_dma(app->gl, last_dma_fd2, video_width2, video_height2,
+                                       last_plane_offsets2, last_plane_pitches2,
+                                       app->drm, app->keystone2, false, 1);
+                    video2_rendered = true;
+                } else {
+                    // No DMA data at all yet - fall back to CPU upload
+                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
+                    if (y_data2 && u_data2 && v_data2) {
+                        gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
+                                      y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                        video2_rendered = true;
+                    }
+                }
+            } else {
+                // CPU PATH - Second video with software decode
+                // Use static YUV pointers that persist across frames
+                if (y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
+                    gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
+                                  y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                    video2_rendered = true;
+                }
+            }
+
+            // SAFETY: If video 2 failed to render, render black frame to prevent disappearing
+            if (!video2_rendered) {
+                static int black_frame_count = 0;
+                if (black_frame_count < 5) {
+                    fprintf(stderr, "[VIDEO2] No valid frame data, rendering black\n");
+                    black_frame_count++;
+                }
+                gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
+                              0, 0, 0, app->drm, app->keystone2, false, 1);
             }
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
-        
+
+skip_video_render:  // Jump here when help is visible to skip video rendering
+
         // Time overlay rendering
         clock_gettime(CLOCK_MONOTONIC, &overlay_start);
         
         // OPTIMIZED: Only render overlays when actually needed
-        bool any_overlay_visible = (app->keystone && (app->keystone->show_corners || 
-                                                     app->keystone->show_border || 
-                                                     app->keystone->show_help));
+        // Render overlays for first keystone
+        // NOTE: Overlay visibility was already checked above to determine rendering path
         if (any_overlay_visible) {
+            // No special GL setup needed - overlays render on top of video
+            // (we already switched to OpenGL path if overlays are visible)
+
+            // PRODUCTION FIX: Only deselect keystone1 if keystone2 is the active one
+            // This ensures only the ACTIVE keystone's corner is highlighted
+            int saved_selected_corner1 = -1;
+            if (app->keystone2 && app->active_keystone == 1 && app->keystone2->selected_corner >= 0) {
+                // Keystone 2 is active, temporarily hide keystone 1's selection
+                saved_selected_corner1 = app->keystone->selected_corner;
+                app->keystone->selected_corner = -1;
+            }
+
             // Only render the overlays that are actually visible
             if (app->keystone->show_corners) {
                 gl_render_corners(app->gl, app->keystone);
             }
             if (app->keystone->show_border) {
-                static int border_render_count = 0;
-                if (border_render_count < 3) {  // Only log first 3 times
-                    printf("Rendering border overlay (frame %d)\n", border_render_count + 1);
-                    border_render_count++;
-                }
                 gl_render_border(app->gl, app->keystone);
             }
             if (app->keystone->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone);
+            }
+
+            // Restore keystone1's selection if it was hidden
+            if (saved_selected_corner1 >= 0) {
+                app->keystone->selected_corner = saved_selected_corner1;
             }
             
             // NOTE: State restoration is now handled by gl_render_frame()
@@ -635,34 +1370,95 @@ void app_run(app_context_t *app) {
                 // Clear error queue
             }
         }
+
+        // ALWAYS render help overlay if visible (even when other overlays aren't)
+        // This allows help to display on blank screen when video is hidden
+        if (app->keystone && app->keystone->show_help) {
+            gl_render_help_overlay(app->gl, app->keystone);
+        }
+        if (app->keystone2 && app->keystone2->show_help) {
+            gl_render_help_overlay(app->gl, app->keystone2);
+        }
+
+        // Render overlays for second keystone
+        // PRODUCTION FIX: Only render keystone2 overlays when video2 has valid frame data
+        // This prevents flickering during initial startup before first frame is decoded
+        if (any_overlay_visible2 && y_data2) {
+            // PRODUCTION FIX: Only deselect keystone2 if keystone1 is the active one
+            // This ensures only the ACTIVE keystone's corner is highlighted
+            int saved_selected_corner = -1;
+            if (app->active_keystone == 0 && app->keystone->selected_corner >= 0) {
+                // Keystone 1 is active, temporarily hide keystone 2's selection
+                saved_selected_corner = app->keystone2->selected_corner;
+                app->keystone2->selected_corner = -1;
+            }
+
+            if (app->keystone2->show_corners) {
+                gl_render_corners(app->gl, app->keystone2);
+            }
+            if (app->keystone2->show_border) {
+                gl_render_border(app->gl, app->keystone2);
+            }
+            if (app->keystone2->show_help) {
+                gl_render_help_overlay(app->gl, app->keystone2);
+            }
+
+            // Restore the selection
+            if (saved_selected_corner >= 0) {
+                app->keystone2->selected_corner = saved_selected_corner;
+            }
+
+            while (glGetError() != GL_NO_ERROR) {
+                // Clear error queue
+            }
+        }
         
+        // Render notification overlay if active
+        if (app->notification_active) {
+            struct timespec current_ts;
+            clock_gettime(CLOCK_MONOTONIC, &current_ts);
+            double current_time = current_ts.tv_sec + current_ts.tv_nsec / 1e9;
+            double elapsed = current_time - app->notification_start_time;
+
+            if (elapsed < app->notification_duration) {
+                // Notification is still active - render it with text
+                gl_render_notification_overlay(app->gl, app->notification_message);
+            } else {
+                // Notification expired
+                app->notification_active = false;
+            }
+        }
+
         clock_gettime(CLOCK_MONOTONIC, &overlay_end);
-        
+
         // Time buffer swapping
         clock_gettime(CLOCK_MONOTONIC, &swap_start);
-        
-        // Swap buffers after all rendering is complete
-        gl_swap_buffers(app->gl, app->drm);
-        
+
+        // Only swap buffers if we rendered something in OpenGL
+        // When using KMS overlay without GL overlays, skip the swap (no vsync wait needed)
+        if (!used_kms_overlay || any_overlay_visible || any_overlay_visible2) {
+            gl_swap_buffers(app->gl, app->drm);
+        }
+
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
-        
-        // OPTIMIZATION: Pre-decode next frame while GPU presents current frame
-        // This overlaps decode with VSync wait, hiding decode latency
+
+        // Capture render_end after swap completes
+        clock_gettime(CLOCK_MONOTONIC, &render_end);
+
+        // OPTIMIZATION: Pre-decode next frame DURING vsync wait (for KMS path)
+        // For KMS overlay, the vsync wait happens in drm_display_video_frame (line 1104)
+        // We can overlap the next frame's decode with the current frame's display
         if (first_frame_decoded && !next_frame_ready && frame_count > 0) {
             struct timespec predecode_start, predecode_end;
             clock_gettime(CLOCK_MONOTONIC, &predecode_start);
-            
+
             int predecode_result = video_decode_frame(app->video);
-            
+
             clock_gettime(CLOCK_MONOTONIC, &predecode_end);
-            double predecode_time = (predecode_end.tv_sec - predecode_start.tv_sec) +
-                                   (predecode_end.tv_nsec - predecode_start.tv_nsec) / 1e9;
-            
+            // Note: predecode timing not currently logged but available if needed
+
             if (predecode_result == 0) {
                 next_frame_ready = true;
-                if (app->show_timing && frame_count < 5) {
-                    printf("Pre-decoded next frame in %.1fms (during swap/VSync)\n", predecode_time * 1000);
-                }
             } else if (video_is_eof(app->video)) {
                 // EOF during pre-decode - will be handled in main decode section next iteration
                 next_frame_ready = false;
@@ -671,102 +1467,136 @@ void app_run(app_context_t *app) {
             }
         }
         
-        clock_gettime(CLOCK_MONOTONIC, &render_end);
-        
-        // Calculate detailed timing for debugging
-        double gl_time = (gl_render_end.tv_sec - gl_render_start.tv_sec) + 
-                        (gl_render_end.tv_nsec - gl_render_start.tv_nsec) / 1e9;
-        double overlay_time = (overlay_end.tv_sec - overlay_start.tv_sec) + 
-                             (overlay_end.tv_nsec - overlay_start.tv_nsec) / 1e9;
-        double swap_time = (swap_end.tv_sec - swap_start.tv_sec) + 
-                          (swap_end.tv_nsec - swap_start.tv_nsec) / 1e9;
-                          
-        // Check if we should do a time-based timing report (every 2 seconds)
-        if (app->show_timing) {
-            struct timespec current_report_time;
-            clock_gettime(CLOCK_MONOTONIC, &current_report_time);
-            double time_since_report = (current_report_time.tv_sec - last_timing_report.tv_sec) + 
-                                      (current_report_time.tv_nsec - last_timing_report.tv_nsec) / 1e9;
-                                      
-            if (time_since_report >= 2.0) {  // Every 2 seconds
-                printf("\n[TIME-BASED] Frames decoded: %d, Diagnostic frames: %d\n",
-                       frame_count, diagnostic_frame_count);
-                printf("[TIME-BASED] Last decode: %.1fms, Last render: %.1fms, Swap: %.1fms\n",
-                       decode_time * 1000, render_time * 1000, swap_time * 1000);
-                       
-                // Log to file as well
-                FILE *timing_log = fopen("timing_log.txt", "a");
-                if (timing_log) {
-                    fprintf(timing_log, "[%d] Frames: %d, Decode: %.1fms, Render: %.1fms\n",
-                           (int)current_report_time.tv_sec, frame_count, 
-                           decode_time * 1000, render_time * 1000);
-                    fclose(timing_log);
-                }
-                
-                // Reset the timer
-                last_timing_report = current_report_time;
-                fflush(stdout);
-            }
-        }
-        
-        // Report detailed timing for long frames
-        if (app->show_timing) {
-            static int detailed_timing_count = 0;
-            if (swap_time > 0.050 || (detailed_timing_count++ % 60 == 0)) { // Every second or if swap > 50ms
-                printf("Detailed timing - GL: %.1fms, Overlays: %.1fms, Swap: %.1fms\n",
-                       gl_time * 1000, overlay_time * 1000, swap_time * 1000);
-                fflush(stdout);
-            }
-        }
+        // Note: Video 2 pre-decode is now handled by async decoder thread
+        // No need for manual pre-decode here
+
+        // Update render_time from actual local timestamps
         render_time = (render_end.tv_sec - render_start.tv_sec) +
-                    (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
+                     (render_end.tv_nsec - render_start.tv_nsec) / 1e9;
         
         total_render_time += render_time;
+        render_frame_count++;  // Increment frame counter for every rendered frame
+        
+        // FRAME DROP DETECTION: Track dropped frames for diagnostics
+        static struct timespec last_frame_time = {0, 0};
+        static int frame_drop_count = 0;
+        static int frame_drop_reports = 0;
+
+        struct timespec current_time_drop;
+        clock_gettime(CLOCK_MONOTONIC, &current_time_drop);
+
+        if (last_frame_time.tv_sec != 0) {
+            double time_since_last = (current_time_drop.tv_sec - last_frame_time.tv_sec) +
+                                   (current_time_drop.tv_nsec - last_frame_time.tv_nsec) / 1e9;
+
+            // At 60fps, frames should arrive every ~16.7ms
+            // If we see >25ms, we may have dropped a frame
+            if (time_since_last > 0.025 && render_frame_count > 10) {
+                frame_drop_count++;
+                // PRODUCTION: Only report first 5 drops, then summary every 100 frames
+                if (frame_drop_reports < 5) {
+                    printf("⚠ [FRAME DROP] Frame %d: %.1fms since last frame (expected ~16.7ms)\n",
+                           render_frame_count, time_since_last * 1000);
+                    frame_drop_reports++;
+                    if (frame_drop_reports == 5) {
+                        printf("  (Further frame drops will be summarized periodically)\n");
+                    }
+                }
+            }
+        }
+        last_frame_time = current_time_drop;
+        
+        // Store timing samples for analysis (only if buffers allocated successfully)
+        if (decode_times && render_times) {
+            if (timing_samples < 300) {
+                decode_times[timing_buffer_idx] = decode_time;
+                render_times[timing_buffer_idx] = render_time;
+                timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+                timing_samples++;
+            } else {
+                decode_times[timing_buffer_idx] = decode_time;
+                render_times[timing_buffer_idx] = render_time;
+                timing_buffer_idx = (timing_buffer_idx + 1) % 300;
+            }
+        }
+        
+        // Detailed frame timing analysis every 30 frames
+        if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0 && decode_times && render_times) {
+            static int last_reported_frame = -1;
+            
+            // Only print once per unique frame milestone
+            if (diagnostic_frame_count != last_reported_frame) {
+                last_reported_frame = diagnostic_frame_count;
+                
+                double avg_decode = 0, min_decode = 999, max_decode = 0;
+                double avg_render = 0, min_render = 999, max_render = 0;
+                int samples = timing_samples < 300 ? timing_samples : 300;
+                
+                for (int i = 0; i < samples; i++) {
+                    avg_decode += decode_times[i];
+                    avg_render += render_times[i];
+                    if (decode_times[i] < min_decode) min_decode = decode_times[i];
+                    if (decode_times[i] > max_decode) max_decode = decode_times[i];
+                    if (render_times[i] < min_render) min_render = render_times[i];
+                    if (render_times[i] > max_render) max_render = render_times[i];
+                }
+                
+                avg_decode /= samples;
+                avg_render /= samples;
+                
+                printf("\n[TIMING ANALYSIS - Frame %d]\n", diagnostic_frame_count);
+                printf("  DECODE:  Avg: %.3fms, Min: %.3fms, Max: %.3fms (samples: %d)\n",
+                       avg_decode * 1000, min_decode * 1000, max_decode * 1000, samples);
+                printf("  RENDER:  Avg: %.3fms, Min: %.3fms, Max: %.3fms\n",
+                       avg_render * 1000, min_render * 1000, max_render * 1000);
+                printf("  Target frame time: %.2fms\n", target_frame_time * 1000);
+                printf("  Hardware decode: %s\n", video_is_hardware_decoded(app->video) ? "YES" : "NO");
+                printf("  Total time: %.3fms (decode + render)\n", (avg_decode + avg_render) * 1000);
+                printf("  Note: Low times indicate worker thread and pre-decode optimizations working\n");
+                
+                if (avg_decode + avg_render > target_frame_time * 1.1) {
+                    printf("  ⚠ WARNING: Frame taking %.0f%% of budget!\n", 
+                           ((avg_decode + avg_render) / target_frame_time) * 100);
+                }
+                fflush(stdout);
+            }
+        }
 
         // Process keystone movement immediately after input update
         process_keystone_movement(app, delta_time, target_frame_time);
 
-        // Implement variable frame rate control based on performance
+        // FIXED: For KMS overlay, drmModeSetPlane doesn't reliably wait for vsync on RPi
+        // Must manually pace frames to avoid overwhelming the worker thread
         double total_frame_time = decode_time + render_time;
-        double remaining_time = adaptive_frame_time - total_frame_time;
-        
-        if (remaining_time > 0.001) { // Only sleep if >1ms remaining
-            // OPTIMIZED: Use nanosleep for better precision
+        double remaining_time = target_frame_time - total_frame_time;
+
+        // PRODUCTION FIX: Frame pacing to prevent jumpiness
+        // Hardware decode is very fast (<1ms), we must enforce proper frame timing
+        // to match video FPS and display refresh rate
+        if (remaining_time > 0.0005) {  // Sleep if we have at least 0.5ms remaining
             struct timespec sleep_time;
             sleep_time.tv_sec = 0;
             sleep_time.tv_nsec = (long)(remaining_time * 1000000000);
             nanosleep(&sleep_time, NULL);
-            
-            // Show render diagnostics periodically
-            if (app->show_timing && diagnostic_frame_count % 30 == 0 && diagnostic_frame_count > 0) {
-                double avg_render_time = total_render_time / diagnostic_frame_count;
-                printf("Render timing - Avg render: %.1fms, Total frame: %.1fms, Frames: %d\n",
-                       avg_render_time * 1000, total_frame_time * 1000, diagnostic_frame_count);
-                fflush(stdout);
-            }
-        } else {
-            // We're running behind - no sleep, but don't make timing worse
-            if (app->show_timing) {
-                printf("Frame overrun: %.1fms (target: %.1fms)\n", 
-                       total_frame_time * 1000, adaptive_frame_time * 1000);
-                fflush(stdout);
-            }
-            
-            // FIXED: Only increase timing slightly if consistently overrunning
-            static int overrun_count = 0;
-            overrun_count++;
-            if (overrun_count > 5) { // Only after 5 consecutive overruns
-                adaptive_frame_time += 0.001; // Add 1ms, don't multiply
-                if (adaptive_frame_time > min_frame_time * 2) {
-                    adaptive_frame_time = min_frame_time * 2; // Max 33ms for 30fps
-                }
-                overrun_count = 0;
-            }
         }
-    }
+
+        if (app->show_timing && total_frame_time > target_frame_time * 1.5) {
+            printf("⚠ Frame processing slow: %.1fms (target: %.1fms)\n",
+                   total_frame_time * 1000, target_frame_time * 1000);
+            fflush(stdout);
+        }
+    }  // End while (app->running)
+    
+    // Cleanup timing buffers
+    if (decode_times) free(decode_times);
+    if (render_times) free(render_times);
 }
 
 void app_cleanup(app_context_t *app) {
+    if (app->async_decoder) {
+        async_decode_destroy(app->async_decoder);
+        app->async_decoder = NULL;
+    }
     if (app->input) {
         input_cleanup(app->input);
         free(app->input);
@@ -776,15 +1606,25 @@ void app_cleanup(app_context_t *app) {
         keystone_cleanup(app->keystone);
         free(app->keystone);
     }
+    if (app->keystone2) {
+        keystone_cleanup(app->keystone2);
+        free(app->keystone2);
+    }
     if (app->video) {
         video_cleanup(app->video);
         free(app->video);
+    }
+    if (app->video2) {
+        video_cleanup(app->video2);
+        free(app->video2);
     }
     if (app->gl) {
         gl_cleanup(app->gl);
         free(app->gl);
     }
     if (app->drm) {
+        // Clean up KMS video overlay before general DRM cleanup
+        drm_hide_video_plane(app->drm);
         drm_cleanup(app->drm);
         free(app->drm);
     }

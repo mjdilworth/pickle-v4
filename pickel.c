@@ -15,9 +15,14 @@ static void signal_handler(int sig) {
     // CRITICAL: Only async-signal-safe operations here!
     // Do NOT call printf, malloc, free, pthread functions, etc.
     g_signal_received = sig;
-    
-    // Re-raise to get default behavior (but allow atexit to run)
-    signal(sig, SIG_DFL);
+
+    // PRODUCTION FIX: Stop the main loop immediately for fast shutdown
+    if (g_app) {
+        g_app->running = false;  // Safe: atomic write to bool
+    }
+
+    // Don't re-raise immediately - let cleanup happen first
+    // signal(sig, SIG_DFL);
 }
 
 static void cleanup_on_exit(void) {
@@ -57,8 +62,10 @@ int main(int argc, char *argv[]) {
     bool show_timing = false;
     bool debug_gamepad = false;
     bool advanced_diagnostics = false;
+    bool enable_hardware_decode = false;  // Changed: now defaults to software
     char *video_file = NULL;
-    
+    char *video_file2 = NULL;
+
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0) {
@@ -70,18 +77,23 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--hw-debug") == 0) {
             advanced_diagnostics = true;
             printf("Advanced hardware decoder diagnostics enabled\n");
+        } else if (strcmp(argv[i], "--hw") == 0) {
+            enable_hardware_decode = true;
+            printf("Hardware decode enabled (--hw flag set)\n");
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
+            fprintf(stderr, "Usage: %s [options] <video_file1.mp4> [video_file2.mp4]\n", argv[0]);
             fprintf(stderr, "\nOptions:\n");
             fprintf(stderr, "  -l               Loop video playback\n");
             fprintf(stderr, "  --timing         Show frame timing information\n");
             fprintf(stderr, "  --debug-gamepad  Log gamepad button presses\n");
             fprintf(stderr, "  --hw-debug       Enable detailed hardware decoder diagnostics\n");
+            fprintf(stderr, "  --hw             Enable hardware decode (default: software)\n");
             fprintf(stderr, "  -h, --help       Show this help message\n");
             fprintf(stderr, "\nKeyboard Controls:\n");
             fprintf(stderr, "  q/ESC    Quit\n");
             fprintf(stderr, "  h        Toggle help overlay\n");
-            fprintf(stderr, "  1-4      Select keystone corners\n");
+            fprintf(stderr, "  1-4      Select keystone corners (video 1)\n");
+            fprintf(stderr, "  5-8      Select keystone corners (video 2)\n");
             fprintf(stderr, "  arrows   Move selected corner\n");
             fprintf(stderr, "  r        Reset keystone\n");
             fprintf(stderr, "  s        Save keystone settings\n");
@@ -98,7 +110,14 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  START+SELECT (2s)  Quit\n");
             return 0;
         } else if (argv[i][0] != '-') {
-            video_file = argv[i];
+            if (!video_file) {
+                video_file = argv[i];
+            } else if (!video_file2) {
+                video_file2 = argv[i];
+            } else {
+                fprintf(stderr, "Too many video files specified\n");
+                return 1;
+            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             fprintf(stderr, "Use -h or --help for usage information\n");
@@ -108,7 +127,7 @@ int main(int argc, char *argv[]) {
     
     if (!video_file) {
         fprintf(stderr, "Error: No video file specified\n");
-        fprintf(stderr, "Usage: %s [options] <video_file.mp4>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options] <video_file1.mp4> [video_file2.mp4]\n", argv[0]);
         fprintf(stderr, "Use -h or --help for more information\n");
         return 1;
     }
@@ -126,7 +145,7 @@ int main(int argc, char *argv[]) {
     setup_signal_handlers();
     
     // Initialize and run the video player
-    if (app_init(&app, video_file, loop_playback, show_timing, debug_gamepad, advanced_diagnostics) != 0) {
+    if (app_init(&app, video_file, video_file2, loop_playback, show_timing, debug_gamepad, advanced_diagnostics, enable_hardware_decode) != 0) {
         fprintf(stderr, "Failed to initialize application\n");
         g_app = NULL;  // Clear global reference
         return 1;

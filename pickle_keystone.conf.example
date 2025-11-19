@@ -1,9 +1,0 @@
-# Pickle Keystone Configuration v1.0
-show_corners=1
-show_border=1
-show_help=1
-# Corner positions (x y)
-corner0=-1.000000 1.000000
-corner1=1.000000 1.000000
-corner2=1.000000 -1.000000
-corner3=-1.000000 -1.000000

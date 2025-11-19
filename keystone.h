@@ -36,6 +36,7 @@ void keystone_move_corner(keystone_context_t *keystone, float dx, float dy);
 void keystone_calculate_matrix(keystone_context_t *keystone);
 const float* keystone_get_matrix(keystone_context_t *keystone);
 void keystone_reset_corners(keystone_context_t *keystone);
+void keystone_set_inset_corners(keystone_context_t *keystone, float margin);
 void keystone_toggle_corners(keystone_context_t *keystone);
 bool keystone_corners_visible(keystone_context_t *keystone);
 void keystone_toggle_border(keystone_context_t *keystone);

@@ -39,14 +39,34 @@ typedef struct {
     bool loop_playback;
     bool using_drm_prime;
     bool advanced_diagnostics; // Flag for detailed diagnostics output
+    bool enable_hardware_decode; // Flag to enable hardware decode (--hw flag)
     
     // 2-stage Bitstream filter chain for V4L2 M2M: avcC→Annex-B + AUD insertion
     AVBSFContext *bsf_annexb_ctx;    // Stage 1: h264_mp4toannexb (avcC to Annex-B conversion)
     AVBSFContext *bsf_aud_ctx;       // Stage 2: h264_metadata (AUD insertion)
+    
+    // V4L2 M2M hardware decoder device handle for DMA buffer export
+    int v4l2_fd;                     // V4L2 device file descriptor (-1 if unavailable)
+    unsigned int v4l2_buffer_index;  // Current output buffer index from V4L2 M2M decoder
+    
+    // Hardware acceleration contexts (FFmpeg hwaccel API)
+    AVBufferRef *hw_device_ctx;      // Hardware device context (DRM/VAAPI/etc)
+    AVBufferRef *hw_frames_ctx;      // Hardware frames context for zero-copy buffers
+    enum AVPixelFormat hw_pix_fmt;   // Hardware pixel format (AV_PIX_FMT_DRM_PRIME/NV12)
+    
+    // DMA buffer zero-copy support (for hardware decoded frames)
+    bool supports_dma_export;        // True if hardware decoder supports DMA buffer export
+    int dma_fd;                      // DMA buffer file descriptor for current frame (-1 if unavailable)
+    int dma_offset;                  // Byte offset within DMA buffer where frame data starts
+    size_t dma_size;                 // Total size of DMA buffer
+    
+    // DMA plane layout (for YUV420P zero-copy rendering)
+    int dma_plane_offset[3];         // Byte offsets for Y, U, V planes
+    int dma_plane_pitch[3];          // Pitch (stride) for Y, U, V planes
 } video_context_t;
 
 // Video decoder functions
-int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics);
+int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool enable_hardware_decode);
 void video_cleanup(video_context_t *video);
 int video_decode_frame(video_context_t *video);
 uint8_t* video_get_rgb_data(video_context_t *video);  // Legacy - for fallback
@@ -67,5 +87,16 @@ void video_get_dimensions(video_context_t *video, int *width, int *height);
 bool video_is_hardware_decoded(video_context_t *video);
 int video_restart_playback(video_context_t *video);
 void video_set_loop(video_context_t *video, bool loop);
+
+// DMA buffer zero-copy support
+bool video_has_dma_buffer(video_context_t *video);
+int video_get_dma_fd(video_context_t *video);
+void video_get_dma_plane_layout(video_context_t *video, int offsets[3], int pitches[3]);
+int video_get_dma_fd(video_context_t *video);
+int video_get_dma_offset(video_context_t *video);
+size_t video_get_dma_size(video_context_t *video);
+
+// Debug flag for hardware decoder diagnostics
+extern bool hw_debug_enabled;
 
 #endif // VIDEO_DECODER_H

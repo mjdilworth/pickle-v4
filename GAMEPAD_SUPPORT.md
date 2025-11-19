@@ -24,14 +24,15 @@ You'll see one of these messages:
 - **Left Analog Stick**: Move selected corner (smooth analog control with 25% deadzone)
 
 ### Keystone Adjustments
-- **L1 (Left Bumper)**: Decrease movement step size (minimum 0.005, decrements by 0.01)
-- **R1 (Right Bumper)**: Increase movement step size (maximum 0.20, increments by 0.01)
+- **L1 (Left Bumper)**: Increase movement step size (increments of 0.001 up to 0.10)
+- **R1 (Right Bumper)**: Decrease movement step size (decrements of 0.001 down to 0.001)
 - **SELECT**: Reset keystone to defaults
+- **START**: Save the current keystone configuration
 
 ### Display Toggles
-- **START**: Toggle keystone corners visibility (show/hide numbered markers)
-- **B Button**: Toggle help overlay
-- **HOME (Guide)**: Toggle border outline
+- **B Button**: Toggle both keystone borders and corner markers on every active keystone
+- **Y Button**: Toggle help overlay
+- **HOME (Guide)**: Toggle corner visibility mode (same as keyboard `c`)
 
 ### Application Control
 - **START + SELECT (hold 2 seconds)**: Quit application

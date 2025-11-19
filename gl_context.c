@@ -2,6 +2,7 @@
 #include "gl_context.h"
 #include "drm_display.h"
 #include "keystone.h"
+#include "video_decoder.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,74 @@ static inline void copy_with_stride_simd(uint8_t *dst, const uint8_t *src,
 // Forward declarations
 static void draw_char_simple(float *vertices, int *vertex_count, char c, float x, float y, float size);
 static void draw_text_simple(float *vertices, int *vertex_count, const char *text, float x, float y, float size);
+
+// GLeglImageOES type definition (in case headers don't provide it)
+#ifndef GLeglImageOES
+typedef void* GLeglImageOES;
+#endif
+
+// EGL extension function pointers for DMA buffer zero-copy rendering
+typedef EGLImage (*eglCreateImageKHR_func)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint *attrib_list);
+typedef void (*glEGLImageTargetTexture2DOES_func)(GLenum target, GLeglImageOES image);
+typedef EGLBoolean (*eglDestroyImageKHR_func)(EGLDisplay dpy, EGLImage image);
+
+// Initialize EGL extension function pointers at runtime
+static eglCreateImageKHR_func eglCreateImageKHR = NULL;
+static glEGLImageTargetTexture2DOES_func glEGLImageTargetTexture2DOES = NULL;
+static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
+
+// EGL DMA buffer extension constants (in case headers don't have them)
+#ifndef EGL_LINUX_DMA_BUF_EXT
+#define EGL_LINUX_DMA_BUF_EXT 0x3270
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_FD_EXT
+#define EGL_DMA_BUF_PLANE0_FD_EXT 0x3272
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_PITCH_EXT
+#define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE1_FD_EXT
+#define EGL_DMA_BUF_PLANE1_FD_EXT 0x3275
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE1_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE1_OFFSET_EXT 0x3276
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE1_PITCH_EXT
+#define EGL_DMA_BUF_PLANE1_PITCH_EXT 0x3277
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE2_FD_EXT
+#define EGL_DMA_BUF_PLANE2_FD_EXT 0x3278
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE2_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE2_OFFSET_EXT 0x3279
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE2_PITCH_EXT
+#define EGL_DMA_BUF_PLANE2_PITCH_EXT 0x327A
+#endif
+
+#ifndef EGL_LINUX_DRM_FOURCC_EXT
+#define EGL_LINUX_DRM_FOURCC_EXT 0x3271
+#endif
+
+#ifndef DRM_FORMAT_NV12
+#define DRM_FORMAT_NV12 0x3231564e  // 'NV12'
+#endif
+
+#ifndef DRM_FORMAT_R8
+#define DRM_FORMAT_R8 0x20203852  // 'R8  '
+#endif
 
 // OpenGL ES 3.0 constants for single-channel textures
 #ifndef GL_R8
@@ -120,6 +189,7 @@ const char *vertex_shader_source =
     "// Legacy uniforms for compatibility\n"
     "uniform mat4 u_mvp_matrix;\n"
     "uniform mat4 u_keystone_matrix;\n"
+    "uniform float u_flip_y;\n"
     "\n"
     "// Output to fragment shader\n"
     "out vec2 v_texcoord;\n"
@@ -130,13 +200,13 @@ const char *vertex_shader_source =
     "    pos = u_keystone_matrix * pos;\n"
     "    gl_Position = u_mvp_matrix * pos;\n"
     "    \n"
-    "    // Pass texture coordinates to fragment shader\n"
-    "    v_texcoord = a_texcoord;\n"
+    "    // Pass texture coordinates to fragment shader, optionally flipping Y\n"
+    "    v_texcoord = vec2(a_texcoord.x, u_flip_y > 0.5 ? 1.0 - a_texcoord.y : a_texcoord.y);\n"
     "}\n";
 
 // Optimized YUV→RGB conversion fragment shader (OpenGL ES 3.1)
 // Keep highp precision for color accuracy (mediump causes color shift)
-const char *fragment_shader_source = 
+const char *fragment_shader_source =
     "#version 310 es\n"
     "precision highp float;\n"  // KEEP highp for color accuracy
     "in vec2 v_texcoord;\n"
@@ -155,6 +225,7 @@ const char *fragment_shader_source =
     "    float v = texture(u_texture_v, v_texcoord).r;\n"
     "    \n"
     "    // BT.709 TV range (16-235 for Y, 16-240 for UV) to RGB conversion\n"
+    "    // Decoder outputs: Color space: bt709, Color range: tv\n"
     "    // First expand from TV range to full range\n"
     "    y = (y * 255.0 - 16.0) / 219.0;\n"
     "    u = (u * 255.0 - 16.0) / 224.0;\n"
@@ -252,6 +323,7 @@ static int create_program(gl_context_t *gl) {
     gl->u_texture_v = glGetUniformLocation(gl->program, "u_texture_v");
     gl->u_texture_nv12 = glGetUniformLocation(gl->program, "u_texture_nv12");
     gl->u_keystone_matrix = glGetUniformLocation(gl->program, "u_keystone_matrix");
+    gl->u_flip_y = glGetUniformLocation(gl->program, "u_flip_y");
     gl->a_position = glGetAttribLocation(gl->program, "a_position");
     gl->a_texcoord = glGetAttribLocation(gl->program, "a_texcoord");
 
@@ -378,13 +450,43 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
-    // OPTIMIZATION: Configure VSync for smooth frame pacing
-    // Set swap interval to 1 for VSync (reduces buffer swap timing variance)
+    // FIXED: Enable VSync for smooth, tear-free playback
+    // Set swap interval to 1 to sync with display refresh (eliminates jitter)
     if (!eglSwapInterval(gl->egl_display, 1)) {
-        printf("Warning: Could not enable VSync (swap interval), may have frame timing issues\n");
+        printf("Warning: Could not enable VSync (swap interval) - playback may be jittery\n");
     } else {
-        printf("VSync enabled for smooth frame pacing\n");
+        printf("VSync enabled for smooth playback (synced to display refresh)\n");
     }
+
+    // Detect EGL DMA buffer import support (zero-copy rendering)
+    gl->supports_egl_image = false;
+    const char *egl_extensions = eglQueryString(gl->egl_display, EGL_EXTENSIONS);
+    if (egl_extensions && strstr(egl_extensions, "EGL_EXT_image_dma_buf_import")) {
+        gl->supports_egl_image = true;
+        if (hw_debug_enabled) {
+            printf("[EGL] DMA buffer import supported - zero-copy rendering enabled!\n");
+        }
+        
+        // Load EGL extension function pointers
+        eglCreateImageKHR = (eglCreateImageKHR_func)eglGetProcAddress("eglCreateImageKHR");
+        glEGLImageTargetTexture2DOES = (glEGLImageTargetTexture2DOES_func)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+        eglDestroyImageKHR = (eglDestroyImageKHR_func)eglGetProcAddress("eglDestroyImageKHR");
+        
+        if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES || !eglDestroyImageKHR) {
+            fprintf(stderr, "[EGL] Failed to load DMA buffer extension functions\n");
+            gl->supports_egl_image = false;
+        } else if (hw_debug_enabled) {
+            printf("[EGL] ✓ Extension functions loaded successfully\n");
+        }
+    } else if (hw_debug_enabled) {
+        printf("[EGL] DMA buffer import NOT supported, using standard texture upload\n");
+    }
+    
+    // Initialize EGL image handles
+    gl->egl_image_y = EGL_NO_IMAGE;
+    gl->egl_image_uv = EGL_NO_IMAGE;
+    gl->egl_image_y2 = EGL_NO_IMAGE;
+    gl->egl_image_uv2 = EGL_NO_IMAGE;
 
     // Create shaders and program
     if (create_program(gl) != 0) {
@@ -406,6 +508,33 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
 
     // OpenGL ES initialization complete
     return 0;
+}
+
+// Calculate aspect-ratio-preserving MVP matrix
+// Prevents video stretching by letterboxing/pillarboxing as needed
+static void calculate_aspect_ratio_matrix(float *mvp_matrix,
+                                         int video_width, int video_height,
+                                         int display_width, int display_height) {
+    // Calculate aspect ratios
+    float video_aspect = (float)video_width / (float)video_height;
+    float display_aspect = (float)display_width / (float)display_height;
+
+    // Initialize as identity matrix
+    for (int i = 0; i < 16; i++) {
+        mvp_matrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;  // 1 on diagonal, 0 elsewhere
+    }
+
+    // Scale to preserve aspect ratio
+    if (video_aspect > display_aspect) {
+        // Video is wider than display - add pillarbox (black bars left/right)
+        // Scale Y to fit, X stays at 1.0
+        mvp_matrix[5] = display_aspect / video_aspect;  // scale_y
+    } else if (video_aspect < display_aspect) {
+        // Video is taller than display - add letterbox (black bars top/bottom)
+        // Scale X to fit, Y stays at 1.0
+        mvp_matrix[0] = video_aspect / display_aspect;  // scale_x
+    }
+    // else: aspects match perfectly, no scaling needed (identity matrix)
 }
 
 void gl_setup_buffers(gl_context_t *gl) {
@@ -435,28 +564,54 @@ void gl_setup_buffers(gl_context_t *gl) {
 
     // Store for later use - don't set attributes here since no VAO
 
-    // Generate YUV textures
+    // Generate YUV textures for video 1
     glGenTextures(1, &gl->texture_y);
     glGenTextures(1, &gl->texture_u);
     glGenTextures(1, &gl->texture_v);
     glGenTextures(1, &gl->texture_nv12);
     
-    // Setup Y texture
+    // Generate YUV textures for video 2
+    glGenTextures(1, &gl->texture_y2);
+    glGenTextures(1, &gl->texture_u2);
+    glGenTextures(1, &gl->texture_v2);
+    
+    // Setup Y texture (video 1)
     glBindTexture(GL_TEXTURE_2D, gl->texture_y);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Setup U texture
+    // Setup U texture (video 1)
     glBindTexture(GL_TEXTURE_2D, gl->texture_u);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Setup V texture
+    // Setup V texture (video 1)
     glBindTexture(GL_TEXTURE_2D, gl->texture_v);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Setup Y texture (video 2)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_y2);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Setup U texture (video 2)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_u2);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Setup V texture (video 2)
+    glBindTexture(GL_TEXTURE_2D, gl->texture_v2);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -489,8 +644,9 @@ void gl_setup_buffers(gl_context_t *gl) {
 
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
-                    display_ctx_t *drm, keystone_context_t *keystone) {
+                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
     (void)stride; // Unused parameter - kept for API consistency
+    (void)video_index; // NV12 not currently used for dual video
     static int frame_rendered = 0;
     static int last_width = 0, last_height = 0;
     static bool gl_state_set = false;
@@ -500,7 +656,10 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     }
     
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Only clear screen if requested (first video clears, second doesn't)
+    if (clear_screen) {
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     
     // Set up OpenGL state only once or when needed
     if (!gl_state_set) {
@@ -605,19 +764,29 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
                     int width, int height, int y_stride, int u_stride, int v_stride,
-                    display_ctx_t *drm, keystone_context_t *keystone) {
-    static int frame_rendered = 0;
-    static int last_width = 0, last_height = 0;
+                    display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // Separate tracking for each video
+    static int frame_rendered[2] = {0, 0};
+    static int last_width[2] = {0, 0};
+    static int last_height[2] = {0, 0};
     static bool gl_state_set = false;
+    
+    // Select appropriate texture set based on video index
+    GLuint tex_y = (video_index == 0) ? gl->texture_y : gl->texture_y2;
+    GLuint tex_u = (video_index == 0) ? gl->texture_u : gl->texture_u2;
+    GLuint tex_v = (video_index == 0) ? gl->texture_v : gl->texture_v2;
     
     // Handle stride for YUV data with potential padding
     
     // Set black clear color for video background
-    if (frame_rendered == 0) {
+    if (frame_rendered[video_index] == 0) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Black background
     }
     
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Only clear screen if requested (first video clears, second doesn't)
+    if (clear_screen) {
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     
     // Set up OpenGL state only once or when needed
     if (!gl_state_set) {
@@ -625,75 +794,62 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         gl_state_set = true;
     }
     
-    // CRITICAL: Complete buffer unbinding before state restoration
-    // This is needed to prevent state leakage from previous operations
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glUseProgram(0);
-    
-    // Reset vertex attribute arrays
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    
-    // Now set up the correct state for video rendering
-    glUseProgram(gl->program);
-    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
-    
-    // Position attribute
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    
-    // Texture coordinate attribute  
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    
-    // Set MVP matrix (identity - only once)
-    float mvp_matrix[16] = {
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1
-    };
+    // CRITICAL: Only do full state setup once per frame (for video_index 0)
+    // For video_index > 0, just update textures and keystone matrix
+    if (video_index == 0) {
+        // Complete buffer unbinding before state restoration
+        // This is needed to prevent state leakage from previous operations
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+        
+        // Reset vertex attribute arrays
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        
+        // Now set up the correct state for video rendering
+        glUseProgram(gl->program);
+        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+        
+        // Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        
+        // Texture coordinate attribute
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+
+        // Explicitly disable blending - overlays might have enabled it
+        glDisable(GL_BLEND);
+
+        // Disable depth test - make sure video is always visible
+        glDisable(GL_DEPTH_TEST);
+    }
+
+    // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
+    // This is OUTSIDE the video_index==0 block so each video gets its own aspect ratio
+    float mvp_matrix[16];
+    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->width, drm->height);
     glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
-    
-    // Explicitly disable blending - overlays might have enabled it
-    glDisable(GL_BLEND);
-    
-    // Disable depth test - make sure video is always visible
-    glDisable(GL_DEPTH_TEST);
-    
+
     // Set keystone matrix (may change dynamically)
     const float *keystone_matrix = keystone_get_matrix(keystone);
     glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
     
-    // Restore texture units and samplers (critical for video rendering)
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_y);
+    // Set flip_y uniform (flip both videos - they're both encoded upside down)
+    glUniform1f(gl->u_flip_y, 1.0f);
     
-    // Set proper texture parameters (might have been changed by overlays)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // OPTIMIZED: Bind textures without excessive glTexParameteri calls
+    // Texture parameters are set once during initialization, not per-frame
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
     
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_u);
-    
-    // Set proper texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
     
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, gl->texture_v);
-    
-    // Set proper texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
     
     // Reset to texture unit 0
     glActiveTexture(GL_TEXTURE0);
@@ -702,6 +858,10 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     glUniform1i(gl->u_texture_y, 0);
     glUniform1i(gl->u_texture_u, 1);
     glUniform1i(gl->u_texture_v, 2);
+    
+    // TIMER: Measure texture upload time
+    struct timespec tex_start, tex_end;
+    clock_gettime(CLOCK_MONOTONIC, &tex_start);
     
     // Update YUV textures if video data is provided
     if (y_data && u_data && v_data) {
@@ -713,181 +873,111 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         bool y_direct = (y_stride == width);
         bool u_direct = (u_stride == uv_width);
         bool v_direct = (v_stride == uv_width);
-        bool size_changed = (width != last_width || height != last_height || frame_rendered == 0);
+        bool size_changed = (width != last_width[video_index] || height != last_height[video_index] || frame_rendered[video_index] == 0);
         
-        if (size_changed) {
-            printf("YUV strides: Y=%d U=%d V=%d (dimensions: %dx%d, UV: %dx%d)\n", 
+        // PRODUCTION: Only log on first frame to reduce console spam
+        if (size_changed && frame_rendered[video_index] == 0) {
+            printf("YUV strides: Y=%d U=%d V=%d (dimensions: %dx%d, UV: %dx%d)\n",
                    y_stride, u_stride, v_stride, width, height, uv_width, uv_height);
             printf("Direct upload: Y=%s U=%s V=%s\n", y_direct?"YES":"NO", u_direct?"YES":"NO", v_direct?"YES":"NO");
         }
         
-        // Y texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
+        // ULTRA-OPTIMIZED: Use glTexStorage2D once, then glTexSubImage2D for updates
+        // This is faster on some GPUs because storage is immutable
+        static bool storage_initialized[2] = {false, false};
+        
+        if (!storage_initialized[video_index] || size_changed) {
+            // First time or resolution changed - allocate storage
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_y);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
+            
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_u);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, uv_width, uv_height);
+            
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, tex_v);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, uv_width, uv_height);
+            
+            storage_initialized[video_index] = true;
+        }
+        
+        // PRODUCTION OPTIMIZATION: Allocate buffers once before all texture uploads
+        // This avoids 3 allocation checks per frame
+        if (!y_direct || !u_direct || !v_direct) {
+            int needed_size = width * height;  // Y plane size
+            allocate_yuv_buffers(needed_size);
+        }
+
+        // Y texture - OPTIMIZED: Direct upload (avoid PBO overhead)
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, gl->texture_y);
-        
-        if (gl->use_pbo && y_direct) {
-            // PBO async upload path (fastest for direct data)
-            int y_size = width * height;
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[0]);
-            
-            if (size_changed) {
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, y_size, NULL, GL_STREAM_DRAW);
-            }
-            
-            // Map buffer and copy data
-            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, y_size, 
-                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-            if (pbo_mem) {
-                memcpy(pbo_mem, y_data, y_size);
-                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                
-                // Upload from PBO (async DMA)
-                if (size_changed) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, 0);
-                }
-            }
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else if (y_direct) {
-            // Direct upload (no PBO)
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, y_data);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
-            }
+        glBindTexture(GL_TEXTURE_2D, tex_y);
+
+        if (y_direct) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
         } else {
-            // Stride copy path (no PBO for non-direct data)
-            int needed_size = width * height;
-            allocate_yuv_buffers(needed_size);
-            
+            // Stride copy path (for padded data)
             copy_with_stride_simd(g_yuv_buffers.y_temp_buffer, y_data, width, height, width, y_stride);
-            
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
-            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.y_temp_buffer);
         }
-        // U texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
+
+        // U texture - OPTIMIZED: Direct upload
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, gl->texture_u);
-        
-        if (gl->use_pbo && u_direct) {
-            // PBO async upload path
-            int u_size = uv_width * uv_height;
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[1]);
-            
-            if (size_changed) {
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, u_size, NULL, GL_STREAM_DRAW);
-            }
-            
-            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, u_size,
-                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-            if (pbo_mem) {
-                memcpy(pbo_mem, u_data, u_size);
-                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                
-                if (size_changed) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
-                }
-            }
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else if (u_direct) {
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, u_data);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
-            }
+        glBindTexture(GL_TEXTURE_2D, tex_u);
+
+        if (u_direct) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
         } else {
-            // Use pre-allocated buffers for U plane
-            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
-            int needed_size = uv_width * uv_height;
-            allocate_yuv_buffers(needed_size);
-            
             copy_with_stride_simd(g_yuv_buffers.u_temp_buffer, u_data, uv_width, uv_height, uv_width, u_stride);
-            
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
-            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.u_temp_buffer);
         }
-        
-        // V texture - OPTIMIZED: Use PBO for async DMA transfer or direct upload
+
+        // V texture - OPTIMIZED: Direct upload
         glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, gl->texture_v);
-        
-        if (gl->use_pbo && v_direct) {
-            // PBO async upload path
-            int v_size = uv_width * uv_height;
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl->pbo[2]);
-            
-            if (size_changed) {
-                glBufferData(GL_PIXEL_UNPACK_BUFFER, v_size, NULL, GL_STREAM_DRAW);
-            }
-            
-            void *pbo_mem = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, v_size,
-                                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-            if (pbo_mem) {
-                memcpy(pbo_mem, v_data, v_size);
-                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-                
-                if (size_changed) {
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, 0);
-                } else {
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, 0);
-                }
-            }
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        } else if (v_direct) {
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, v_data);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
-            }
+        glBindTexture(GL_TEXTURE_2D, tex_v);
+
+        if (v_direct) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
         } else {
-            // Use pre-allocated buffers for V plane
-            // OPTIMIZED: Use SIMD-accelerated stride copy (NEON on ARM)
-            int needed_size = uv_width * uv_height;
-            allocate_yuv_buffers(needed_size);
-            
             copy_with_stride_simd(g_yuv_buffers.v_temp_buffer, v_data, uv_width, uv_height, uv_width, v_stride);
-            
-            if (size_changed) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_width, uv_height, 0, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
-            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, g_yuv_buffers.v_temp_buffer);
         }
         
-        if (frame_rendered == 0) {
+        if (frame_rendered[video_index] == 0) {
             printf("GPU YUV→RGB rendering started (%dx%d)\n", width, height);
         }
-        last_width = width;
-        last_height = height;
+        last_width[video_index] = width;
+        last_height[video_index] = height;
         
-        frame_rendered++;
-    } else if (frame_rendered == 0) {
+        frame_rendered[video_index]++;
+    } else if (frame_rendered[video_index] == 0) {
         // Skip test pattern for now - YUV textures need proper initialization
-        printf("Waiting for video data...\n");
+        // (Don't print "Waiting for video data..." - it's just noise)
     }
     
-    // Check for OpenGL errors before drawing
-    GLenum error = glGetError();
-    if (error != GL_NO_ERROR) {
-        printf("OpenGL error before draw: 0x%x\n", error);
-    }
+    clock_gettime(CLOCK_MONOTONIC, &tex_end);
+    double tex_upload_time = (tex_end.tv_sec - tex_start.tv_sec) + (tex_end.tv_nsec - tex_start.tv_nsec) / 1e9;
+    
+    // TIMER: Measure draw call time
+    struct timespec draw_start, draw_end;
+    clock_gettime(CLOCK_MONOTONIC, &draw_start);
     
     // Draw quad
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     
-    // Check for OpenGL errors after drawing
-    error = glGetError();
-    if (error != GL_NO_ERROR) {
-        printf("OpenGL error after draw: 0x%x\n", error);
+    clock_gettime(CLOCK_MONOTONIC, &draw_end);
+    double draw_time = (draw_end.tv_sec - draw_start.tv_sec) + (draw_end.tv_nsec - draw_start.tv_nsec) / 1e9;
+    
+    // PRODUCTION: Diagnostic output only on first 3 slow frames
+    static int frame_diag = 0;
+    if (frame_diag < 3 && (tex_upload_time > 0.008 || draw_time > 0.010)) {
+        printf("[Render] Video%d - Upload: %.1fms, Draw: %.1fms\n",
+               video_index, tex_upload_time * 1000, draw_time * 1000);
+        frame_diag++;
+        if (frame_diag == 3) {
+            printf("  (Further render timing available with --timing flag)\n");
+        }
     }
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
@@ -934,25 +1024,57 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     if (!keystone || !keystone->show_corners) {
         return; // Don't render corners if not visible
     }
-    
-    // Pre-allocated static buffer for corners (initialized once)
-    static float corner_vertices[10000];  // Enough for position+color data
-    static GLuint corner_vbo = 0;
+
+    // PRODUCTION FIX: Separate VBOs and state tracking for each keystone
+    // This prevents flickering when rendering corners for dual keystones
+    static float corner_vertices1[10000];  // Keystone 1 vertex buffer
+    static float corner_vertices2[10000];  // Keystone 2 vertex buffer
+    static GLuint corner_vbo1 = 0;
+    static GLuint corner_vbo2 = 0;
     static bool vbo_initialized = false;
-    static int cached_selected_corner = -2;  // Track which corner was selected
-    
-    // Initialize VBO once on first call
+
+    // Per-keystone state tracking (indexed by keystone: 0 = first seen, 1 = second seen)
+    static keystone_context_t *keystone_ptrs[2] = {NULL, NULL};
+    static int cached_selected_corners[2] = {-2, -2};
+    static bool last_show_corners[2] = {false, false};
+
+    // Initialize VBOs once on first call
     if (!vbo_initialized) {
-        glGenBuffers(1, &corner_vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
-        // OPTIMIZED: Pre-allocate with GL_DYNAMIC_DRAW on first init only
-        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices), NULL, GL_DYNAMIC_DRAW);
+        glGenBuffers(1, &corner_vbo1);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo1);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices1), NULL, GL_DYNAMIC_DRAW);
+
+        glGenBuffers(1, &corner_vbo2);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo2);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices2), NULL, GL_DYNAMIC_DRAW);
+
         vbo_initialized = true;
     }
-    
-    // OPTIMIZATION: Only update VBO if corners moved or selection changed
-    bool needs_update = keystone->corners_dirty || 
-                        (cached_selected_corner != keystone->selected_corner);
+
+    // Determine which keystone index (0 or 1) based on pointer
+    int keystone_idx = -1;
+    if (keystone == keystone_ptrs[0] || keystone_ptrs[0] == NULL) {
+        keystone_idx = 0;
+        keystone_ptrs[0] = keystone;
+    } else if (keystone == keystone_ptrs[1] || keystone_ptrs[1] == NULL) {
+        keystone_idx = 1;
+        keystone_ptrs[1] = keystone;
+    } else {
+        // Fallback: use index 0 if pointer doesn't match either
+        keystone_idx = 0;
+    }
+
+    // Select the appropriate VBO and vertex buffer for this keystone
+    GLuint corner_vbo = (keystone_idx == 0) ? corner_vbo1 : corner_vbo2;
+    float *corner_vertices = (keystone_idx == 0) ? corner_vertices1 : corner_vertices2;
+
+    // Check if update needed for THIS specific keystone
+    bool visibility_changed = (last_show_corners[keystone_idx] != keystone->show_corners);
+    bool selection_changed = (cached_selected_corners[keystone_idx] != keystone->selected_corner);
+    bool needs_update = keystone->corners_dirty || visibility_changed || selection_changed;
+
+    // Update cached state for THIS keystone
+    last_show_corners[keystone_idx] = keystone->show_corners;
     
     // Always prepare corner colors (outside needs_update so available for rendering)
     float corner_colors[4][4];
@@ -973,7 +1095,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     }
     
     if (needs_update) {
-        cached_selected_corner = keystone->selected_corner;
+        cached_selected_corners[keystone_idx] = keystone->selected_corner;
         keystone->corners_dirty = false;  // Clear dirty flag
         
         // Create corner positions (small squares)
@@ -1066,16 +1188,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Render all 4 corner squares - colors are now in vertex data
-    static int last_selected = -999;
-    
-    // Debug when selection changes
-    if (keystone->selected_corner != last_selected) {
-        printf("[RENDER] Selected corner changed: %d -> %d\n", last_selected, keystone->selected_corner);
-        last_selected = keystone->selected_corner;
-    }
-    
-    // Draw all corner squares in one call - each corner is 4 vertices
+    // Draw all corner squares - each corner is 4 vertices
     for (int i = 0; i < 4; i++) {
         glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
     }
@@ -1332,67 +1445,79 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     if (!keystone || !keystone->show_help) {
         return; // Don't render help overlay if not visible
     }
+
+    // OPTIMIZATION: Cache text geometry - only generate once on first display
+    static bool help_initialized = false;
+    static float help_bg_vertices[24]; // Background rectangle
+    static float help_text_vertices[30000]; // Text geometry
+    static int text_vertex_count = 0;
+
+    if (!help_initialized) {
+        // Generate background vertices (only once)
+        // Bottom-left
+        help_bg_vertices[0] = -0.9f; help_bg_vertices[1] = -0.7f;
+        help_bg_vertices[2] = 0.0f; help_bg_vertices[3] = 0.0f; help_bg_vertices[4] = 0.0f; help_bg_vertices[5] = 0.95f;
+        // Bottom-right
+        help_bg_vertices[6] = 0.9f; help_bg_vertices[7] = -0.7f;
+        help_bg_vertices[8] = 0.0f; help_bg_vertices[9] = 0.0f; help_bg_vertices[10] = 0.0f; help_bg_vertices[11] = 0.95f;
+        // Top-right
+        help_bg_vertices[12] = 0.9f; help_bg_vertices[13] = 0.7f;
+        help_bg_vertices[14] = 0.0f; help_bg_vertices[15] = 0.0f; help_bg_vertices[16] = 0.0f; help_bg_vertices[17] = 0.95f;
+        // Top-left
+        help_bg_vertices[18] = -0.9f; help_bg_vertices[19] = 0.7f;
+        help_bg_vertices[20] = 0.0f; help_bg_vertices[21] = 0.0f; help_bg_vertices[22] = 0.0f; help_bg_vertices[23] = 0.95f;
     
-    // Create help overlay with text - using vertex colors (x, y, r, g, b, a)
-    float help_vertices[60000]; // Large buffer for text vertices with color
-    int vertex_count = 0;
-    
-    // Large centered background with semi-transparent black color
-    // Bottom-left
-    help_vertices[0] = -0.9f; help_vertices[1] = -0.7f;
-    help_vertices[2] = 0.0f; help_vertices[3] = 0.0f; help_vertices[4] = 0.0f; help_vertices[5] = 0.8f;
-    // Bottom-right
-    help_vertices[6] = 0.9f; help_vertices[7] = -0.7f;
-    help_vertices[8] = 0.0f; help_vertices[9] = 0.0f; help_vertices[10] = 0.0f; help_vertices[11] = 0.8f;
-    // Top-right
-    help_vertices[12] = 0.9f; help_vertices[13] = 0.7f;
-    help_vertices[14] = 0.0f; help_vertices[15] = 0.0f; help_vertices[16] = 0.0f; help_vertices[17] = 0.8f;
-    // Top-left
-    help_vertices[18] = -0.9f; help_vertices[19] = 0.7f;
-    help_vertices[20] = 0.0f; help_vertices[21] = 0.0f; help_vertices[22] = 0.0f; help_vertices[23] = 0.8f;
-    vertex_count = 4;
-    
-    // Compact help text - keyboard and gamepad controls
-    const char* help_text = 
-        "PICKLE KEYSTONE\n"
-        "\n"
-        "KEYBOARD\n"
-        "1234   Corner Select\n"
-        "Arrows Move Corner\n"
-        "S      Save\n"
-        "R      Reset\n"
-        "C      Toggle Corners\n"
-        "B      Toggle Border\n"
-        "H      Toggle Help\n"
-        "Q      Quit\n"
-        "\n"
-        "GAMEPAD\n"
-        "X      Cycle Corner\n"
-        "DPAD   Move Corner\n"
-        "A      Show Corners\n"
-        "B      Show Border\n"
-        "Y      Show Help\n"
-        "L1     Step Down\n"
-        "R1     Step Up\n"
-        "START  Save\n"
-        "SELECT Reset";
-    
-    // Update help VBO with background geometry
+        // Generate text geometry (only once)
+        const char* help_text =
+            "Copyright Dilworth Creative LLC\n"
+            "\n"
+            "PICKLE KEYSTONE\n"
+            "\n"
+            "KEYBOARD\n"
+            "1234   Corner Select\n"
+            "Arrows Move Corner\n"
+            "S      Save\n"
+            "R      Reset\n"
+            "C      Toggle Corners\n"
+            "B      Toggle Border\n"
+            "W      WiFi Connect\n"
+            "H      Toggle Help\n"
+            "Q      Quit\n"
+            "\n"
+            "GAMEPAD\n"
+            "X      Cycle Corner\n"
+            "DPAD   Move Corner\n"
+            "A      Show Corners\n"
+            "B      Show Border\n"
+            "Y      Show Help\n"
+            "L1     Step Down\n"
+            "R1     Step Up\n"
+            "START  Save\n"
+            "SELECT Reset";
+
+        draw_text_simple(help_text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
+        help_initialized = true;
+        printf("[HELP] Text geometry generated: %d vertices (cached for reuse)\n", text_vertex_count);
+    }
+
+    // Now render the cached geometry (fast!)
     glBindBuffer(GL_ARRAY_BUFFER, gl->help_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), help_vertices, GL_DYNAMIC_DRAW);
     
+    // Upload cached background geometry
+    glBufferData(GL_ARRAY_BUFFER, 4 * 6 * sizeof(float), help_bg_vertices, GL_DYNAMIC_DRAW);
+
     // Use corner shader program for help overlay rendering
     glUseProgram(gl->corner_program);
-    
+
     // Set up vertex attributes (interleaved position + color)
     int stride = 6 * sizeof(float); // x, y, r, g, b, a
     glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
     glEnableVertexAttribArray(gl->corner_a_position);
-    
+
     // Color attribute at location 1
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
-    
+
     // Set identity matrix for MVP
     float identity[16] = {
         1, 0, 0, 0,
@@ -1401,51 +1526,78 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
         0, 0, 0, 1
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
-    
+
     // Enable blending for transparency
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    
+
     // Disable depth testing to ensure overlays are always visible
     glDisable(GL_DEPTH_TEST);
-    
+
     // Draw help overlay background (semi-transparent black from vertex colors)
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4); // Background rectangle
-    
-    // Now render text with better formatting
-    float text_vertices[30000]; // Increased buffer size for longer help text
-    int text_vertex_count = 0;
-    draw_text_simple(text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
-    
-    // Upload text geometry with 2-float format
-    glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 2 * sizeof(float), text_vertices, GL_DYNAMIC_DRAW);
-    
-    // Update vertex attribute for 2-float format
-    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-    glDisableVertexAttribArray(1); // Disable color attribute
-    
-    // Create cyan/white color vertices for text (manually set color for each vertex)
-    float colored_vertices[180000]; // Large buffer with colors (30000 * 6)
-    for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
-        colored_vertices[i * 6 + 0] = text_vertices[i * 2 + 0]; // x
-        colored_vertices[i * 6 + 1] = text_vertices[i * 2 + 1]; // y
-        colored_vertices[i * 6 + 2] = 0.0f; // r - cyan color
-        colored_vertices[i * 6 + 3] = 1.0f; // g
-        colored_vertices[i * 6 + 4] = 1.0f; // b
-        colored_vertices[i * 6 + 5] = 1.0f; // a
+
+    // OPTIMIZATION: Reuse cached text geometry (no regeneration every frame!)
+    // Create bright white color vertices for text using cached geometry
+    static float colored_vertices[180000]; // Persistent buffer
+    static bool colors_initialized = false;
+
+    if (!colors_initialized) {
+        // Only add colors once
+        for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
+            colored_vertices[i * 6 + 0] = help_text_vertices[i * 2 + 0]; // x
+            colored_vertices[i * 6 + 1] = help_text_vertices[i * 2 + 1]; // y
+            colored_vertices[i * 6 + 2] = 1.0f; // r - bright white
+            colored_vertices[i * 6 + 3] = 1.0f; // g
+            colored_vertices[i * 6 + 4] = 1.0f; // b
+            colored_vertices[i * 6 + 5] = 1.0f; // a
+        }
+        colors_initialized = true;
     }
-    
-    // Upload text with colors
+
+    // Upload cached text with colors (just one memcpy, no regeneration!)
     glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 6 * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
     glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
-    
-    // Draw all text pixels (each character pixel is a 4-vertex rectangle)
-    int text_pixels = text_vertex_count / 4; // Number of character pixels
-    for (int i = 0; i < text_pixels; i++) {
-        glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+
+    // OPTIMIZATION: Draw all text in ONE batched call instead of 3000+ separate calls!
+    // Each rectangle is 4 vertices (triangle fan), draw them all as quads
+    // Use GL_POINTS with point sprites would be better, but GLES doesn't support it well
+    // So we'll convert to indexed triangles for a single draw call
+    static GLuint text_indices_vbo = 0;
+    static int last_text_vertex_count = 0;
+
+    if (text_indices_vbo == 0) {
+        glGenBuffers(1, &text_indices_vbo);
     }
+
+    // Generate indices if needed (convert quads to triangles)
+    if (text_vertex_count != last_text_vertex_count) {
+        int num_quads = text_vertex_count / 4;
+        GLuint *indices = malloc(num_quads * 6 * sizeof(GLuint)); // 2 triangles per quad
+
+        for (int i = 0; i < num_quads; i++) {
+            int base = i * 4;
+            indices[i * 6 + 0] = base + 0;
+            indices[i * 6 + 1] = base + 1;
+            indices[i * 6 + 2] = base + 2;
+            indices[i * 6 + 3] = base + 0;
+            indices[i * 6 + 4] = base + 2;
+            indices[i * 6 + 5] = base + 3;
+        }
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, text_indices_vbo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, num_quads * 6 * sizeof(GLuint), indices, GL_STATIC_DRAW);
+        free(indices);
+        last_text_vertex_count = text_vertex_count;
+    } else {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, text_indices_vbo);
+    }
+
+    // Draw ALL text in ONE call!
+    int num_quads = text_vertex_count / 4;
+    glDrawElements(GL_TRIANGLES, num_quads * 6, GL_UNSIGNED_INT, 0);
     
     // Disable blending and restore depth testing
     glDisable(GL_BLEND);
@@ -1453,17 +1605,734 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
     
     glDisableVertexAttribArray(gl->corner_a_position);
     glDisableVertexAttribArray(1);
-    
+
     // CRITICAL: Restore GL state - unbind VBO to prevent interference
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
+void gl_render_notification_overlay(gl_context_t *gl, const char *message) {
+    if (!gl || !message) return;
+
+    // Create notification overlay with background and text
+    float notify_vertices[1000]; // Buffer for background vertices with color
+    int vertex_count = 0;
+
+    // Centered notification box with darker green background for better readability
+    // Bottom-left
+    notify_vertices[0] = -0.35f; notify_vertices[1] = -0.15f;
+    notify_vertices[2] = 0.0f; notify_vertices[3] = 0.6f; notify_vertices[4] = 0.0f; notify_vertices[5] = 0.95f;
+    // Bottom-right
+    notify_vertices[6] = 0.35f; notify_vertices[7] = -0.15f;
+    notify_vertices[8] = 0.0f; notify_vertices[9] = 0.6f; notify_vertices[10] = 0.0f; notify_vertices[11] = 0.95f;
+    // Top-right
+    notify_vertices[12] = 0.35f; notify_vertices[13] = 0.15f;
+    notify_vertices[14] = 0.0f; notify_vertices[15] = 0.6f; notify_vertices[16] = 0.0f; notify_vertices[17] = 0.95f;
+    // Top-left
+    notify_vertices[18] = -0.35f; notify_vertices[19] = 0.15f;
+    notify_vertices[20] = 0.0f; notify_vertices[21] = 0.6f; notify_vertices[22] = 0.0f; notify_vertices[23] = 0.95f;
+    vertex_count = 4;
+
+    // Upload background geometry
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), notify_vertices, GL_DYNAMIC_DRAW);
+
+    // Use corner shader program
+    glUseProgram(gl->corner_program);
+
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float); // x, y, r, g, b, a
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Set identity matrix for MVP
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+
+    // Enable blending for transparency
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+
+    // Draw notification background
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+    // Render notification text centered
+    float text_vertices[3000];
+    int text_vertex_count = 0;
+    draw_text_simple(text_vertices, &text_vertex_count, message, -0.32f, 0.02f, 0.035f);
+
+    // Create colored vertices for text (white color)
+    float colored_vertices[18000]; // 3000 * 6
+    for (int i = 0; i < text_vertex_count && i * 6 < 18000; i++) {
+        colored_vertices[i * 6 + 0] = text_vertices[i * 2 + 0]; // x
+        colored_vertices[i * 6 + 1] = text_vertices[i * 2 + 1]; // y
+        colored_vertices[i * 6 + 2] = 1.0f; // r - white color
+        colored_vertices[i * 6 + 3] = 1.0f; // g
+        colored_vertices[i * 6 + 4] = 1.0f; // b
+        colored_vertices[i * 6 + 5] = 1.0f; // a
+    }
+
+    // Upload text with colors
+    glBufferData(GL_ARRAY_BUFFER, text_vertex_count * 6 * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Draw text pixels
+    int text_pixels = text_vertex_count / 4;
+    for (int i = 0; i < text_pixels; i++) {
+        glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+    }
+
+    // Restore GL state
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// WiFi overlay function disabled - requires wifi_manager_t which is not defined
+#if 0
+void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
+    if (!gl || !mgr) return;
+    
+    // DEBUG: Log what mgr pointer value we received
+    #ifndef NDEBUG
+    static int render_call_count = 0;
+    if (render_call_count++ % 60 == 0) {
+        printf("[WiFi Render CALLED] mgr pointer=%p, selected_index=%d\n", (void*)mgr, mgr->selected_index);
+        fflush(stdout);
+    }
+    #endif
+    
+    // Print WiFi menu to console every 60 frames (about once per second at 60fps)
+    static int print_counter = 0;
+    if (print_counter++ % 60 == 0) {
+        printf("\n=== WiFi Networks ===\n");
+        for (int i = 0; i < mgr->network_count && i < 5; i++) {
+            printf("  [%d] %s - Signal: %d%% %s\n", 
+                   i, mgr->networks[i].ssid, (int)mgr->networks[i].signal_strength,
+                   i == mgr->selected_index ? "← SELECTED" : "");
+        }
+        printf("Use D-pad UP/DOWN to select, SELECT button to confirm\n");
+        printf("======================\n");
+        fflush(stdout);
+    }
+    
+    // Enable blending for semi-transparent overlay
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+    
+    glUseProgram(gl->corner_program);
+    
+    // Set MVP matrix
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+    
+    // Render full-screen semi-transparent black background
+    float bg_vertices[24] = {
+        -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+         1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+         1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 0.9f,
+        -1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 0.9f
+    };
+    
+    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(bg_vertices), bg_vertices, GL_DYNAMIC_DRAW);
+    
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    
+    // Draw a highlight bar behind the currently selected network line (only in list mode)
+    // This makes selection visible even if the '>' glyph isn't present in the font
+    if (mgr->state == WIFI_STATE_NETWORK_LIST) {
+        // Text layout parameters must match draw_text_simple()
+        const float base_y = 0.5f;
+        const float text_size = 0.025f;
+        const float line_height = text_size * 1.3f;
+        // Header (WiFi Networks) + blank line before networks start
+        int selected_line_index = 2 + mgr->selected_index; // 0-based from top
+        float line_y = base_y - selected_line_index * line_height;
+        
+        // Highlight rectangle extents
+        float rect_left = -0.9f;
+        float rect_right = 0.5f;
+        float rect_top = line_y + (line_height * 0.55f);
+        float rect_bottom = line_y - (line_height * 0.55f);
+        
+        // Semi-transparent green highlight
+        float hl_vertices[24] = {
+            rect_left,  rect_bottom, 0.0f, 0.6f, 0.2f, 0.45f,
+            rect_right, rect_bottom, 0.0f, 0.6f, 0.2f, 0.45f,
+            rect_right, rect_top,    0.0f, 0.6f, 0.2f, 0.45f,
+            rect_left,  rect_top,    0.0f, 0.6f, 0.2f, 0.45f
+        };
+        
+        glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(hl_vertices), hl_vertices, GL_DYNAMIC_DRAW);
+        int hl_stride = 6 * sizeof(float);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, hl_stride, (void*)0);
+        glEnableVertexAttribArray(gl->corner_a_position);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, hl_stride, (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    }
+    
+    // Build WiFi overlay text depending on state
+    char wifi_text[1024];
+    int offset = 0;
+    if (mgr->state == WIFI_STATE_NETWORK_LIST) {
+        offset = snprintf(wifi_text, sizeof(wifi_text), "WiFi Networks\n\n");
+        for (int i = 0; i < mgr->network_count && i < 5; i++) {
+            if (i == mgr->selected_index) {
+                offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                                 "> %s (%d%%)\n", mgr->networks[i].ssid, 
+                                 (int)mgr->networks[i].signal_strength);
+            } else {
+                offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                                 "  %s (%d%%)\n", mgr->networks[i].ssid,
+                                 (int)mgr->networks[i].signal_strength);
+            }
+        }
+        snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                 "\nArrows: Select\nEnter/SELECT: Choose");
+    } else if (mgr->state == WIFI_STATE_PASSWORD_ENTRY) {
+        // Password display (masked or visible)
+        char shown[256];
+        if (mgr->show_password) {
+            snprintf(shown, sizeof(shown), "%s", mgr->password);
+        } else {
+            int len = (mgr->password_length >= 0) ? mgr->password_length : 0;
+            if (len > (int)sizeof(shown) - 1) len = (int)sizeof(shown) - 1;
+            memset(shown, '*', len);
+            shown[len] = '\0';
+        }
+
+        offset = snprintf(wifi_text, sizeof(wifi_text),
+                          "WiFi Password\n\nSSID: %s\nPassword: %s (%s)\n\n",
+                          mgr->networks[mgr->selected_index].ssid,
+                          shown,
+                          mgr->show_password ? "visible" : "hidden");
+        offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                           "Arrows: Move  Enter/SELECT: Press Key  Backspace: Delete\n");
+        if (mgr->status[0] != '\0') {
+            // Append status/error message
+            offset += snprintf(wifi_text + offset, sizeof(wifi_text) - offset,
+                               "\n%s\n",
+                               mgr->status);
+        }
+        
+        // After the text, draw a simple on-screen keyboard grid
+        // Layout is in mgr->keyboard_layout[4] with varying row lengths
+    const float key_text_size = 0.028f;
+    const float start_y = 0.12f; // slightly lower to reduce overlap
+    const float row_gap = key_text_size * 2.6f;
+    const float key_w = 0.11f;   // slightly smaller keys
+    const float key_h = row_gap * 0.45f; // a bit shorter for clearer rows
+    const float key_gap = 0.02f; // spacing between keys
+        
+    // Draw each key; render selection background before its label to avoid tinting
+
+        for (int r = 0; r < 4; ++r) {
+            int row_len = (int)strlen(mgr->keyboard_layout[r]);
+            // Center the row based on total width including gaps
+            float row_total_w = row_len * key_w + (row_len - 1) * key_gap;
+            float row_offset_x = -0.5f * row_total_w;
+            float y = start_y - r * row_gap;
+            for (int c = 0; c < row_len; ++c) {
+                float x = row_offset_x + c * (key_w + key_gap);
+                // Highlight if selected
+                int cursor_row = mgr->keyboard_cursor / 12;
+                int cursor_col = mgr->keyboard_cursor % 12;
+                bool is_sel = (cursor_row == r && cursor_col == c);
+                
+                // Base key background (dark grey)
+                float base_r = 0.05f, base_g = 0.05f, base_b = 0.05f, base_a = 0.55f;
+                
+                // Draw key rectangle
+                float rect[24] = {
+                    x,           y - key_h, 0.0f, base_r, base_g, base_b, base_a,
+                    x + key_w,   y - key_h, 0.0f, base_r, base_g, base_b, base_a,
+                    x + key_w,   y + key_h, 0.0f, base_r, base_g, base_b, base_a,
+                    x,           y + key_h, 0.0f, base_r, base_g, base_b, base_a
+                };
+                glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+                glBufferData(GL_ARRAY_BUFFER, sizeof(rect), rect, GL_DYNAMIC_DRAW);
+                glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(gl->corner_a_position);
+                glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+                glEnableVertexAttribArray(1);
+                glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                if (is_sel) {
+                    // To avoid any translucent artifacts, draw selection with blending temporarily disabled
+                    glDisable(GL_BLEND);
+                    float sel_rcol = 0.20f, sel_gcol = 0.85f, sel_bcol = 0.30f, sel_acol = 1.0f;
+                    float srect[24] = {
+                        x,         y - key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol,
+                        x + key_w, y - key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol,
+                        x + key_w, y + key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol,
+                        x,         y + key_h, 0.0f, sel_rcol, sel_gcol, sel_bcol, sel_acol
+                    };
+                    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(srect), srect, GL_DYNAMIC_DRAW);
+                    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                    glEnableVertexAttribArray(gl->corner_a_position);
+                    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+                    glEnableVertexAttribArray(1);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+                    // Border
+                    float bt = (key_w < key_h ? key_w : key_h) * 0.10f;
+                    float br = 1.0f, bg = 1.0f, bb = 0.2f, ba = 1.0f;
+                    float b_top[24] = {
+                        x - bt,      y + key_h + bt, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y + key_h + bt, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y + key_h,    0.0f, br, bg, bb, ba,
+                        x - bt,      y + key_h,      0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_top), b_top, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    float b_bot[24] = {
+                        x - bt,      y - key_h,      0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y - key_h,   0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y - key_h - bt, 0.0f, br, bg, bb, ba,
+                        x - bt,      y - key_h - bt, 0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_bot), b_bot, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    float b_left[24] = {
+                        x - bt, y - key_h, 0.0f, br, bg, bb, ba,
+                        x,      y - key_h, 0.0f, br, bg, bb, ba,
+                        x,      y + key_h, 0.0f, br, bg, bb, ba,
+                        x - bt, y + key_h, 0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_left), b_left, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    float b_right[24] = {
+                        x + key_w, y - key_h, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y - key_h, 0.0f, br, bg, bb, ba,
+                        x + key_w + bt, y + key_h, 0.0f, br, bg, bb, ba,
+                        x + key_w, y + key_h, 0.0f, br, bg, bb, ba
+                    };
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(b_right), b_right, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+                    glEnable(GL_BLEND);
+                }
+
+                // Draw label
+                char label[8] = {0};
+                char k = mgr->keyboard_layout[r][c];
+                if (k == '_') { label[0] = 'S'; label[1] = 'P'; }
+                else if (k == '<') { label[0] = 'B'; label[1] = 'K'; label[2] = 'S'; label[3] = 'P'; }
+                else if (k == '>') { label[0] = 'O'; label[1] = 'K'; }
+                else if (k == '!') {
+                    if (mgr->show_password) { label[0] = 'H'; label[1] = 'I'; label[2] = 'D'; label[3] = 'E'; }
+                    else { label[0] = 'S'; label[1] = 'H'; label[2] = 'O'; label[3] = 'W'; }
+                }
+                else label[0] = k;
+                int label_len = (int)strlen(label);
+                float max_fit_size = (key_w * 0.80f) / (1.2f * (label_len > 0 ? label_len : 1));
+                float label_size = max_fit_size;
+                if (label_size > 0.040f) label_size = 0.040f;
+                if (label_size < 0.022f) label_size = 0.022f;
+                float total_w = (label_len ? label_len : 1) * label_size * 1.2f;
+                float tx = x + (key_w - total_w) * 0.5f;
+                float ty = y + label_size * 0.2f; // better vertical centering for our font
+
+                float text_buf[512];
+                int vcount = 0;
+                // Slightly increase label size when selected
+                float eff_label_size = is_sel ? (label_size * 1.1f) : label_size;
+                draw_text_simple(text_buf, &vcount, label, tx, ty, eff_label_size);
+                if (vcount > 0) {
+                    float colored[4096];
+                    int cc = 0;
+                    for (int i = 0; i < vcount && (cc + 6) < 4096; ++i) {
+                        colored[cc++] = text_buf[i * 2 + 0];
+                        colored[cc++] = text_buf[i * 2 + 1];
+                        // Invert label color when selected (black on bright key)
+                        float tr = is_sel ? 0.0f : 1.0f;
+                        float tg = is_sel ? 0.0f : 1.0f;
+                        float tb = is_sel ? 0.0f : 1.0f;
+                        colored[cc++] = tr;
+                        colored[cc++] = tg;
+                        colored[cc++] = tb;
+                        colored[cc++] = 1.0f;
+                    }
+                    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+                    glBufferData(GL_ARRAY_BUFFER, cc * sizeof(float), colored, GL_DYNAMIC_DRAW);
+                    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+                    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+                    glEnableVertexAttribArray(gl->corner_a_position);
+                    glEnableVertexAttribArray(1);
+                    int pixels = vcount / 4;
+                    for (int p = 0; p < pixels; ++p) glDrawArrays(GL_TRIANGLE_FAN, p * 4, 4);
+                }
+            }
+        }
+
+        // (Selection already drawn per-key before labels)
+    } else if (mgr->state == WIFI_STATE_SCANNING) {
+        snprintf(wifi_text, sizeof(wifi_text),
+                 "WiFi\n\nScanning for networks...\n\nPlease wait");
+    } else {
+        // Fallback: show nothing if in other states
+        snprintf(wifi_text, sizeof(wifi_text), "WiFi\n");
+    }
+    
+    // DEBUG: Log the text being rendered
+    #ifndef NDEBUG
+    static int wifi_text_render_count = 0;
+    if (wifi_text_render_count++ % 120 == 0) {
+        printf("[WiFi Text Rendered] selected_index=%d, First line: %.50s\n", 
+               mgr->selected_index, wifi_text);
+    }
+    #endif
+    
+    // Render text using same approach as help overlay
+    float text_vertices[30000];
+    int text_vertex_count = 0;
+    draw_text_simple(text_vertices, &text_vertex_count, wifi_text, -0.8f, 0.5f, 0.025f);
+    
+    #ifndef NDEBUG
+    static int detailed_log_count = 0;
+    bool should_log_detailed = (detailed_log_count++ % 120 == 0);
+    #else
+    bool should_log_detailed = false;
+    #endif
+    
+    if (should_log_detailed) {
+        printf("[WiFi Render] idx=%d, count=%d\n", mgr->selected_index, text_vertex_count);
+        // Print line by line to see the markers clearly
+        printf("=== Full WiFi Text ===\n%s\n", wifi_text);
+        printf("====== End Text ======\n");
+        
+    fflush(stdout);
+    }
+    
+    if (text_vertex_count > 0) {
+        // Create colored vertices for text - YELLOW to be clearly visible
+        float colored_vertices[180000];
+        int colored_vertex_count = 0;
+        for (int i = 0; i < text_vertex_count && i * 6 < 180000; i++) {
+            colored_vertices[colored_vertex_count++] = text_vertices[i * 2 + 0]; // x
+            colored_vertices[colored_vertex_count++] = text_vertices[i * 2 + 1]; // y
+            colored_vertices[colored_vertex_count++] = 1.0f; // r - YELLOW
+            colored_vertices[colored_vertex_count++] = 1.0f; // g - YELLOW
+            colored_vertices[colored_vertex_count++] = 0.0f; // b - no blue
+            colored_vertices[colored_vertex_count++] = 1.0f; // a
+        }
+        
+        // Upload text with colors
+        glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
+        glBufferData(GL_ARRAY_BUFFER, colored_vertex_count * sizeof(float), colored_vertices, GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(gl->corner_a_position);
+        glEnableVertexAttribArray(1);
+        
+        int text_pixels = text_vertex_count / 4;
+        
+        if (should_log_detailed) {
+            printf("  Rendering %d text pixels\n", text_pixels);
+            printf("  text_vertex_count=%d, colored_vertex_count=%d\n", text_vertex_count, colored_vertex_count);
+        }
+        
+        // Draw all text pixels (each character pixel is a 4-vertex rectangle)
+        int draw_calls = 0;
+        for (int i = 0; i < text_pixels; i++) {
+            glDrawArrays(GL_TRIANGLE_FAN, i * 4, 4);
+            draw_calls++;
+        }
+        
+        if (should_log_detailed) {
+            printf("  Completed %d draw calls\n", draw_calls);
+            fflush(stdout);
+        }
+    }
+    
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+#endif
+
+// DMA buffer zero-copy rendering
+// Imports hardware-decoded frame via DMA buffer file descriptor
+// Uses eglCreateImageKHR and glEGLImageTargetTexture2DOES for zero-copy binding
+void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
+                        int plane_offsets[3], int plane_pitches[3],
+                        struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    if (!gl || dma_fd < 0) {
+        fprintf(stderr, "[DMA] Invalid arguments (gl=%p, fd=%d)\n", (void*)gl, dma_fd);
+        return;
+    }
+
+    if (!gl->supports_egl_image) {
+        fprintf(stderr, "[DMA] EGL image not supported\n");
+        return;
+    }
+
+    // DEBUG: Log DMA rendering
+    static int dma_render_count[2] = {0, 0};
+    if (dma_render_count[video_index] < 3) {
+        printf("[DMA_RENDER] Video %d: fd=%d, size=%dx%d, clear=%d\n",
+               video_index, dma_fd, width, height, clear_screen);
+        dma_render_count[video_index]++;
+    }
+
+    // Select appropriate texture set based on video index
+    GLuint tex_y = (video_index == 0) ? gl->texture_y : gl->texture_y2;
+    GLuint tex_u = (video_index == 0) ? gl->texture_u : gl->texture_u2;
+    GLuint tex_v = (video_index == 0) ? gl->texture_v : gl->texture_v2;
+
+    // Set up rendering state
+    glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
+    if (clear_screen && video_index == 0) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
+
+    // OPTIMIZATION: Only set up GL state once per frame (for video 0)
+    // Video 1 reuses the same state - only textures and matrices change
+    if (video_index == 0) {
+        glUseProgram(gl->program);
+        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+
+        // Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        // Texture coordinate attribute
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+
+        // Disable blending and depth test
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+    }
+
+    // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
+    float mvp_matrix[16];
+    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
+    glUniformMatrix4fv(gl->u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+    
+    // YUV420P format via DMA buffer (3 separate planes)
+    // Use actual video dimensions, not buffer dimensions (hardware may pad buffers)
+    int uv_width = width / 2;   // UV is half resolution of Y
+    int uv_height = height / 2;
+    
+    struct timespec dma_start, dma_end;
+    clock_gettime(CLOCK_MONOTONIC, &dma_start);
+    
+    if (!eglCreateImageKHR) {
+        fprintf(stderr, "[DMA] eglCreateImageKHR not loaded\n");
+        return;
+    }
+    
+    // Create Y plane EGL image using actual hardware layout
+    EGLint y_attrs[] = {
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
+        EGL_NONE
+    };
+
+    EGLImage y_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, y_attrs);
+    EGLint egl_err = eglGetError();
+    if (y_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count[2] = {0, 0};
+        if (err_count[video_index] < 3) {
+            fprintf(stderr, "[DMA] Video %d Y plane import failed: 0x%x (fd=%d, %dx%d, offset=%d, pitch=%d)\n",
+                    video_index, egl_err, dma_fd, width, height, plane_offsets[0], plane_pitches[0]);
+            err_count[video_index]++;
+        }
+        return;
+    }
+    
+    // Create U plane EGL image using actual hardware layout
+    EGLint u_attrs[] = {
+        EGL_WIDTH, uv_width,
+        EGL_HEIGHT, uv_height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[1],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[1],
+        EGL_NONE
+    };
+    
+    EGLImage u_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, u_attrs);
+    egl_err = eglGetError();
+    if (u_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[DMA] U plane import failed: 0x%x\n", egl_err);
+            err_count++;
+        }
+        if (eglDestroyImageKHR) {
+            (*eglDestroyImageKHR)(gl->egl_display, y_image);
+        }
+        return;
+    }
+    
+    // Create V plane EGL image using actual hardware layout
+    EGLint v_attrs[] = {
+        EGL_WIDTH, uv_width,
+        EGL_HEIGHT, uv_height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[2],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[2],
+        EGL_NONE
+    };
+    
+    EGLImage v_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, v_attrs);
+    egl_err = eglGetError();
+    if (v_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[DMA] V plane import failed: 0x%x\n", egl_err);
+            err_count++;
+        }
+        if (eglDestroyImageKHR) {
+            (*eglDestroyImageKHR)(gl->egl_display, y_image);
+            (*eglDestroyImageKHR)(gl->egl_display, u_image);
+        }
+        return;
+    }
+    
+    // Bind Y plane to texture unit 0
+    // Bind Y plane to texture unit 0 (use selected texture based on video_index)
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)y_image);
+    } else {
+        fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
+        goto cleanup_dma;
+    }
+    // Set texture parameters for completeness
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(gl->u_texture_y, 0);
+
+    // Bind U plane to texture unit 1 (use selected texture based on video_index)
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
+    (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)u_image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(gl->u_texture_u, 1);
+
+    // Bind V plane to texture unit 2 (use selected texture based on video_index)
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
+    (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)v_image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(gl->u_texture_v, 2);
+    
+    // Set flip_y uniform (video is encoded upside down)
+    glUniform1f(gl->u_flip_y, 1.0f);
+
+    // Bind keystone matrix and render
+    const float *keystone_matrix = keystone_get_matrix(keystone);
+    glUniformMatrix4fv(gl->u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    // Check for GL errors (only report first few)
+    GLenum err = glGetError();
+    static int gl_err_count = 0;
+    if (err != GL_NO_ERROR && gl_err_count < 3) {
+        fprintf(stderr, "[DMA] GL error after draw: 0x%x\n", err);
+        gl_err_count++;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &dma_end);
+
+cleanup_dma:
+    // Flush GL commands to GPU (non-blocking)
+    // The driver will ensure EGL images aren't freed until GPU is done with them
+    glFlush();
+
+    // CRITICAL: Unbind textures from EGL images before destroying
+    // Bind NULL/0 to each texture to detach the EGL image
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_u);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, tex_v);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    }
+
+    // Now destroy the EGL images
+    if (eglDestroyImageKHR) {
+        (*eglDestroyImageKHR)(gl->egl_display, y_image);
+        (*eglDestroyImageKHR)(gl->egl_display, u_image);
+        (*eglDestroyImageKHR)(gl->egl_display, v_image);
+    }
+
+    // Reset texture binding
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 void gl_cleanup(gl_context_t *gl) {
-    // Clean up YUV textures
+    // Clean up YUV textures (video 1)
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
     if (gl->texture_v) glDeleteTextures(1, &gl->texture_v);
     if (gl->texture_nv12) glDeleteTextures(1, &gl->texture_nv12);
+    
+    // Clean up YUV textures (video 2)
+    if (gl->texture_y2) glDeleteTextures(1, &gl->texture_y2);
+    if (gl->texture_u2) glDeleteTextures(1, &gl->texture_u2);
+    if (gl->texture_v2) glDeleteTextures(1, &gl->texture_v2);
     
     // Clean up PBOs
     if (gl->use_pbo) {

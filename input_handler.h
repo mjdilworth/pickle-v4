@@ -39,6 +39,7 @@ typedef struct {
     bool gamepad_increase_step;         // R1: increase step size
     bool gamepad_reset_keystone;        // SELECT: reset keystone
     bool gamepad_toggle_mode;           // START: toggle keystone mode
+    bool gamepad_toggle_corner_border;  // B button: toggle both borders and corners
     uint64_t gamepad_start_select_time; // For START+SELECT hold detection
     bool debug_gamepad;                 // Debug flag for logging button presses
 } input_context_t;
@@ -59,6 +60,10 @@ void input_restore_terminal_global(void);  // Emergency terminal restoration
 #define KEY_CORNER_2     KEY_2
 #define KEY_CORNER_3     KEY_3
 #define KEY_CORNER_4     KEY_4
+#define KEY_CORNER_5     KEY_5
+#define KEY_CORNER_6     KEY_6
+#define KEY_CORNER_7     KEY_7
+#define KEY_CORNER_8     KEY_8
 
 // Gamepad button mappings for 8BitDo Zero 2 (using joystick API)
 // These match the js_event.number values from /dev/input/js0
