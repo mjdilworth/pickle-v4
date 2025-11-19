@@ -1220,17 +1220,17 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     float corner_colors[4][4];
     for (int i = 0; i < 4; i++) {
         if (keystone->selected_corner == i) {
-            // Bright green for selected
+            // Bright green for selected - semi-transparent to show border
             corner_colors[i][0] = 0.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 0.0f;
-            corner_colors[i][3] = 1.0f;
+            corner_colors[i][3] = 0.5f;  // 50% opacity for selected
         } else {
-            // White with subtle transparency for unselected (more elegant)
+            // White with transparency for unselected - allow border to show through
             corner_colors[i][0] = 1.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 1.0f;
-            corner_colors[i][3] = 0.7f;
+            corner_colors[i][3] = 0.3f;  // 30% opacity for unselected
         }
     }
     
@@ -1442,7 +1442,110 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // NOTE: Don't unbind buffers here - video_player.c handles complete state restoration
 }
 
-// Complete 5x7 bitmap font data - each byte represents one row, 5 bits used
+// Render display boundary (red rectangle showing max projector/display area)
+void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone) {
+    if (!keystone || !keystone->show_border) {
+        return; // Don't render boundary if border not visible
+    }
+    
+    // Enable blending for transparent overlay
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Disable depth testing to ensure overlay is always visible
+    glDisable(GL_DEPTH_TEST);
+    
+    // Create boundary line vertices - rectangle covering full display
+    // Normalized coordinates: (-1, -1) to (1, 1)
+    // Each vertex: x, y, r, g, b, a (6 floats per vertex)
+    float boundary_vertices[48]; // 8 vertices * 6 floats = 48 floats
+    
+    // Red color for boundary
+    float r = 1.0f, g = 0.0f, b = 0.0f, a = 0.8f;  // 80% opaque red
+    
+    // Line 1: Top edge (left to right)
+    boundary_vertices[0] = -1.0f;   // top-left x
+    boundary_vertices[1] = 1.0f;    // top-left y
+    boundary_vertices[2] = r; boundary_vertices[3] = g; boundary_vertices[4] = b; boundary_vertices[5] = a;
+    
+    boundary_vertices[6] = 1.0f;    // top-right x
+    boundary_vertices[7] = 1.0f;    // top-right y
+    boundary_vertices[8] = r; boundary_vertices[9] = g; boundary_vertices[10] = b; boundary_vertices[11] = a;
+    
+    // Line 2: Right edge (top to bottom)
+    boundary_vertices[12] = 1.0f;   // top-right x
+    boundary_vertices[13] = 1.0f;   // top-right y
+    boundary_vertices[14] = r; boundary_vertices[15] = g; boundary_vertices[16] = b; boundary_vertices[17] = a;
+    
+    boundary_vertices[18] = 1.0f;   // bottom-right x
+    boundary_vertices[19] = -1.0f;  // bottom-right y
+    boundary_vertices[20] = r; boundary_vertices[21] = g; boundary_vertices[22] = b; boundary_vertices[23] = a;
+    
+    // Line 3: Bottom edge (right to left)
+    boundary_vertices[24] = 1.0f;   // bottom-right x
+    boundary_vertices[25] = -1.0f;  // bottom-right y
+    boundary_vertices[26] = r; boundary_vertices[27] = g; boundary_vertices[28] = b; boundary_vertices[29] = a;
+    
+    boundary_vertices[30] = -1.0f;  // bottom-left x
+    boundary_vertices[31] = -1.0f;  // bottom-left y
+    boundary_vertices[32] = r; boundary_vertices[33] = g; boundary_vertices[34] = b; boundary_vertices[35] = a;
+    
+    // Line 4: Left edge (bottom to top)
+    boundary_vertices[36] = -1.0f;  // bottom-left x
+    boundary_vertices[37] = -1.0f;  // bottom-left y
+    boundary_vertices[38] = r; boundary_vertices[39] = g; boundary_vertices[40] = b; boundary_vertices[41] = a;
+    
+    boundary_vertices[42] = -1.0f;  // top-left x
+    boundary_vertices[43] = 1.0f;   // top-left y
+    boundary_vertices[44] = r; boundary_vertices[45] = g; boundary_vertices[46] = b; boundary_vertices[47] = a;
+    
+    // Create temporary VBO for boundary if needed
+    static GLuint boundary_vbo = 0;
+    if (boundary_vbo == 0) {
+        glGenBuffers(1, &boundary_vbo);
+    }
+    
+    // Update boundary VBO
+    glBindBuffer(GL_ARRAY_BUFFER, boundary_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(boundary_vertices), boundary_vertices, GL_DYNAMIC_DRAW);
+    
+    // Use corner shader program
+    glUseProgram(gl->corner_program);
+    
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    // Set identity matrix for MVP
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+    
+    // Set line width - thinner than keystone border for clarity
+    glLineWidth(1.5f);
+    
+    // Draw boundary as 4 lines (8 vertices)
+    glDrawArrays(GL_LINES, 0, 8);
+    
+    // Reset line width
+    glLineWidth(1.0f);
+    
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
+    
+    // Disable blending and restore depth testing
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+}
 static const unsigned char font_5x7[128][7] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     ['!'] = {0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00},

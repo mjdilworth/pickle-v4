@@ -1589,6 +1589,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
             if (app->keystone->show_border) {
                 gl_render_border(app->gl, app->keystone);
+                gl_render_display_boundary(app->gl, app->keystone);
             }
             if (app->keystone->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone);
@@ -1635,6 +1636,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
             if (app->keystone2->show_border) {
                 gl_render_border(app->gl, app->keystone2);
+                gl_render_display_boundary(app->gl, app->keystone2);
             }
             if (app->keystone2->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone2);
