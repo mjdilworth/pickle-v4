@@ -85,9 +85,15 @@ typedef struct {
     // EGL DMA buffer zero-copy support
     bool supports_egl_image;         // True if EGL_EXT_image_dma_buf_import supported
     EGLImage egl_image_y;            // EGL image for Y plane (DMA-backed)
+    EGLImage egl_image_u;            // EGL image for U plane (DMA-backed) - YUV420P
+    EGLImage egl_image_v;            // EGL image for V plane (DMA-backed) - YUV420P
     EGLImage egl_image_uv;           // EGL image for UV plane (DMA-backed) - NV12 packed
     EGLImage egl_image_y2;           // EGL image for Y plane (video 2)
+    EGLImage egl_image_u2;           // EGL image for U plane (video 2)
+    EGLImage egl_image_v2;           // EGL image for V plane (video 2)
     EGLImage egl_image_uv2;          // EGL image for UV plane (video 2)
+    int cached_dma_fd;               // Track which DMA FD the EGL images are for (video 1)
+    int cached_dma_fd2;              // Track which DMA FD the EGL images are for (video 2)
 } gl_context_t;
 
 // OpenGL ES functions

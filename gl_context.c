@@ -563,9 +563,15 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
     
     // Initialize EGL image handles
     gl->egl_image_y = EGL_NO_IMAGE;
+    gl->egl_image_u = EGL_NO_IMAGE;
+    gl->egl_image_v = EGL_NO_IMAGE;
     gl->egl_image_uv = EGL_NO_IMAGE;
     gl->egl_image_y2 = EGL_NO_IMAGE;
+    gl->egl_image_u2 = EGL_NO_IMAGE;
+    gl->egl_image_v2 = EGL_NO_IMAGE;
     gl->egl_image_uv2 = EGL_NO_IMAGE;
+    gl->cached_dma_fd = -1;
+    gl->cached_dma_fd2 = -1;
 
     // Create shaders and program
     if (create_program(gl) != 0) {
@@ -835,6 +841,9 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
             bool uv_ok = upload_plane_with_pbo(gl, PLANE_U, uv_plane, uv_width, uv_height, 2, uv_row_bytes, GL_RG);
 
             pbo_uploaded = y_ok && uv_ok;
+            if (pbo_uploaded && frame_rendered[video_index] <= 3) {
+                printf("[PBO] ✓ NV12 frame uploaded via PBO double-buffering (async)\n");
+            }
             if (!pbo_uploaded) {
                 gl->use_pbo = false;
                 if (!gl->pbo_warned) {
@@ -2329,35 +2338,62 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
 
     // DEBUG: Log DMA rendering
     static int dma_render_count[2] = {0, 0};
-    if (dma_render_count[video_index] < 3) {
-        printf("[DMA_RENDER] Video %d: fd=%d, size=%dx%d, clear=%d\n",
-               video_index, dma_fd, width, height, clear_screen);
-        dma_render_count[video_index]++;
-    }
+    // Suppressed verbose DMA render logging
+    dma_render_count[video_index]++;
 
-    // Select appropriate texture set based on video index
+    // Select appropriate texture set and EGL images based on video index
     GLuint tex_y = (video_index == 0) ? gl->texture_y : gl->texture_y2;
     GLuint tex_u = (video_index == 0) ? gl->texture_u : gl->texture_u2;
     GLuint tex_v = (video_index == 0) ? gl->texture_v : gl->texture_v2;
+    EGLImage *cached_y = (video_index == 0) ? &gl->egl_image_y : &gl->egl_image_y2;
+    EGLImage *cached_u = (video_index == 0) ? &gl->egl_image_u : &gl->egl_image_u2;
+    EGLImage *cached_v = (video_index == 0) ? &gl->egl_image_v : &gl->egl_image_v2;
+    int *cached_fd = (video_index == 0) ? &gl->cached_dma_fd : &gl->cached_dma_fd2;
 
-    // CRITICAL: Clear any previous EGL image bindings before rebinding
-    // This prevents GL_INVALID_OPERATION errors when reusing textures
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_y);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
-    }
+    // OPTIMIZATION: Only destroy and recreate EGL images if DMA FD changed
+    // Hardware decoder often reuses the same buffer, so we can cache EGL images
+    bool need_new_images = (*cached_fd != dma_fd);
     
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_u);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+    if (need_new_images && eglDestroyImageKHR) {
+        if (*cached_y != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, *cached_y);
+            *cached_y = EGL_NO_IMAGE;
+        }
+        if (*cached_u != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, *cached_u);
+            *cached_u = EGL_NO_IMAGE;
+        }
+        if (*cached_v != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, *cached_v);
+            *cached_v = EGL_NO_IMAGE;
+        }
+        // Note: cached_fd will be updated to dma_fd after successful image creation (line ~2559)
     }
-    
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, tex_v);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
+
+    // Only recreate textures if we need new EGL images
+    if (need_new_images) {
+        if (video_index == 0) {
+            glDeleteTextures(1, &gl->texture_y);
+            glDeleteTextures(1, &gl->texture_u);
+            glDeleteTextures(1, &gl->texture_v);
+            glGenTextures(1, &gl->texture_y);
+            glGenTextures(1, &gl->texture_u);
+            glGenTextures(1, &gl->texture_v);
+            tex_y = gl->texture_y;
+            tex_u = gl->texture_u;
+            tex_v = gl->texture_v;
+        } else {
+            glDeleteTextures(1, &gl->texture_y2);
+            glDeleteTextures(1, &gl->texture_u2);
+            glDeleteTextures(1, &gl->texture_v2);
+            glGenTextures(1, &gl->texture_y2);
+            glGenTextures(1, &gl->texture_u2);
+            glGenTextures(1, &gl->texture_v2);
+            tex_y = gl->texture_y2;
+            tex_u = gl->texture_u2;
+            tex_v = gl->texture_v2;
+        }
+        // Suppressed DMA FD change logging
     }
 
     // Set up rendering state
@@ -2367,10 +2403,13 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
 
-    // OPTIMIZATION: Only set up GL state once per frame (for video 0)
+    // CRITICAL: Ensure shader program is active for BOTH videos
+    // Previously this was only done for video 0, causing GL_INVALID_OPERATION for video 1
+    glUseProgram(gl->program);
+
+    // OPTIMIZATION: Only set up buffers and attributes once per frame (for video 0)
     // Video 1 reuses the same state - only textures and matrices change
     if (video_index == 0) {
-        glUseProgram(gl->program);
         glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
 
@@ -2409,129 +2448,187 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
         return;
     }
     
-    // Create Y plane EGL image using actual hardware layout
-    EGLint y_attrs[] = {
-        EGL_WIDTH, width,
-        EGL_HEIGHT, height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
-        EGL_NONE
-    };
+    // OPTIMIZATION: Only create EGL images if DMA FD changed
+    // If cached images exist and FD is the same, reuse them (major performance win)
+    EGLImage y_image = *cached_y;
+    EGLImage u_image = *cached_u;
+    EGLImage v_image = *cached_v;
+    
+    if (need_new_images) {
+        // Create Y plane EGL image using actual hardware layout
+        EGLint y_attrs[] = {
+            EGL_WIDTH, width,
+            EGL_HEIGHT, height,
+            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+            EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
+            EGL_NONE
+        };
 
-    EGLImage y_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
-                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, y_attrs);
-    EGLint egl_err = eglGetError();
-    if (y_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        static int err_count[2] = {0, 0};
-        if (err_count[video_index] < 3) {
-            fprintf(stderr, "[DMA] Video %d Y plane import failed: 0x%x (fd=%d, %dx%d, offset=%d, pitch=%d)\n",
-                    video_index, egl_err, dma_fd, width, height, plane_offsets[0], plane_pitches[0]);
-            err_count[video_index]++;
+        y_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                             EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, y_attrs);
+        EGLint egl_err = eglGetError();
+        if (y_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+            static int err_count[2] = {0, 0};
+            if (err_count[video_index] < 5) {
+                fprintf(stderr, "[DMA] Video %d Y plane EGL image creation failed: EGL error 0x%x\n",
+                        video_index, egl_err);
+                fprintf(stderr, "[DMA]   FD=%d, size=%dx%d, offset=%d, pitch=%d\n",
+                        dma_fd, width, height, plane_offsets[0], plane_pitches[0]);
+                err_count[video_index]++;
+            }
+            return;
         }
-        return;
-    }
-    
-    // Create U plane EGL image using actual hardware layout
-    EGLint u_attrs[] = {
-        EGL_WIDTH, uv_width,
-        EGL_HEIGHT, uv_height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[1],
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[1],
-        EGL_NONE
-    };
-    
-    EGLImage u_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
-                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, u_attrs);
-    egl_err = eglGetError();
-    if (u_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        static int err_count = 0;
-        if (err_count < 3) {
-            fprintf(stderr, "[DMA] U plane import failed: 0x%x\n", egl_err);
-            err_count++;
+        
+        // Y plane EGL image created (verbose logging suppressed)
+        *cached_y = y_image;  // Cache for reuse
+        
+        // Create U plane EGL image using actual hardware layout
+        EGLint u_attrs[] = {
+            EGL_WIDTH, uv_width,
+            EGL_HEIGHT, uv_height,
+            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+            EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[1],
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[1],
+            EGL_NONE
+        };
+        
+        u_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                             EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, u_attrs);
+        egl_err = eglGetError();
+        if (u_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+            static int err_count = 0;
+            if (err_count < 5) {
+                fprintf(stderr, "[DMA] U plane EGL image creation failed: EGL error 0x%x\n", egl_err);
+                fprintf(stderr, "[DMA]   FD=%d, size=%dx%d, offset=%d, pitch=%d\n",
+                        dma_fd, uv_width, uv_height, plane_offsets[1], plane_pitches[1]);
+                err_count++;
+            }
+            if (eglDestroyImageKHR) {
+                (*eglDestroyImageKHR)(gl->egl_display, y_image);
+            }
+            return;
         }
-        if (eglDestroyImageKHR) {
-            (*eglDestroyImageKHR)(gl->egl_display, y_image);
+        
+        // U plane EGL image created (verbose logging suppressed)
+        *cached_u = u_image;  // Cache for reuse
+        
+        // Create V plane EGL image using actual hardware layout
+        EGLint v_attrs[] = {
+            EGL_WIDTH, uv_width,
+            EGL_HEIGHT, uv_height,
+            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+            EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[2],
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[2],
+            EGL_NONE
+        };
+        
+        v_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                             EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, v_attrs);
+        egl_err = eglGetError();
+        if (v_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+            static int err_count = 0;
+            if (err_count < 5) {
+                fprintf(stderr, "[DMA] V plane EGL image creation failed: EGL error 0x%x\n", egl_err);
+                fprintf(stderr, "[DMA]   FD=%d, size=%dx%d, offset=%d, pitch=%d\n",
+                        dma_fd, uv_width, uv_height, plane_offsets[2], plane_pitches[2]);
+                err_count++;
+            }
+            if (eglDestroyImageKHR) {
+                (*eglDestroyImageKHR)(gl->egl_display, y_image);
+                (*eglDestroyImageKHR)(gl->egl_display, u_image);
+            }
+            return;
         }
-        return;
-    }
-    
-    // Create V plane EGL image using actual hardware layout
-    EGLint v_attrs[] = {
-        EGL_WIDTH, uv_width,
-        EGL_HEIGHT, uv_height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[2],
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[2],
-        EGL_NONE
-    };
-    
-    EGLImage v_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
-                                         EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, v_attrs);
-    egl_err = eglGetError();
-    if (v_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        static int err_count = 0;
-        if (err_count < 3) {
-            fprintf(stderr, "[DMA] V plane import failed: 0x%x\n", egl_err);
-            err_count++;
-        }
-        if (eglDestroyImageKHR) {
-            (*eglDestroyImageKHR)(gl->egl_display, y_image);
-            (*eglDestroyImageKHR)(gl->egl_display, u_image);
-        }
-        return;
-    }
-    
-    // Bind Y plane to texture unit 0 (use selected texture based on video_index)
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_y);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)y_image);
-        GLenum err = glGetError();
-        if (err != GL_NO_ERROR) {
-            fprintf(stderr, "[DMA] Y plane bind error: 0x%x\n", err);
-        }
+        
+        // V plane EGL image created (verbose logging suppressed)
+        *cached_v = v_image;  // Cache for reuse
+        *cached_fd = dma_fd;  // Mark cache as valid for this FD
     } else {
-        fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
-        goto cleanup_dma;
+        // Reusing cached EGL images (verbose logging suppressed)
     }
-    // Set texture parameters for completeness
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Bind textures to EGL images (needed when images are new)
+    // Once bound, the texture-image association persists, so we only bind on creation
+    if (need_new_images) {
+        // Bind Y plane to texture unit 0 (use selected texture based on video_index)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_y);
+        // CRITICAL: Set texture parameters BEFORE binding EGL image
+        // According to spec, glEGLImageTargetTexture2DOES requires texture to be in proper state
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (glEGLImageTargetTexture2DOES) {
+            (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)y_image);
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR) {
+                static int bind_err_count = 0;
+                if (bind_err_count < 5) {
+                    fprintf(stderr, "[DMA] Y plane texture bind error: 0x%x (GL_INVALID_VALUE=0x501)\n", err);
+                    fprintf(stderr, "[DMA]   Texture ID: %u, EGL Image: %p\n", tex_y, (void*)y_image);
+                    // Check if texture is bound
+                    GLint bound_tex = 0;
+                    glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_tex);
+                    fprintf(stderr, "[DMA]   Currently bound texture: %d\n", bound_tex);
+                    bind_err_count++;
+                }
+                goto cleanup_dma;
+            }
+            // Y plane texture bound (verbose logging suppressed)
+        } else {
+            fprintf(stderr, "[DMA] glEGLImageTargetTexture2DOES not loaded\n");
+            goto cleanup_dma;
+        }
+
+        // Bind U plane to texture unit 1 (use selected texture based on video_index)
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, tex_u);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)u_image);
+        GLenum err_u = glGetError();
+        if (err_u != GL_NO_ERROR) {
+            fprintf(stderr, "[DMA] U plane bind error: 0x%x\n", err_u);
+            goto cleanup_dma;
+        }
+        // U plane texture bound (verbose logging suppressed)
+        glUniform1i(gl->u_texture_u, 1);
+
+        // Bind V plane to texture unit 2 (use selected texture based on video_index)
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, tex_v);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)v_image);
+        GLenum err_v = glGetError();
+        if (err_v != GL_NO_ERROR) {
+            fprintf(stderr, "[DMA] V plane bind error: 0x%x\n", err_v);
+            goto cleanup_dma;
+        }
+        // V plane texture bound (verbose logging suppressed)
+        glUniform1i(gl->u_texture_v, 2);
+    } else {
+        // Textures already bound to EGL images, just activate them
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_y);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, tex_u);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, tex_v);
+    }
+    
+    // Set texture uniforms (every frame)
     glUniform1i(gl->u_texture_y, 0);
-
-    // Bind U plane to texture unit 1 (use selected texture based on video_index)
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_u);
-    (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)u_image);
-    GLenum err_u = glGetError();
-    if (err_u != GL_NO_ERROR) {
-        fprintf(stderr, "[DMA] U plane bind error: 0x%x\n", err_u);
-    }
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(gl->u_texture_u, 1);
-
-    // Bind V plane to texture unit 2 (use selected texture based on video_index)
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, tex_v);
-    (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)v_image);
-    GLenum err_v = glGetError();
-    if (err_v != GL_NO_ERROR) {
-        fprintf(stderr, "[DMA] V plane bind error: 0x%x\n", err_v);
-    }
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glUniform1i(gl->u_texture_v, 2);
     
     // Set flip_y uniform (video is encoded upside down)
@@ -2557,34 +2654,15 @@ cleanup_dma:
     // The driver will ensure EGL images aren't freed until GPU is done with them
     glFlush();
 
-    // CRITICAL: Unbind textures from EGL images before destroying
-    // Bind NULL/0 to each texture to detach the EGL image
+    // IMPORTANT: Do NOT destroy cached EGL images here!
+    // Cached images are meant to be reused across frames when DMA FD doesn't change.
+    // They are only destroyed when:
+    // 1. DMA FD changes (need_new_images==true, destroyed at line ~2500)
+    // 2. Cleanup during shutdown (gl_cleanup function)
+    // Destroying them every frame causes GL_INVALID_VALUE errors on subsequent draws.
+    
+    // Reset active texture unit
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_y);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
-    }
-
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_u);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
-    }
-
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, tex_v);
-    if (glEGLImageTargetTexture2DOES) {
-        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, (GLeglImageOES)0);
-    }
-
-    // Now destroy the EGL images
-    if (eglDestroyImageKHR) {
-        (*eglDestroyImageKHR)(gl->egl_display, y_image);
-        (*eglDestroyImageKHR)(gl->egl_display, u_image);
-        (*eglDestroyImageKHR)(gl->egl_display, v_image);
-    }
-
-    // Reset texture binding
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -2619,6 +2697,34 @@ void gl_cleanup(gl_context_t *gl) {
     
     // Clean up pre-allocated YUV buffers
     free_yuv_buffers();
+    
+    // Clean up EGL images
+    if (eglDestroyImageKHR) {
+        if (gl->egl_image_y != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_y);
+        }
+        if (gl->egl_image_u != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_u);
+        }
+        if (gl->egl_image_v != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_v);
+        }
+        if (gl->egl_image_uv != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_uv);
+        }
+        if (gl->egl_image_y2 != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_y2);
+        }
+        if (gl->egl_image_u2 != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_u2);
+        }
+        if (gl->egl_image_v2 != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_v2);
+        }
+        if (gl->egl_image_uv2 != EGL_NO_IMAGE) {
+            (*eglDestroyImageKHR)(gl->egl_display, gl->egl_image_uv2);
+        }
+    }
     
     if (gl->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(gl->egl_display, gl->egl_surface);

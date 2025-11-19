@@ -434,6 +434,13 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         return -1;
     }
     
+    // Enable PBO double-buffering for hardware decode (async texture uploads)
+    if (app->video->use_hardware_decode) {
+        app->gl->use_pbo = true;
+        glGenBuffers(2 * 3, &app->gl->pbo[0][0]);  // 2 ring buffers x 3 planes (Y/U/V)
+        printf("[RENDER] PBO double-buffering enabled for hardware decode\n");
+    }
+    
     // Validate video dimensions after decoder opens file
     if (app->video->width > MAX_VIDEO_WIDTH || app->video->height > MAX_VIDEO_HEIGHT) {
         fprintf(stderr, "Error: Video dimensions %dx%d exceed limits (%dx%d max)\n",
@@ -1287,19 +1294,17 @@ void app_run(app_context_t *app) {
             video_height = 256;
         }
         
-        // Get YUV data for GPU rendering
-        uint8_t *y_data, *u_data, *v_data;
-        int y_stride, u_stride, v_stride;
-        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+        // Check if DMA buffer is available for zero-copy rendering
+        // Do this check ONCE at the start to avoid inconsistencies
+        bool has_dma = video_has_dma_buffer(app->video);
         
-        // PRODUCTION: Removed noisy YUV pointer debug output
-        // Only log if NULL (actual error condition)
-        static bool null_warned = false;
-        if (!y_data && !null_warned) {
-            printf("Warning: NULL YUV data pointer\n");
-            null_warned = true;
-            fflush(stdout);
+        // Get YUV data for GPU rendering (only if not using DMA)
+        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+        int y_stride = 0, u_stride = 0, v_stride = 0;
+        if (!has_dma) {
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
         }
+        // Note: y_data will be NULL when using DMA (expected, not an error)
         
         // CRITICAL: Start render timing RIGHT BEFORE actual GL operations
         // Don't include async decode prep, input handling, or other non-render work
@@ -1328,17 +1333,34 @@ void app_run(app_context_t *app) {
             goto skip_video_render;
         }
 
-        // Check if DMA buffer is available for zero-copy rendering
-        // Try KMS direct scanout first, then fall back to OpenGL if not available
-        bool has_dma = video_has_dma_buffer(app->video);
+        // DMA buffer check already done above (has_dma variable)
         bool used_kms_overlay = false;  // Track if we used KMS path (no GL work needed)
         bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
         
-        // PRODUCTION FIX: Always use CPU/OpenGL path for hardware decode
-        // KMS overlay plane cannot apply keystone correction (no transformation matrix)
-        // Keystone correction is a core feature, so we must use OpenGL rendering
-        // This means hardware decoded frames are uploaded to GPU textures via CPU
-        if (false && has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
+        // DMA RENDERING: Use OpenGL + EGL DMA import for hardware decode
+        // This provides zero-copy GPU rendering WITH keystone support
+        // KMS overlay (disabled) cannot do keystone, but OpenGL+DMA can
+        if (has_dma && new_primary_frame_ready) {
+            // OPENGL DMA PATH: Zero-copy rendering with keystone support
+            int dma_fd = video_get_dma_fd(app->video);
+            if (dma_fd >= 0) {
+                static bool dma_path_logged = false;
+                if (!dma_path_logged) {
+                    printf("[DMA] ✓ Using DMA zero-copy rendering (OpenGL + EGL import)\n");
+                    dma_path_logged = true;
+                }
+
+                // Get actual plane layout from hardware decoder
+                int plane_offsets[3] = {0, 0, 0};
+                int plane_pitches[3] = {0, 0, 0};
+                video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
+
+                // Render using DMA buffer directly (zero-copy, <1ms upload)
+                gl_render_frame_dma(app->gl, dma_fd, video_width, video_height,
+                                   plane_offsets, plane_pitches, app->drm, app->keystone,
+                                   true, 0);
+            }
+        } else if (false && has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
             // KMS DIRECT SCANOUT PATH - DISABLED for keystone support
             // This path bypasses OpenGL and cannot apply keystone transformation
             // Keeping code for reference, but disabled to ensure keystone always works
@@ -1370,7 +1392,10 @@ void app_run(app_context_t *app) {
                 // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
                 // This is handled in the standard overlay rendering section below
             }
-        } else {
+        }
+        
+        // CPU RENDERING PATH - Only used when DMA is not available (software decode)
+        if (!has_dma && !used_kms_overlay) {
             // CPU RENDERING PATH (DMA currently broken on this hardware)
             // Use simple direct glTexSubImage2D uploads for now
             // Used only when: no DMA buffers available (software decode)
@@ -1452,15 +1477,7 @@ void app_run(app_context_t *app) {
             primary_async_request_pending = false;
         }
 
-        // Render second video with second keystone (don't clear screen)
-        if (app->video2 && app->keystone2) {
-            // Get dimensions (safe to call anytime)
-            int video_width2 = app->video2->width;
-            int video_height2 = app->video2->height;
-            bool video2_rendered = false;
-            struct timespec nv12_cpu_start2 = {0, 0}, nv12_cpu_end2 = {0, 0};
-            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
-
+        // Update timing statistics for both videos (regardless of video2 existence)
         if (app->show_timing) {
             for (int i = 0; i < 2; ++i) {
                 if (nv12_frame_time[i] >= 0.0) {
@@ -1487,13 +1504,52 @@ void app_run(app_context_t *app) {
             }
         }
 
+        // Render second video with second keystone (don't clear screen)
+        if (app->video2 && app->keystone2) {
+            // Get dimensions (safe to call anytime)
+            int video_width2 = app->video2->width;
+            int video_height2 = app->video2->height;
+            bool video2_rendered = false;
+            struct timespec nv12_cpu_start2 = {0, 0}, nv12_cpu_end2 = {0, 0};
+            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
+
             // Split rendering path by decode type:
-            // HW decode → NV12 conversion + 2-plane upload
+            // HW decode with DMA → Zero-copy DMA import
+            // HW decode without DMA → NV12 conversion + 2-plane upload
             // SW decode → Direct YUV420P 3-plane upload (no conversion)
             bool use_hw_decode2 = app->video2->use_hardware_decode;
+            bool has_dma2 = use_hw_decode2 && video_has_dma_buffer(app->video2);
 
-            if (use_hw_decode2 && new_secondary_frame_ready) {
-                // HW DECODE PATH: Convert to NV12 and upload 2 planes
+            if (has_dma2 && new_secondary_frame_ready) {
+                // HW DECODE DMA PATH: Zero-copy rendering via EGL DMA import
+                int dma_fd2 = video_get_dma_fd(app->video2);
+                if (dma_fd2 >= 0) {
+                    static bool dma2_path_logged = false;
+                    if (!dma2_path_logged) {
+                        printf("[DMA] ✓ Using DMA zero-copy rendering for VIDEO 2 (OpenGL + EGL import)\n");
+                        dma2_path_logged = true;
+                    }
+
+                    // Get actual plane layout from hardware decoder
+                    int plane_offsets2[3] = {0, 0, 0};
+                    int plane_pitches2[3] = {0, 0, 0};
+                    video_get_dma_plane_layout(app->video2, plane_offsets2, plane_pitches2);
+
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
+                    }
+                    // Render using DMA buffer directly (zero-copy, <1ms upload)
+                    gl_render_frame_dma(app->gl, dma_fd2, video_width2, video_height2,
+                                       plane_offsets2, plane_pitches2, app->drm, app->keystone2,
+                                       false, 1);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
+                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+                    }
+                    video2_rendered = true;
+                }
+            } else if (use_hw_decode2 && !has_dma2 && new_secondary_frame_ready) {
+                // HW DECODE FALLBACK PATH: Convert to NV12 and upload 2 planes
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start2);
                 }
@@ -1673,10 +1729,16 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Time buffer swapping
         clock_gettime(CLOCK_MONOTONIC, &swap_start);
 
-        // Only swap buffers if we rendered something in OpenGL
-        // When using KMS overlay without GL overlays, skip the swap (no vsync wait needed)
-        if (!used_kms_overlay || any_overlay_visible || any_overlay_visible2) {
+        // Only swap buffers if we rendered a NEW frame in OpenGL
+        // Skip swap when: no new frame, or using KMS overlay without GL overlays
+        bool should_swap = (new_primary_frame_ready || new_secondary_frame_ready) && 
+                          (!used_kms_overlay || any_overlay_visible || any_overlay_visible2);
+        if (should_swap) {
             gl_swap_buffers(app->gl, app->drm);
+        } else {
+            // No new frame ready - sleep briefly to avoid tight spinning loop
+            struct timespec sleep_time = {0, 1000000};  // 1ms
+            nanosleep(&sleep_time, NULL);
         }
 
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
@@ -1757,7 +1819,8 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         double total_stage_time = decode0_time + decode1_time + upload_time + warp_draw_time + swap_time;
         
         // Per-frame output (every 6 frames to reduce spam, ~10 fps @ 60fps capture)
-        if (app->show_timing && frame_count > 0 && frame_count % 6 == 0) {
+        // Only print when we actually rendered a new frame
+        if (app->show_timing && new_primary_frame_ready && frame_count > 0 && frame_count % 6 == 0) {
             printf("[PERF] Frame %d: decode0=%.2fms decode1=%.2fms upload=%.2fms warp+draw=%.2fms swap=%.2fms total=%.2fms\n",
                    frame_count,
                    decode0_time * 1000,
