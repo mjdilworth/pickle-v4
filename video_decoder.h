@@ -94,6 +94,10 @@ typedef struct {
     void *last_y_source;             // Track if we already copied this frame
     void *last_u_source;
     void *last_v_source;
+    
+    // PRODUCTION: Interrupt callback for network timeout protection
+    int64_t last_io_activity;        // Timestamp of last I/O activity (av_gettime_relative)
+    int io_timeout_us;               // I/O timeout in microseconds (default 5s)
 } video_context_t;
 
 // Video decoder functions

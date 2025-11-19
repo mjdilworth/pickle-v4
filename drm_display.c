@@ -168,6 +168,7 @@ int drm_init(display_ctx_t *drm) {
         fprintf(stderr, "2. Stop desktop environment: sudo systemctl stop lightdm\n");
         fprintf(stderr, "3. Switch to console: Ctrl+Alt+F1, then run with sudo\n");
         close(drm->drm_fd);
+        drm->drm_fd = -1;
         return -1;
     }
 
@@ -175,7 +176,9 @@ int drm_init(display_ctx_t *drm) {
     if (drm->connector->count_modes == 0) {
         fprintf(stderr, "No display modes available\n");
         drmModeFreeConnector(drm->connector);
+        drm->connector = NULL;
         close(drm->drm_fd);
+        drm->drm_fd = -1;
         return -1;
     }
     
@@ -189,18 +192,27 @@ int drm_init(display_ctx_t *drm) {
     if (!drm->encoder) {
         fprintf(stderr, "Failed to find encoder\n");
         drmModeFreeConnector(drm->connector);
+        drm->connector = NULL;
         close(drm->drm_fd);
+        drm->drm_fd = -1;
         return -1;
     }
 
     // Get CRTC
-    drm->crtc = drmModeGetCrtc(drm->drm_fd, drm->crtc_id);
+    drm->crtc = drmModeGetCrtc(drm->drm_fd, drm->encoder->crtc_id);
     if (!drm->crtc) {
-        fprintf(stderr, "Failed to get CRTC %d\n", drm->crtc_id);
-        drmModeFreeEncoder(drm->encoder);
-        drmModeFreeConnector(drm->connector);
+        fprintf(stderr, "Failed to get CRTC\n");
         close(drm->drm_fd);
+        drm->drm_fd = -1;
+        drm->connector = NULL;
+        drm->encoder = NULL;
         return -1;
+    }
+    
+    // PRODUCTION: Save original CRTC state for restoration on cleanup
+    drm->saved_crtc = drmModeGetCrtc(drm->drm_fd, drm->encoder->crtc_id);
+    if (!drm->saved_crtc) {
+        fprintf(stderr, "Warning: Failed to save original CRTC state\n");
     }
     
     printf("Using CRTC %d, Encoder %d, Connector %d\n", 
@@ -219,9 +231,13 @@ int drm_init(display_ctx_t *drm) {
     if (!drm->gbm_device) {
         fprintf(stderr, "Failed to create GBM device\n");
         drmModeFreeCrtc(drm->crtc);
+        drm->crtc = NULL;
         drmModeFreeEncoder(drm->encoder);
+        drm->encoder = NULL;
         drmModeFreeConnector(drm->connector);
+        drm->connector = NULL;
         close(drm->drm_fd);
+        drm->drm_fd = -1;
         return -1;
     }
 
@@ -233,10 +249,15 @@ int drm_init(display_ctx_t *drm) {
     if (!drm->gbm_surface) {
         fprintf(stderr, "Failed to create GBM surface\n");
         gbm_device_destroy(drm->gbm_device);
+        drm->gbm_device = NULL;
         drmModeFreeCrtc(drm->crtc);
+        drm->crtc = NULL;
         drmModeFreeEncoder(drm->encoder);
+        drm->encoder = NULL;
         drmModeFreeConnector(drm->connector);
+        drm->connector = NULL;
         close(drm->drm_fd);
+        drm->drm_fd = -1;
         return -1;
     }
 
@@ -411,6 +432,23 @@ int drm_swap_buffers(display_ctx_t *drm) {
 }
 
 void drm_cleanup(display_ctx_t *drm) {
+    // PRODUCTION: Restore original CRTC state before cleanup
+    if (drm->saved_crtc && drm->drm_fd >= 0) {
+        int ret = drmModeSetCrtc(drm->drm_fd, 
+                                 drm->saved_crtc->crtc_id,
+                                 drm->saved_crtc->buffer_id,
+                                 drm->saved_crtc->x, 
+                                 drm->saved_crtc->y,
+                                 &drm->connector_id, 
+                                 1, 
+                                 &drm->saved_crtc->mode);
+        if (ret < 0) {
+            fprintf(stderr, "Warning: Failed to restore CRTC state: %d\n", ret);
+        }
+        drmModeFreeCrtc(drm->saved_crtc);
+        drm->saved_crtc = NULL;
+    }
+    
     // Clean up framebuffers
     if (drm->current_fb_id) {
         drmModeRmFB(drm->drm_fd, drm->current_fb_id);

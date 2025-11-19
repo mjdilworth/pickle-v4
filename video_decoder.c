@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -16,6 +17,7 @@
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
+#include <libavutil/time.h>
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 
@@ -41,6 +43,29 @@ bool hw_debug_enabled = false;
 
 // See ZERO_COPY_ARCHITECTURE.md for detailed architecture documentation
 // ============================================================================
+
+// PRODUCTION: Interrupt callback to prevent infinite hangs on network streams
+// Returns 1 to abort, 0 to continue
+static int interrupt_callback(void* opaque) {
+    video_context_t *video = (video_context_t *)opaque;
+    if (!video) return 0;
+    
+    // Check for quit signal
+    extern volatile sig_atomic_t g_quit_requested;
+    if (g_quit_requested) {
+        fprintf(stderr, "[IO] Interrupt: quit requested\n");
+        return 1;
+    }
+    
+    // Check for timeout (5 seconds default)
+    int64_t elapsed = av_gettime_relative() - video->last_io_activity;
+    if (elapsed > video->io_timeout_us) {
+        fprintf(stderr, "[IO] Interrupt: timeout after %lld us\n", (long long)elapsed);
+        return 1;
+    }
+    
+    return 0;
+}
 
 
 // memfd_create may not be available in older glibc - provide fallback
@@ -77,14 +102,14 @@ static inline int memfd_create_compat(const char *name, unsigned int flags) {
 static enum AVPixelFormat get_format_callback(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     video_context_t *video = (video_context_t *)ctx->opaque;
     const enum AVPixelFormat *p;
+    int call_num = 0;
     
     if (video) {
         pthread_mutex_lock(&video->lock);
         video->callback_count++;
-        int call_num = video->callback_count;
+        call_num = video->callback_count;
         pthread_mutex_unlock(&video->lock);
     }
-    int call_num = video ? video->callback_count : 0;
     
     if (hw_debug_enabled) {
         printf("\n");
@@ -367,6 +392,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     video->dma_size = 0;
     video->v4l2_fd = -1;  // V4L2 device FD not yet available
     video->v4l2_buffer_index = 0;  // V4L2 output buffer index
+    
+    // PRODUCTION: Initialize interrupt callback for network timeout protection
+    video->last_io_activity = av_gettime_relative();
+    video->io_timeout_us = 5000000;  // 5 second timeout
 
     // Print decode mode
     if (enable_hardware_decode) {
@@ -388,6 +417,9 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     av_dict_set(&options, "multiple_requests", "1", 0);      // Enable HTTP keep-alive
     av_dict_set(&options, "reconnect", "1", 0);              // Auto-reconnect on network issues
     
+    // Update activity timestamp before I/O
+    video->last_io_activity = av_gettime_relative();
+    
     if (avformat_open_input(&video->format_ctx, filename, NULL, &options) < 0) {
         fprintf(stderr, "Failed to open input file: %s\n", filename);
         av_dict_free(&options);
@@ -395,6 +427,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         return -1;
     }
     av_dict_free(&options);
+    
+    // PRODUCTION: Set interrupt callback AFTER format_ctx is opened
+    video->format_ctx->interrupt_callback.callback = interrupt_callback;
+    video->format_ctx->interrupt_callback.opaque = video;
 
     // Modern libavformat: Efficient stream information retrieval
     AVDictionary *stream_options = NULL;
@@ -583,6 +619,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         
         if (av_bsf_alloc(bsf_annexb, &video->bsf_annexb_ctx) < 0) {
             fprintf(stderr, "[HW_DECODE] BSF: ✗ Failed to allocate BSF context\n");
+            // Cleanup already allocated resources before video_cleanup
+            if (video->codec_ctx) {
+                avcodec_free_context(&video->codec_ctx);
+            }
             video_cleanup(video);
             return -1;
         }
@@ -597,6 +637,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         
         if (av_bsf_init(video->bsf_annexb_ctx) < 0) {
             fprintf(stderr, "[HW_DECODE] BSF: ✗ Failed to initialize BSF\n");
+            // BSF context will be freed in video_cleanup
+            if (video->codec_ctx) {
+                avcodec_free_context(&video->codec_ctx);
+            }
             video_cleanup(video);
             return -1;
         }
@@ -1002,6 +1046,9 @@ int video_decode_frame(video_context_t *video) {
         
         // receive_result == AVERROR(EAGAIN): Decoder needs more packets
         // Read next packet and send it
+        
+        // PRODUCTION: Update I/O activity timestamp before read
+        video->last_io_activity = av_gettime_relative();
         
         int read_result = av_read_frame(video->format_ctx, video->packet);
         
@@ -1605,6 +1652,10 @@ void video_seek(video_context_t *video, int64_t timestamp) {
 }
 
 void video_cleanup(video_context_t *video) {
+    if (!video) {
+        return;
+    }
+    
     // Clean up DMA buffer if still open
     if (video->dma_fd >= 0) {
         close(video->dma_fd);
@@ -1614,9 +1665,11 @@ void video_cleanup(video_context_t *video) {
     // Clean up hardware contexts
     if (video->hw_frames_ctx) {
         av_buffer_unref(&video->hw_frames_ctx);
+        video->hw_frames_ctx = NULL;
     }
     if (video->hw_device_ctx) {
         av_buffer_unref(&video->hw_device_ctx);
+        video->hw_device_ctx = NULL;
     }
     
     // No frame buffers in this version
@@ -1624,19 +1677,24 @@ void video_cleanup(video_context_t *video) {
     // Clean up 2-stage BSF chain
     if (video->bsf_annexb_ctx) {
         av_bsf_free(&video->bsf_annexb_ctx);
+        video->bsf_annexb_ctx = NULL;
     }
     if (video->bsf_aud_ctx) {
         av_bsf_free(&video->bsf_aud_ctx);
+        video->bsf_aud_ctx = NULL;
     }
     
     if (video->frame) {
         av_frame_free(&video->frame);
+        video->frame = NULL;
     }
     if (video->sw_frame) {
         av_frame_free(&video->sw_frame);
+        video->sw_frame = NULL;
     }
     if (video->packet) {
         av_packet_free(&video->packet);
+        video->packet = NULL;
     }
     
     // CRITICAL: Properly close codec before freeing to release V4L2 device
@@ -1684,6 +1742,7 @@ void video_cleanup(video_context_t *video) {
         
         // Now safe to free codec context and release V4L2 device
         avcodec_free_context(&video->codec_ctx);
+        video->codec_ctx = NULL;
         
         // Extra delay for V4L2 M2M to ensure kernel driver fully releases device
         if (is_v4l2m2m) {
@@ -1693,6 +1752,7 @@ void video_cleanup(video_context_t *video) {
     
     if (video->format_ctx) {
         avformat_close_input(&video->format_ctx);
+        video->format_ctx = NULL;
     }
     
     if (video->nv12_buffer) {
@@ -1717,7 +1777,12 @@ void video_cleanup(video_context_t *video) {
         video->cached_v_size = 0;
     }
 
-    pthread_mutex_destroy(&video->lock);
+    // Safe pthread cleanup with error checking
+    int mutex_result = pthread_mutex_destroy(&video->lock);
+    if (mutex_result != 0 && mutex_result != EINVAL) {
+        fprintf(stderr, "[CLEANUP] Warning: pthread_mutex_destroy failed: %d\n", mutex_result);
+    }
+    
     memset(video, 0, sizeof(*video));
 }
 
@@ -1774,4 +1839,5 @@ size_t video_get_dma_size(video_context_t *video) {
         return 0;
     }
     
+    return video->dma_size;
 }

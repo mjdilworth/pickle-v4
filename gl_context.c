@@ -9,6 +9,25 @@
 #include <math.h>
 #include <time.h>
 
+// PRODUCTION: Validate EGL context before critical operations
+static bool validate_egl_context(void) {
+    EGLContext ctx = eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT) {
+        fprintf(stderr, "ERROR: EGL context lost\n");
+        return false;
+    }
+    return true;
+}
+
+// PRODUCTION: Check and clear GL errors
+__attribute__((unused))
+static void check_gl_errors(const char *operation) {
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        fprintf(stderr, "GL error in %s: 0x%x\n", operation, err);
+    }
+}
+
 // Double-buffered Pixel Buffer Objects for staging
 #define PBO_RING_COUNT 2
 #define PLANE_Y 0
@@ -849,6 +868,12 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
                     int width, int height, int y_stride, int u_stride, int v_stride,
                     display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render - EGL context lost\n");
+        return;
+    }
+    
     // Separate tracking for each video
     static int frame_rendered[2] = {0, 0};
     static int last_width[2] = {0, 0};
@@ -1195,17 +1220,17 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     float corner_colors[4][4];
     for (int i = 0; i < 4; i++) {
         if (keystone->selected_corner == i) {
-            // Green for selected
+            // Bright green for selected
             corner_colors[i][0] = 0.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 0.0f;
             corner_colors[i][3] = 1.0f;
         } else {
-            // White for unselected
+            // White with subtle transparency for unselected (more elegant)
             corner_colors[i][0] = 1.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 1.0f;
-            corner_colors[i][3] = 1.0f;
+            corner_colors[i][3] = 0.7f;
         }
     }
     
@@ -1214,7 +1239,7 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         keystone->corners_dirty = false;  // Clear dirty flag
         
         // Create corner positions (small squares)
-        float corner_size = 0.015f; // 1.5% of screen size (smaller)
+        float corner_size = 0.008f; // 0.8% of screen size (refined and elegant)
         
         // Corner vertices with colors: [x, y, r, g, b, a] per vertex
         int vertex_count = 0;
@@ -1398,8 +1423,8 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     };
     glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
     
-    // Set line width for better visibility
-    glLineWidth(3.0f);
+    // Set line width for refined appearance
+    glLineWidth(2.0f);
     
     // Draw border as 4 separate lines (8 vertices with colors from vertex data)
     glDrawArrays(GL_LINES, 0, 8); // 8 vertices (4 lines * 2 vertices each)
@@ -1588,27 +1613,15 @@ void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone) {
             "\n"
             "PICKLE KEYSTONE\n"
             "\n"
-            "KEYBOARD\n"
-            "1234   Corner Select\n"
-            "Arrows Move Corner\n"
-            "S      Save\n"
-            "R      Reset\n"
-            "C      Toggle Corners\n"
-            "B      Toggle Border\n"
-            "W      WiFi Connect\n"
-            "H      Toggle Help\n"
-            "Q      Quit\n"
-            "\n"
             "GAMEPAD\n"
             "X      Cycle Corner\n"
             "DPAD   Move Corner\n"
-            "A      Show Corners\n"
-            "B      Show Border\n"
+            "B      Show Keysone Border\n"
             "Y      Show Help\n"
             "L1     Step Down\n"
             "R1     Step Up\n"
             "START  Save\n"
-            "SELECT Reset";
+            "SELECT Reset Keystone";
 
         draw_text_simple(help_text_vertices, &text_vertex_count, help_text, -0.85f, 0.62f, 0.022f);
         help_initialized = true;

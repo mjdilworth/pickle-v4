@@ -1,5 +1,6 @@
 #include "video_player.h"
 #include "input_handler.h"
+#include "version.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,20 +10,21 @@
 
 // Global app context for signal handlers
 static app_context_t *g_app = NULL;
-static volatile sig_atomic_t g_signal_received = 0;
+
+// PRODUCTION: Global quit flag for async-signal-safe shutdown
+// Set by signal handler, checked in main loop
+volatile sig_atomic_t g_quit_requested = 0;
 
 static void signal_handler(int sig) {
     // CRITICAL: Only async-signal-safe operations here!
     // Do NOT call printf, malloc, free, pthread functions, etc.
-    g_signal_received = sig;
-
-    // PRODUCTION FIX: Stop the main loop immediately for fast shutdown
-    if (g_app) {
-        g_app->running = false;  // Safe: atomic write to bool
-    }
-
-    // Don't re-raise immediately - let cleanup happen first
-    // signal(sig, SIG_DFL);
+    (void)sig;  // Mark unused to avoid warning
+    
+    // PRODUCTION FIX: Set atomic flag only - main loop checks this
+    g_quit_requested = 1;
+    
+    // Do NOT touch g_app or any other data structures here!
+    // Let main loop handle graceful shutdown
 }
 
 static void cleanup_on_exit(void) {
@@ -36,8 +38,8 @@ static void cleanup_on_exit(void) {
         g_app = NULL;
     }
     
-    if (g_signal_received != 0) {
-        printf("Exiting after signal %d\n", g_signal_received);
+    if (g_quit_requested) {
+        printf("Exiting after signal\n");
         fflush(stdout);
     }
 }
@@ -47,15 +49,18 @@ static void setup_signal_handlers(void) {
     signal(SIGINT, signal_handler);   // Ctrl+C
     signal(SIGTERM, signal_handler);  // Termination signal
     signal(SIGHUP, signal_handler);   // Hangup (SSH disconnect)
-    signal(SIGABRT, signal_handler);  // Abort signal
+    
+    // Emergency handlers for crashes - restore terminal before dying
     signal(SIGSEGV, signal_handler);  // Segmentation fault
+    signal(SIGBUS, signal_handler);   // Bus error
+    signal(SIGABRT, signal_handler);  // Abort signal
     
     // Register atexit handler for safe cleanup
     atexit(cleanup_on_exit);
 }
 
 int main(int argc, char *argv[]) {
-    printf("Starting pickle video player...\n");
+    printf("Starting %s...\n", VERSION_FULL);
     fflush(stdout);
     
     bool loop_playback = false;
@@ -80,6 +85,16 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--hw") == 0) {
             enable_hardware_decode = true;
             printf("Hardware decode enabled (--hw flag set)\n");
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", VERSION_FULL);
+            printf("Semantic versioning: %d.%d.%d\n", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
+            printf("\nFeatures:\n");
+            printf("  - Dual video playback with independent keystone correction\n");
+            printf("  - Hardware-accelerated decode (--hw flag)\n");
+            printf("  - DRM/KMS direct scanout with OpenGL ES 3.1\n");
+            printf("  - Gamepad and keyboard input support\n");
+            printf("  - Real-time performance profiling (--timing flag)\n");
+            return 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stderr, "Usage: %s [options] <video_file1.mp4> [video_file2.mp4]\n", argv[0]);
             fprintf(stderr, "\nOptions:\n");
@@ -88,6 +103,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  --debug-gamepad  Log gamepad button presses\n");
             fprintf(stderr, "  --hw-debug       Enable detailed hardware decoder diagnostics\n");
             fprintf(stderr, "  --hw             Enable hardware decode (default: software)\n");
+            fprintf(stderr, "  -v, --version    Show version information\n");
             fprintf(stderr, "  -h, --help       Show this help message\n");
             fprintf(stderr, "\nKeyboard Controls:\n");
             fprintf(stderr, "  q/ESC    Quit\n");

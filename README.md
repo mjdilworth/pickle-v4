@@ -1,6 +1,32 @@
 # Pickle Video Player
 
-A high-performance video player using hardware-accelerated decoding and OpenGL ES rendering.
+**Version:** 4.2.0 (fast-hw)
+
+A high-performance dual-video player with hardware-accelerated decoding, OpenGL ES rendering, and real-time keystone correction.
+
+## Features
+
+- **Dual video playback** with independent keystone correction for each stream
+- **Hardware decode support** via V4L2 M2M (use `--hw` flag)
+- **Software decode optimized** with direct YUV420P upload (default)
+- **DRM/KMS** direct scanout with OpenGL ES 3.1 rendering
+- **Gamepad and keyboard** input support for interactive control
+- **Real-time profiling** with `--timing` flag
+- **Persistent keystone settings** saved per video configuration
+
+## Version Information
+
+Check the current version:
+```bash
+./pickle --version
+# or
+./pickle -v
+```
+
+**Semantic Versioning:** To bump the version, edit `version.h`:
+- `VERSION_MAJOR`: Incompatible changes
+- `VERSION_MINOR`: New features (backward-compatible)
+- `VERSION_PATCH`: Bug fixes (backward-compatible)
 
 ## Performance Optimization: CPU Governor Configuration
 
@@ -148,55 +174,6 @@ Ensure you have proper DRM/KMS permissions and are running as root or with appro
 
 
 
-Mike Dilworth is inviting you to a scheduled Zoom meeting.
-
-Topic: Mike Dilworth
-Time: Nov 13, 2025 11:45 AM Athens
-Join Zoom Meeting
-https://us05web.zoom.us/j/2576768572?pwd=zpanyL382meBhZ9aWNJUIcpu5Cjk3F.1&omn=86524305978
-
-Meeting ID: 257 676 8572
-Passcode: vdRuF2
-
-mmcblk0p3 vfat   FAT32 SHARED 4464-FE62
 
 
 
-# Add cloudflare gpg key
-sudo mkdir -p --mode=0755 /usr/share/keyrings
-curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
-
-# Add this repo to your apt repositories
-echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
-
-# install cloudflared
-sudo apt-get update && sudo apt-get install cloudflared
-
-
-
-03444930787
-
-./configure \
-    --extra-cflags="-I/usr/local/include" \
-    --extra-ldflags="-L/usr/local/lib" \
-    --extra-libs="-lpthread -lm -latomic" \
-    --arch=armel \
-    --target-os=linux \
-    --enable-pic \
-    --enable-gpl \
-    --enable-nonfree \
-    --enable-version3 \
-    --enable-pthreads \
-    --enable-libdrm \
-    --enable-v4l2-m2m \
-    --enable-mmal \
-    --enable-libx264 \
-    --enable-libx265 \
-    --enable-shared \
-    --enable-libopus \
-    --enable-libvorbis \
-    --disable-ffplay \
-    --disable-ffprobe
-
-
-    /dev/mmcblk0p3: LABEL_FATBOOT="SHARED" LABEL="SHARED" UUID="6C38-CE7E" BLOCK_SIZE="512" TYPE="vfat" PARTUUID="f8623b50-03"
