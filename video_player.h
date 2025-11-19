@@ -28,7 +28,8 @@ typedef struct {
 typedef struct {
     video_context_t *video;
     video_context_t *video2;     // Second video decoder
-    async_decode_t *async_decoder; // Async decode thread for video 2
+    async_decode_t *async_decoder_primary;   // Async decode thread for video 1 (software path)
+    async_decode_t *async_decoder_secondary; // Async decode thread for video 2
     display_ctx_t *drm;
     gl_context_t *gl;
     input_context_t *input;

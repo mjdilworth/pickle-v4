@@ -19,143 +19,29 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 
-// ============================================================================
-// ZERO-COPY VIDEO DECODING PIPELINE FOR RPi4 V3D GPU
-// ============================================================================
-//
-// GOAL: Eliminate CPU texture upload bottleneck (currently 12-27ms) by:
-// 1. Decoding H.264 directly to GEM-backed GPU buffers (V4L2 M2M)
-// 2. Extracting DMA-BUF file descriptors (zero-copy)
-// 3. Importing DMA FDs directly into GPU texture memory (EGL)
-// 4. Rendering YUV→RGB on GPU (no CPU involvement)
+// Configuration Constants
+#define MAX_PACKETS_PER_DECODE_CALL 50
+#define MAX_HARDWARE_FALLBACK_RETRIES 1
+#define V4L2_CLEANUP_DELAY_US 10000
+#define V4L2_POST_CLEANUP_DELAY_US 50000
+#define DECODER_DRAIN_SAFETY_LIMIT 50
+#define BUFFERING_PROGRESS_INTERVAL_1 10
+#define BUFFERING_PROGRESS_INTERVAL_2 20
+#define BUFFERING_PROGRESS_INTERVAL_3 30
+#define BUFFERING_PROGRESS_INTERVAL_4 40
+#define FRAME_DEBUG_INTERVAL 100
+#define DEFAULT_FPS_FALLBACK 30.0
+#define AVCC_EXTRADATA_SIZE 8
 
-// Debug flag for hardware decode diagnostics (set from app context)
+// ============================================================================
+// Zero-copy video decoding implementation for RPi4 V3D GPU
+
+// Debug flag for hardware decode diagnostics
 bool hw_debug_enabled = false;
-//
-// ARCHITECTURE:
-// ┌─────────────────┐
-// │ H.264 MP4 File  │
-// └────────┬────────┘
-//          │ av_read_frame()
-//          ▼
-// ┌─────────────────────────────────────────────┐
-// │ FFmpeg V4L2 M2M Decoder (h264_v4l2m2m)      │
-// │ - Hardware: bcm2835-codec driver             │
-// │ - Device: /dev/video10 (h.264)               │
-// │ - Output: DRM_PRIME (GEM-backed buffers)     │ ◄── CRITICAL: Requires:
-// │   (if FFmpeg configured correctly)           │    1. DRM device context
-// └────────┬────────────────────────────────────┘    2. av_hwdevice_ctx_create()
-//          │                                         3. avcodec_open2()
-//          │ DMA-BUF FD extraction
-//          │ (AVDRMFrameDescriptor)
-//          ▼
-// ┌──────────────────────────┐
-// │ DMA-BUF Export           │
-// │ - FD from GEM buffer     │
-// │ - No CPU copy needed     │
-// │ - V3D can access directly│
-// └────────┬─────────────────┘
-//          │ EGL DMABUF import
-//          │ (gl_render_frame_dma)
-//          ▼
-// ┌──────────────────────────┐
-// │ GPU Texture              │
-// │ - DMA mapping            │
-// │ - YUV420p planar         │
-// └────────┬─────────────────┘
-//          │ GPU shader
-//          │ YUV→RGB conversion
-//          ▼
-// ┌──────────────────────────┐
-// │ Display Output           │
-// │ - HDMI / Composite       │
-// │ - 60fps 1920x1080        │
-// └──────────────────────────┘
-//
-// CURRENT STATUS:
-// ✅ V4L2 M2M decoder working
-// ✅ DRM device context setup correct
-// ✅ AVHWFramesContext allocation: SUCCESSFUL (no EINVAL error!)
-// ✅ DMA FD extraction code complete and correct
-// ✅ EGL DMABUF import framework ready
-// ✅ All infrastructure correct per FFmpeg API spec
-// ❌ Format callback never invoked by patched FFmpeg (build configuration issue)
-// ❌ Decoder outputs yuv420p instead of DRM_PRIME (consequence of no callback)
-//
-// ROOT CAUSE ANALYSIS:
-// The patched FFmpeg source (v4l2_m2m_dec.c) has the code to:
-// 1. Build format list: fmts2[0] = AV_PIX_FMT_DRM_PRIME (CORRECT)
-// 2. Call ff_get_format(avctx, fmts2) which SHOULD invoke our callback
-// 3. Check if format == DRM_PRIME and set output_drm = 1 (CORRECT)
-//
-// However, in the compiled /usr/local/bin/ffmpeg:
-// - ff_get_format() does NOT invoke the registered get_format callback
-// - This bypasses the entire format negotiation pipeline
-// - Decoder defaults to yuv420p (mmap mode, system RAM)
-//
-// POSSIBLE ROOT CAUSES:
-// 1. FFmpeg was compiled without proper callback infrastructure
-// 2. V4L2 M2M decoder hardcodes format in different code path
-// 3. Kernel version incompatibility with DMABUF mode
-// 4. Missing FFmpeg patches for callback propagation
-//
-// TO FIX ZERO-COPY PERMANENTLY:
-// Option A (Recommended): Rebuild FFmpeg locally with specific flags
-//   - git clone rpi-ffmpeg from /home/dilly/Projects/Video/patch/rpi-ffmpeg
-//   - ./configure --enable-v4l2-m2m --enable-libdrm --enable-nonfree ...
-//   - make && make install to /usr/local/lib
-//   - Ensure get_format callback is properly wired in libavcodec
-//   - Test to verify format callback IS invoked
-//
-// Option B: Modify FFmpeg source to always enable DMABUF for V4L2 M2M
-//   - Edit libavcodec/v4l2_m2m_dec.c to force output_drm = 1
-//   - Patch out the format callback dependency
-//   - Rebuild and test
-//
-// Option C: Use environment variable or codec option
-//   - Check if FFmpeg supports V4L2_MEMORY_DMABUF forcing via av_dict
-//   - Try: av_dict_set(&opts, "drm_output", "1", 0) or similar
-//
-// CURRENT APPLICATION STATUS:
-// The C code is 100% correct and follows FFmpeg best practices:
-// - init_hw_accel_context(): Creates DRM context + initializes frames context ✅
-// - get_format_callback(): Ready to select DRM_PRIME when invoked ✅
-// - video_decode_frame(): Extracts DMA FD from AVDRMFrameDescriptor ✅
-// - AVDRMFrameDescriptor handling: Correct, includes all needed data ✅
-// - DMA FD duplication: Correct ownership transfer ✅
-// - EGL DMABUF import: Framework in gl_context.c ready ✅
-//
-// When FFmpeg is fixed to invoke format callbacks or default to DMABUF,
-// the entire zero-copy pipeline will work automatically.
-//
-// WHEN FORMAT CALLBACK GETS INVOKED:
-// Once FFmpeg is configured to pass format negotiation to the decoder,
-// the following sequence automatically works:
-//
-// 1. init_hw_accel_context() creates DRM device context
-// 2. avcodec_open2() tells V4L2 M2M to use V4L2_MEMORY_DMABUF
-// 3. Kernel allocates GEM-backed buffers for decoded output
-// 4. video_decode_frame() receives AVFrame with AV_PIX_FMT_DRM_PRIME
-// 5. We extract AVDRMFrameDescriptor→objects[0].fd (DMA FD)
-// 6. gl_render_frame_dma() imports DMA FD into GPU texture
-// 7. GPU renders YUV→RGB directly (no CPU memcpy)
-// 8. Texture upload time: <1ms (vs current 12-27ms)
-// 9. 60fps playback achieved ✓
-//
-// THE PROBLEM:
-// The patched FFmpeg in /usr/local/lib has DRM_PRIME support in its source,
-// but the compiled v4l2_m2m_dec.c never reaches the format negotiation code.
-// The decoder is hardcoded to output yuv420p system memory (mmap mode).
-// This is likely because:
-// - Format callback (get_format) is never invoked by FFmpeg
-// - V4L2 M2M decoder defaults to mmap instead of DMABUF
-// - Kernel driver configuration or FFmpeg build omission
-//
-// SOLUTION PATHS:
-// 1. Rebuild FFmpeg with explicit V4L2_MEMORY_DMABUF forced
-// 2. Modify FFmpeg source to always use DMABUF for V4L2 M2M
-// 3. Use alternative decoder (libv4l2-rpi or proprietary)
-// 4. Verify FFmpeg was built with --enable-v4l2-m2m and --enable-libdrm
+
+// See ZERO_COPY_ARCHITECTURE.md for detailed architecture documentation
+// ============================================================================
+
 
 // memfd_create may not be available in older glibc - provide fallback
 #ifndef MFD_CLOEXEC
@@ -189,11 +75,16 @@ static inline int memfd_create_compat(const char *name, unsigned int flags) {
 // NOTE: This callback is CRITICAL - if not invoked, decoder will not output DRM_PRIME!
 // The patched FFmpeg v4l2_m2m_dec calls ff_get_format() which SHOULD invoke this callback
 static enum AVPixelFormat get_format_callback(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
-    (void)ctx;  // Unused parameter
+    video_context_t *video = (video_context_t *)ctx->opaque;
     const enum AVPixelFormat *p;
     
-    static int callback_count = 0;
-    int call_num = ++callback_count;
+    if (video) {
+        pthread_mutex_lock(&video->lock);
+        video->callback_count++;
+        int call_num = video->callback_count;
+        pthread_mutex_unlock(&video->lock);
+    }
+    int call_num = video ? video->callback_count : 0;
     
     if (hw_debug_enabled) {
         printf("\n");
@@ -439,6 +330,7 @@ static int init_hw_accel_context(video_context_t *video) {
     
     // Set format callback (may help if frames context was not assigned)
     video->codec_ctx->get_format = get_format_callback;
+    video->codec_ctx->opaque = video;  // Pass context to callback
     if (hw_debug_enabled) {
         printf("[HWACCEL] ✓ Format negotiation callback registered\n");
     }
@@ -454,6 +346,12 @@ static int init_hw_accel_context(video_context_t *video) {
 
 int video_init(video_context_t *video, const char *filename, bool advanced_diagnostics, bool enable_hardware_decode) {
     memset(video, 0, sizeof(*video));
+    // Initialize mutex for thread safety
+    if (pthread_mutex_init(&video->lock, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize mutex\n");
+        return -1;
+    }
+
 
     // Set global debug flag for hardware decode diagnostics
     hw_debug_enabled = advanced_diagnostics;
@@ -888,10 +786,20 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     }
     video->duration = stream->duration;
 
-    // Allocate frame for YUV data (both hardware and software use same frame now)
+    // Allocate frame for YUV data (decoded frame from decoder)
     video->frame = av_frame_alloc();
     if (!video->frame) {
         fprintf(stderr, "Failed to allocate frame\n");
+        video_cleanup(video);
+        return -1;
+    }
+
+    // Allocate software frame used when decoding to hardware formats (e.g. DRM_PRIME).
+    // We will transfer hardware frames into this CPU-accessible YUV420P frame
+    // so existing rendering paths can treat hardware and software decode uniformly.
+    video->sw_frame = av_frame_alloc();
+    if (!video->sw_frame) {
+        fprintf(stderr, "Failed to allocate software frame for hardware decode\n");
         video_cleanup(video);
         return -1;
     }
@@ -913,10 +821,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
 }
 
 int video_decode_frame(video_context_t *video) {
-    static int decode_call_count = 0;
-    decode_call_count++;
+    // video->decode_call_count moved to context
+    video->decode_call_count++;
     
-    if (decode_call_count == 1) {
+    if (video->decode_call_count == 1) {
         printf("video_decode_frame() starting...\n");
         fflush(stdout);
     }
@@ -932,24 +840,22 @@ int video_decode_frame(video_context_t *video) {
     
     int packets_sent_this_call = 0;
     // Hardware decoders that are broken/incompatible will hang immediately
-    // Working decoders typically output a frame within 3-5 packets
-    // V4L2 M2M may buffer 20-30 packets before first frame (normal behavior)
+    if (video->decode_call_count == 1 && video->use_hardware_decode) {
     // Some videos (especially high bitrate) may need 40-50 packets
-    int MAX_PACKETS_PER_CALL = 50;  // Allow enough buffering for all video types
-    if (video->use_hardware_decode && decode_call_count == 1) {
-        MAX_PACKETS_PER_CALL = 50;  // First call: generous timeout for V4L2 buffering
-        printf("[HW_DECODE] First decode: will send up to %d packets before software fallback\n", MAX_PACKETS_PER_CALL);
+        printf("[HW_DECODE] First decode: will send up to %d packets before software fallback\n", MAX_PACKETS_PER_DECODE_CALL);
         printf("[HW_DECODE] Note: V4L2 M2M may buffer 20-50 packets depending on video\n");
     }
     
-    while (packets_sent_this_call < MAX_PACKETS_PER_CALL) {
+    while (packets_sent_this_call < MAX_PACKETS_PER_DECODE_CALL) {
         // First, try to get any frame the decoder has buffered
         int receive_result = avcodec_receive_frame(video->codec_ctx, video->frame);
         
         if (receive_result == 0) {
             // Successfully decoded a frame
-            static int frame_count = 0;
-            frame_count++;
+            pthread_mutex_lock(&video->lock);
+            video->frame_count++;
+            int frame_count = video->frame_count;
+            pthread_mutex_unlock(&video->lock);
             
             if (frame_count == 1) {
                 const char *fmt_name = av_get_pix_fmt_name(video->frame->format);
@@ -1059,14 +965,21 @@ int video_decode_frame(video_context_t *video) {
                 }
             }
 
-            // CRITICAL OPTIMIZATION: Copy V4L2 uncached buffers to cached memory NOW
-            // Don't wait until render time - do it immediately after decode
-            // This prevents the memcpy from blocking the render/VSync path
-            if (video->use_hardware_decode && video->frame->data[0]) {
-                // Trigger the memcpy by calling the getters (which cache the data)
-                video_get_y_data(video);
-                video_get_u_data(video);
-                video_get_v_data(video);
+            // If this is a hardware frame (e.g. DRM_PRIME), transfer it to
+            // a software YUV420P frame so the rest of the code can treat
+            // hardware and software decode uniformly via video_get_yuv_data().
+            if (video->use_hardware_decode && video->frame->format == AV_PIX_FMT_DRM_PRIME) {
+                if (!video->sw_frame) {
+                    video->sw_frame = av_frame_alloc();
+                }
+                if (video->sw_frame) {
+                    // Ensure sw_frame uses a CPU-accessible format
+                    av_frame_unref(video->sw_frame);
+                    int tr_ret = av_hwframe_transfer_data(video->sw_frame, video->frame, 0);
+                    if (tr_ret < 0) {
+                        fprintf(stderr, "[HW_DECODE] Failed to transfer DRM_PRIME frame to software: %s\n", av_err2str(tr_ret));
+                    }
+                }
             }
 
             return 0;  // SUCCESS - Frame ready for caller to use
@@ -1075,7 +988,7 @@ int video_decode_frame(video_context_t *video) {
         if (receive_result == AVERROR_EOF) {
             // End of stream reached
             video->eof_reached = true;
-            if (decode_call_count == 1 && video->advanced_diagnostics) {
+            if (video->decode_call_count == 1 && video->advanced_diagnostics) {
                 printf("End of video stream reached\n");
             }
             return -1;
@@ -1167,7 +1080,7 @@ int video_decode_frame(video_context_t *video) {
         }
         
         // Show buffering progress for V4L2 M2M on first decode
-        if (video->use_hardware_decode && decode_call_count == 1) {
+        if (video->use_hardware_decode && video->decode_call_count == 1) {
             if (packets_sent_this_call == 10) {
                 printf("[HW_DECODE] Buffering: sent %d packets, waiting for first frame...\n", packets_sent_this_call);
             } else if (packets_sent_this_call == 20) {
@@ -1248,23 +1161,16 @@ int video_decode_frame(video_context_t *video) {
         video->use_hardware_decode = false;
         
         // Try decoding again with software decoder
-        return video_decode_frame(video);
+        // Note: Hardware fallback now handled by retry counter in context
+        // Instead of recursive call, the decoder will be re-attempted on next call
+        // This prevents stack overflow from repeated failures
+        return -1;  // Signal failure, caller should retry
     }  // End if (video->use_hardware_decode)
     
     return -1; // Failed to decode even with software fallback
 }
 
-// Cached memory buffers for V4L2 M2M frames (speeds up GL texture upload)
-// V4L2 mmap buffers are uncached/write-combined which is very slow for CPU reads
-static uint8_t *cached_y_buffer = NULL;
-static uint8_t *cached_u_buffer = NULL;
-static uint8_t *cached_v_buffer = NULL;
-static size_t cached_y_size = 0;
-static size_t cached_u_size = 0;
-static size_t cached_v_size = 0;
-static void *last_y_source = NULL;  // Track if we already copied this frame
-static void *last_u_source = NULL;
-static void *last_v_source = NULL;
+// Cached memory buffers for V4L2 M2M frames moved to video_context_t for thread safety
 
 uint8_t* video_get_y_data(video_context_t *video) {
     if (!video->frame) return NULL;
@@ -1273,26 +1179,35 @@ uint8_t* video_get_y_data(video_context_t *video) {
     // V4L2 M2M mmap buffers are uncached (optimized for DMA, slow for CPU reads)
     // Memcpy to cached RAM is ~5x faster than reading uncached memory repeatedly
     if (video->use_hardware_decode && video->frame->data[0]) {
+        pthread_mutex_lock(&video->lock);
+        
         // Check if we already copied this frame (avoid duplicate memcpy)
-        if (last_y_source == video->frame->data[0] && cached_y_buffer) {
-            return cached_y_buffer;
+        if (video->last_y_source == video->frame->data[0] && video->cached_y_buffer) {
+            pthread_mutex_unlock(&video->lock);
+            return video->cached_y_buffer;
         }
 
         size_t y_size = video->frame->linesize[0] * video->height;
 
         // Allocate cached buffer if needed
-        if (cached_y_size < y_size) {
-            free(cached_y_buffer);
-            cached_y_buffer = malloc(y_size);
-            cached_y_size = cached_y_buffer ? y_size : 0;
-            if (!cached_y_buffer) return video->frame->data[0]; // Fallback
+        if (video->cached_y_size < y_size) {
+            free(video->cached_y_buffer);
+            video->cached_y_buffer = malloc(y_size);
+            video->cached_y_size = video->cached_y_buffer ? y_size : 0;
+            if (!video->cached_y_buffer) {
+                pthread_mutex_unlock(&video->lock);
+                return video->frame->data[0]; // Fallback
+            }
             printf("[PERF] Allocated %zu KB cached Y buffer for hardware decode\n", y_size / 1024);
         }
 
         // Copy to cached memory (fast memcpy, then fast GL upload)
-        memcpy(cached_y_buffer, video->frame->data[0], y_size);
-        last_y_source = video->frame->data[0];
-        return cached_y_buffer;
+        memcpy(video->cached_y_buffer, video->frame->data[0], y_size);
+        video->last_y_source = video->frame->data[0];
+        
+        uint8_t *result = video->cached_y_buffer;
+        pthread_mutex_unlock(&video->lock);
+        return result;
     }
 
     return video->frame->data[0];
@@ -1303,24 +1218,33 @@ uint8_t* video_get_u_data(video_context_t *video) {
 
     // OPTIMIZATION: For hardware decode, copy to cached memory
     if (video->use_hardware_decode && video->frame->data[1]) {
+        pthread_mutex_lock(&video->lock);
+        
         // Check if we already copied this frame (avoid duplicate memcpy)
-        if (last_u_source == video->frame->data[1] && cached_u_buffer) {
-            return cached_u_buffer;
+        if (video->last_u_source == video->frame->data[1] && video->cached_u_buffer) {
+            pthread_mutex_unlock(&video->lock);
+            return video->cached_u_buffer;
         }
 
         int uv_height = video->height / 2;
         size_t u_size = video->frame->linesize[1] * uv_height;
 
-        if (cached_u_size < u_size) {
-            free(cached_u_buffer);
-            cached_u_buffer = malloc(u_size);
-            cached_u_size = cached_u_buffer ? u_size : 0;
-            if (!cached_u_buffer) return video->frame->data[1]; // Fallback
+        if (video->cached_u_size < u_size) {
+            free(video->cached_u_buffer);
+            video->cached_u_buffer = malloc(u_size);
+            video->cached_u_size = video->cached_u_buffer ? u_size : 0;
+            if (!video->cached_u_buffer) {
+                pthread_mutex_unlock(&video->lock);
+                return video->frame->data[1]; // Fallback
+            }
         }
 
-        memcpy(cached_u_buffer, video->frame->data[1], u_size);
-        last_u_source = video->frame->data[1];
-        return cached_u_buffer;
+        memcpy(video->cached_u_buffer, video->frame->data[1], u_size);
+        video->last_u_source = video->frame->data[1];
+        
+        uint8_t *result = video->cached_u_buffer;
+        pthread_mutex_unlock(&video->lock);
+        return result;
     }
 
     return video->frame->data[1];
@@ -1331,113 +1255,40 @@ uint8_t* video_get_v_data(video_context_t *video) {
 
     // OPTIMIZATION: For hardware decode, copy to cached memory
     if (video->use_hardware_decode && video->frame->data[2]) {
+        pthread_mutex_lock(&video->lock);
+        
         // Check if we already copied this frame (avoid duplicate memcpy)
-        if (last_v_source == video->frame->data[2] && cached_v_buffer) {
-            return cached_v_buffer;
+        if (video->last_v_source == video->frame->data[2] && video->cached_v_buffer) {
+            pthread_mutex_unlock(&video->lock);
+            return video->cached_v_buffer;
         }
 
         int uv_height = video->height / 2;
         size_t v_size = video->frame->linesize[2] * uv_height;
 
-        if (cached_v_size < v_size) {
-            free(cached_v_buffer);
-            cached_v_buffer = malloc(v_size);
-            cached_v_size = cached_v_buffer ? v_size : 0;
-            if (!cached_v_buffer) return video->frame->data[2]; // Fallback
+        if (video->cached_v_size < v_size) {
+            free(video->cached_v_buffer);
+            video->cached_v_buffer = malloc(v_size);
+            video->cached_v_size = video->cached_v_buffer ? v_size : 0;
+            if (!video->cached_v_buffer) {
+                pthread_mutex_unlock(&video->lock);
+                return video->frame->data[2]; // Fallback
+            }
         }
 
-        memcpy(cached_v_buffer, video->frame->data[2], v_size);
-        last_v_source = video->frame->data[2];
-        return cached_v_buffer;
+        memcpy(video->cached_v_buffer, video->frame->data[2], v_size);
+        video->last_v_source = video->frame->data[2];
+        
+        uint8_t *result = video->cached_v_buffer;
+        pthread_mutex_unlock(&video->lock);
+        return result;
     }
 
     return video->frame->data[2];
 }
-
-int video_get_y_stride(video_context_t *video) {
-    if (!video->frame) return 0;
-    return video->frame->linesize[0];
-}
-
-int video_get_u_stride(video_context_t *video) {
-    if (!video->frame) return 0;
-    return video->frame->linesize[1];
-}
-
-int video_get_v_stride(video_context_t *video) {
-    if (!video->frame) return 0;
-    return video->frame->linesize[2];
-}
-
-uint8_t* video_get_rgb_data(video_context_t *video) {
-    // This function is kept for compatibility but returns NULL
-    // since we're doing YUV→RGB conversion on GPU
-    (void)video; // Suppress unused parameter warning
-    return NULL;
-}
-
-bool video_is_eof(video_context_t *video) {
-    return video->eof_reached;
-}
-
 int video_restart_playback(video_context_t *video) {
-    if (!video->initialized) {
-        return -1;
-    }
+    // Flush BSF contexts
 
-    printf("[RESTART] Restarting video playback...\n");
-    
-    // METHOD 1: Try seek with AVSEEK_FLAG_FRAME first
-    // This is more reliable for MP4 files than timestamp-based seeking
-    int ret = av_seek_frame(video->format_ctx, video->video_stream_index, 0, 
-                           AVSEEK_FLAG_FRAME | AVSEEK_FLAG_BACKWARD);
-    
-    if (ret < 0) {
-        // METHOD 2: If frame-based seek fails, try timestamp 0
-        printf("[RESTART] Frame seek failed, trying timestamp seek\n");
-        ret = av_seek_frame(video->format_ctx, video->video_stream_index, 0, AVSEEK_FLAG_BACKWARD);
-    }
-    
-    if (ret < 0) {
-        // METHOD 3: Last resort - close and reopen the file
-        printf("[RESTART] Seek failed (%s), reopening file...\n", av_err2str(ret));
-        
-        // Save file path
-        char *url = strdup(video->format_ctx->url);
-        if (!url) return -1;
-        
-        // Save settings for reinit
-        bool advanced_diag = video->advanced_diagnostics;
-        bool enable_hardware = video->enable_hardware_decode;
-        
-        // Clean up current decoder state
-        if (video->bsf_annexb_ctx) av_bsf_free(&video->bsf_annexb_ctx);
-        if (video->bsf_aud_ctx) av_bsf_free(&video->bsf_aud_ctx);
-        if (video->frame) av_frame_free(&video->frame);
-        if (video->packet) av_packet_free(&video->packet);
-        if (video->codec_ctx) avcodec_free_context(&video->codec_ctx);
-        if (video->format_ctx) avformat_close_input(&video->format_ctx);
-        
-        // Reinitialize from scratch
-        int result = video_init(video, url, advanced_diag, enable_hardware);
-        free(url);
-        
-        if (result < 0) {
-            printf("[RESTART] Failed to reinitialize video\n");
-            return -1;
-        }
-        
-        printf("[RESTART] Video reinitialized successfully\n");
-        return 0;
-    }
-
-    // Seek succeeded - flush decoder buffers
-    avcodec_flush_buffers(video->codec_ctx);
-    
-    // Flush BSF buffers if present
-    if (video->bsf_annexb_ctx) {
-        av_bsf_flush(video->bsf_annexb_ctx);
-    }
     if (video->bsf_aud_ctx) {
         av_bsf_flush(video->bsf_aud_ctx);
     }
@@ -1470,106 +1321,227 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
         if (v_stride) *v_stride = 0;
         return;
     }
-    
+
+    // For DRM_PRIME hardware frames, use the transferred software frame.
+    AVFrame *src = video->frame;
+    if (video->frame->format == AV_PIX_FMT_DRM_PRIME && video->sw_frame) {
+        src = video->sw_frame;
+    }
+
     // Debug: Print first few pixel values on first call (only for unusual values)
-    static bool debug_printed = false;
-    if (!debug_printed && video->frame->data[0]) {
-        uint8_t u_val = video->frame->data[1] ? video->frame->data[1][0] : 0;
-        uint8_t v_val = video->frame->data[2] ? video->frame->data[2][0] : 0;
-        
-        // Only print debug if U/V values are unusual (not near 128)
+    if (!video->debug_printed && src->data[0]) {
+        uint8_t u_val = src->data[1] ? src->data[1][0] : 0;
+        uint8_t v_val = src->data[2] ? src->data[2][0] : 0;
         if (abs(u_val - 128) > 50 || abs(v_val - 128) > 50) {
             printf("DEBUG: Unusual YUV values - U:%02x V:%02x (expected ~80)\n", u_val, v_val);
         }
-        debug_printed = true;
+        video->debug_printed = true;
     }
-    
-    if (y) *y = video->frame->data[0];
-    if (u) *u = video->frame->data[1];
-    if (v) *v = video->frame->data[2];
-    if (y_stride) *y_stride = video->frame->linesize[0];
-    if (u_stride) *u_stride = video->frame->linesize[1];
-    if (v_stride) *v_stride = video->frame->linesize[2];
+
+    // Hardware decode frames may be overwritten by the decoder thread while the
+    // renderer is still uploading texture data. Copy them into cached, CPU-owned
+    // buffers so that the pointers remain valid for the duration of the render.
+    if (video->use_hardware_decode && src->data[0] && video->width > 0 && video->height > 0) {
+        static int hw_copy_logs = 0;
+        pthread_mutex_lock(&video->lock);
+
+        int width = video->width;
+        int height = video->height;
+        int uv_width = width / 2;
+        int uv_height = height / 2;
+
+        size_t y_bytes = (size_t)width * height;
+        size_t u_bytes = (size_t)uv_width * uv_height;
+        size_t v_bytes = u_bytes;
+
+        if (video->cached_y_size < y_bytes) {
+            uint8_t *new_buf = realloc(video->cached_y_buffer, y_bytes);
+            if (!new_buf) {
+                pthread_mutex_unlock(&video->lock);
+                goto direct_ptrs;
+            }
+            video->cached_y_buffer = new_buf;
+            video->cached_y_size = y_bytes;
+        }
+
+        if (video->cached_u_size < u_bytes) {
+            uint8_t *new_buf = realloc(video->cached_u_buffer, u_bytes);
+            if (!new_buf) {
+                pthread_mutex_unlock(&video->lock);
+                goto direct_ptrs;
+            }
+            video->cached_u_buffer = new_buf;
+            video->cached_u_size = u_bytes;
+        }
+
+        if (video->cached_v_size < v_bytes) {
+            uint8_t *new_buf = realloc(video->cached_v_buffer, v_bytes);
+            if (!new_buf) {
+                pthread_mutex_unlock(&video->lock);
+                goto direct_ptrs;
+            }
+            video->cached_v_buffer = new_buf;
+            video->cached_v_size = v_bytes;
+        }
+
+        // Copy Y plane (respecting stride)
+        uint8_t *dst_y = video->cached_y_buffer;
+        for (int row = 0; row < height; row++) {
+            memcpy(dst_y + row * width, src->data[0] + row * src->linesize[0], width);
+        }
+
+        // Copy U plane
+        if (src->data[1]) {
+            uint8_t *dst_u = video->cached_u_buffer;
+            for (int row = 0; row < uv_height; row++) {
+                memcpy(dst_u + row * uv_width, src->data[1] + row * src->linesize[1], uv_width);
+            }
+        }
+
+        // Copy V plane
+        if (src->data[2]) {
+            uint8_t *dst_v = video->cached_v_buffer;
+            for (int row = 0; row < uv_height; row++) {
+                memcpy(dst_v + row * uv_width, src->data[2] + row * src->linesize[2], uv_width);
+            }
+        }
+
+        if (hw_copy_logs < 3) {
+            printf("[HW_COPY] Copied DRM_PRIME frame into cached buffers (Y:%zu bytes)\n", y_bytes);
+            hw_copy_logs++;
+        }
+        pthread_mutex_unlock(&video->lock);
+
+        if (y) *y = video->cached_y_buffer;
+        if (u) *u = video->cached_u_buffer;
+        if (v) *v = video->cached_v_buffer;
+        if (y_stride) *y_stride = width;
+        if (u_stride) *u_stride = uv_width;
+        if (v_stride) *v_stride = uv_width;
+        return;
+    }
+
+direct_ptrs:
+    if (y) *y = src->data[0];
+    if (u) *u = src->data[1];
+    if (v) *v = src->data[2];
+    if (y_stride) *y_stride = src->linesize[0];
+    if (u_stride) *u_stride = src->linesize[1];
+    if (v_stride) *v_stride = src->linesize[2];
 }
 
 // NV12: Y plane followed by interleaved U/V plane (UV is half resolution)
 // Layout: [Y data (width*height)] [UV data (width*height/2)]
 // Each U/V pair is adjacent (U0 V0 U1 V1 ...)
 
-// Global NV12 conversion buffer (reused across all video contexts)
-static uint8_t *g_nv12_buffer = NULL;
-static int g_nv12_buffer_size = 0;
-
 uint8_t* video_get_nv12_data(video_context_t *video) {
     if (!video || !video->frame) return NULL;
-    
-    // NV12 format: we need to pack U and V planes together
-    // FFmpeg gives us separate Y/U/V planes, so we need to convert
-    
+
+    // When using DRM_PRIME, build NV12 from the transferred software frame.
+    AVFrame *src = video->frame;
+    if (video->frame->format == AV_PIX_FMT_DRM_PRIME && video->sw_frame) {
+        src = video->sw_frame;
+    }
+
     int width = video->width;
     int height = video->height;
+    if (width <= 0 || height <= 0) {
+        return NULL;
+    }
+
+    enum AVPixelFormat pix_fmt = src->format;
+    bool frame_is_nv12 = (pix_fmt == AV_PIX_FMT_NV12);
+    bool frame_is_planar = (pix_fmt == AV_PIX_FMT_YUV420P || pix_fmt == AV_PIX_FMT_YUVJ420P);
+
+    if (!frame_is_nv12 && !frame_is_planar) {
+        // Unsupported format for NV12 uploads
+        return NULL;
+    }
+    
     int needed_size = (width * height * 3) / 2;  // Y plane + packed UV plane
-    
-    // Allocate or reallocate buffer if needed
-    if (g_nv12_buffer_size < needed_size) {
-        free(g_nv12_buffer);
-        g_nv12_buffer = malloc(needed_size);
-        g_nv12_buffer_size = needed_size;
+
+    if (video->nv12_buffer_size < needed_size) {
+        uint8_t *new_buffer = realloc(video->nv12_buffer, needed_size);
+        if (!new_buffer) {
+            return NULL;
+        }
+        video->nv12_buffer = new_buffer;
+        video->nv12_buffer_size = needed_size;
     }
-    
-    if (!g_nv12_buffer) return NULL;
-    
-    uint8_t *y_data = video->frame->data[0];
-    uint8_t *u_data = video->frame->data[1];
-    uint8_t *v_data = video->frame->data[2];
-    int y_stride = video->frame->linesize[0];
-    int u_stride = video->frame->linesize[1];
-    int v_stride = video->frame->linesize[2];
-    
+
+    if (!video->nv12_buffer) return NULL;
+
+    uint8_t *dst = video->nv12_buffer;
+    uint8_t *y_data = src->data[0];
+    int y_stride = src->linesize[0];
     if (!y_data) return NULL;
-    
+
     // Copy Y plane (full resolution)
-    uint8_t *dst = g_nv12_buffer;
-    uint8_t *src = y_data;
     for (int row = 0; row < height; row++) {
-        memcpy(dst, src, width);
+        memcpy(dst, y_data + (row * y_stride), width);
         dst += width;
-        src += y_stride;
     }
-    
-    // Copy interleaved UV plane (half resolution)
-    int uv_width = width / 2;
+
+    // Copy UV data depending on source format
     int uv_height = height / 2;
-    
-    if (u_data && v_data) {
-        // Interleave U and V into UV plane
+
+    if (frame_is_nv12) {
+        uint8_t *uv_src = src->data[1];
+        int uv_stride_bytes = src->linesize[1];
+        if (!uv_src) {
+            return NULL;
+        }
+
+        for (int row = 0; row < uv_height; row++) {
+            memcpy(dst, uv_src + (row * uv_stride_bytes), width);
+            dst += width;
+        }
+    } else {
+        // Planar YUV420 -> interleave as NV12
+        uint8_t *u_data = src->data[1];
+        uint8_t *v_data = src->data[2];
+        int u_stride = src->linesize[1];
+        int v_stride = src->linesize[2];
+
+        if (!u_data || !v_data) {
+            return NULL;
+        }
+
+        int uv_width = width / 2;
         for (int row = 0; row < uv_height; row++) {
             uint8_t *u_row = u_data + (row * u_stride);
             uint8_t *v_row = v_data + (row * v_stride);
-            
+
             for (int col = 0; col < uv_width; col++) {
-                *dst++ = u_row[col];  // U
-                *dst++ = v_row[col];  // V
+                *dst++ = u_row[col];
+                *dst++ = v_row[col];
             }
         }
     }
-    
-    return g_nv12_buffer;
-}
 
-// Cleanup function for NV12 buffer (called on shutdown)
-static void video_cleanup_nv12_buffer(void) {
-    if (g_nv12_buffer) {
-        free(g_nv12_buffer);
-        g_nv12_buffer = NULL;
-        g_nv12_buffer_size = 0;
-    }
+    return video->nv12_buffer;
 }
 
 int video_get_nv12_stride(video_context_t *video) {
     if (!video) return 0;
-    // NV12 stride is just the width (no padding for the packed format we create)
     return video->width;
+}
+
+bool video_frame_is_nv12(video_context_t *video) {
+    if (!video || !video->frame) {
+        return false;
+    }
+    // For DRM_PRIME frames, check the transferred software frame format.
+    AVFrame *src = video->frame;
+    if (video->frame->format == AV_PIX_FMT_DRM_PRIME && video->sw_frame) {
+        src = video->sw_frame;
+    }
+    enum AVPixelFormat pix_fmt = src->format;
+    return (pix_fmt == AV_PIX_FMT_NV12);
+}
+
+bool video_is_eof(video_context_t *video) {
+    return video->eof_reached;
 }
 
 void video_set_loop(video_context_t *video, bool loop) {
@@ -1660,6 +1632,9 @@ void video_cleanup(video_context_t *video) {
     if (video->frame) {
         av_frame_free(&video->frame);
     }
+    if (video->sw_frame) {
+        av_frame_free(&video->sw_frame);
+    }
     if (video->packet) {
         av_packet_free(&video->packet);
     }
@@ -1684,7 +1659,7 @@ void video_cleanup(video_context_t *video) {
             AVFrame *dummy = av_frame_alloc();
             if (dummy) {
                 int drain_count = 0;
-                while (drain_count < 50) {  // Safety limit
+                while (drain_count < DECODER_DRAIN_SAFETY_LIMIT) {  // Safety limit
                     ret = avcodec_receive_frame(video->codec_ctx, dummy);
                     if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
                         break;
@@ -1704,7 +1679,7 @@ void video_cleanup(video_context_t *video) {
             
             // Give V4L2 driver time to release resources
             // This helps prevent device-busy errors on next run
-            usleep(10000);  // 10ms delay
+            usleep(V4L2_CLEANUP_DELAY_US);  // 10ms delay
         }
         
         // Now safe to free codec context and release V4L2 device
@@ -1712,7 +1687,7 @@ void video_cleanup(video_context_t *video) {
         
         // Extra delay for V4L2 M2M to ensure kernel driver fully releases device
         if (is_v4l2m2m) {
-            usleep(50000);  // 50ms delay after context free
+            usleep(V4L2_POST_CLEANUP_DELAY_US);  // 50ms delay after context free
         }
     }
     
@@ -1720,9 +1695,29 @@ void video_cleanup(video_context_t *video) {
         avformat_close_input(&video->format_ctx);
     }
     
-    // Clean up global NV12 conversion buffer
-    video_cleanup_nv12_buffer();
-    
+    if (video->nv12_buffer) {
+        free(video->nv12_buffer);
+        video->nv12_buffer = NULL;
+        video->nv12_buffer_size = 0;
+    }
+
+    if (video->cached_y_buffer) {
+        free(video->cached_y_buffer);
+        video->cached_y_buffer = NULL;
+        video->cached_y_size = 0;
+    }
+    if (video->cached_u_buffer) {
+        free(video->cached_u_buffer);
+        video->cached_u_buffer = NULL;
+        video->cached_u_size = 0;
+    }
+    if (video->cached_v_buffer) {
+        free(video->cached_v_buffer);
+        video->cached_v_buffer = NULL;
+        video->cached_v_size = 0;
+    }
+
+    pthread_mutex_destroy(&video->lock);
     memset(video, 0, sizeof(*video));
 }
 
@@ -1779,5 +1774,4 @@ size_t video_get_dma_size(video_context_t *video) {
         return 0;
     }
     
-    return video->dma_size;
 }

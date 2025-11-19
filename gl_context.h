@@ -25,16 +25,20 @@ typedef struct {
     GLuint texture_y;     // Y plane texture
     GLuint texture_u;     // U plane texture  
     GLuint texture_v;     // V plane texture
-    GLuint texture_nv12;  // NV12 packed format texture
+    GLuint texture_nv12;  // NV12 UV interleaved texture (video 1)
+    GLuint texture_nv12_2;// NV12 UV interleaved texture (video 2)
     
     // YUV textures for second video (video 2)
     GLuint texture_y2;    // Y plane texture (video 2)
     GLuint texture_u2;    // U plane texture (video 2)
     GLuint texture_v2;    // V plane texture (video 2)
     
-    // Pixel Buffer Objects for async DMA transfers
-    GLuint pbo[3];        // PBOs for Y, U, V planes (async upload)
+    // Pixel Buffer Objects for async texture staging
+    GLuint pbo[2][3];     // Double-buffered PBOs per Y/U/V plane
+    size_t pbo_size[3];   // Allocated bytes per plane
+    int pbo_index;        // Current staging buffer slot
     bool use_pbo;         // Enable PBO async uploads
+    bool pbo_warned;      // Prevent repeated fallback logs
     
     GLuint vbo;
     GLuint ebo;
@@ -53,7 +57,8 @@ typedef struct {
     GLint u_texture_y;    // Y plane sampler
     GLint u_texture_u;    // U plane sampler
     GLint u_texture_v;    // V plane sampler
-    GLint u_texture_nv12; // NV12 packed sampler
+    GLint u_texture_nv12; // NV12 UV sampler
+    GLint u_use_nv12;     // Toggle for NV12 path
     GLint u_keystone_matrix;
     GLint u_flip_y;       // Flip texture Y coordinate (for upside-down videos)
     

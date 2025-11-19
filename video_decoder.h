@@ -49,10 +49,20 @@ typedef struct {
     int v4l2_fd;                     // V4L2 device file descriptor (-1 if unavailable)
     unsigned int v4l2_buffer_index;  // Current output buffer index from V4L2 M2M decoder
     
+    // NV12 conversion buffer (per context to support multi-video playback)
+    uint8_t *nv12_buffer;
+    int nv12_buffer_size;
+    
     // Hardware acceleration contexts (FFmpeg hwaccel API)
     AVBufferRef *hw_device_ctx;      // Hardware device context (DRM/VAAPI/etc)
     AVBufferRef *hw_frames_ctx;      // Hardware frames context for zero-copy buffers
     enum AVPixelFormat hw_pix_fmt;   // Hardware pixel format (AV_PIX_FMT_DRM_PRIME/NV12)
+
+    // Software frame for hardware-decoded content
+    // When using DRM_PRIME or other hw formats, we transfer
+    // the frame into this CPU-accessible YUV420P frame so that
+    // existing CPU upload paths can render it.
+    AVFrame *sw_frame;
     
     // DMA buffer zero-copy support (for hardware decoded frames)
     bool supports_dma_export;        // True if hardware decoder supports DMA buffer export
@@ -63,6 +73,27 @@ typedef struct {
     // DMA plane layout (for YUV420P zero-copy rendering)
     int dma_plane_offset[3];         // Byte offsets for Y, U, V planes
     int dma_plane_pitch[3];          // Pitch (stride) for Y, U, V planes
+    
+    // Thread safety
+    pthread_mutex_t lock;            // Mutex for thread-safe access to context
+    
+    // Per-context state (moved from static variables for thread safety)
+    int callback_count;              // Format callback invocation count
+    int frame_count;                 // Decoded frame count
+    bool debug_printed;              // Debug output flag
+    int decode_call_count;           // Number of decode function calls
+    int hw_fallback_retry_count;     // Hardware decode fallback retry counter
+    
+    // Cached buffers for V4L2 M2M frames (speeds up GL texture upload)
+    uint8_t *cached_y_buffer;
+    uint8_t *cached_u_buffer;
+    uint8_t *cached_v_buffer;
+    size_t cached_y_size;
+    size_t cached_u_size;
+    size_t cached_v_size;
+    void *last_y_source;             // Track if we already copied this frame
+    void *last_u_source;
+    void *last_v_source;
 } video_context_t;
 
 // Video decoder functions
@@ -80,6 +111,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
                        int *y_stride, int *u_stride, int *v_stride);  // New YUV output
 uint8_t* video_get_nv12_data(video_context_t *video);  // NV12 packed format
 int video_get_nv12_stride(video_context_t *video);
+bool video_frame_is_nv12(video_context_t *video);
 double video_get_frame_time(video_context_t *video);
 bool video_is_eof(video_context_t *video);
 void video_seek(video_context_t *video, int64_t timestamp);
