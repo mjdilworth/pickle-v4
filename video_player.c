@@ -501,6 +501,15 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
         video_set_loop(app->video2, loop_playback);
 
+        // Enable pure hardware path for video2 if external texture is supported
+        if (app->video2->use_hardware_decode && app->gl->supports_external_texture) {
+            app->video2->skip_sw_transfer = true;
+            printf("[ZERO-COPY] Pure hardware path enabled for video 2 (external texture)\n");
+        } else if (app->video2->use_hardware_decode) {
+            app->video2->skip_sw_transfer = false;
+            printf("[HW_DECODE] Using hardware decode with CPU transfer for video 2\n");
+        }
+
         if (!app->video2->use_hardware_decode) {
             app->async_decoder_secondary = async_decode_create(app->video2);
             if (!app->async_decoder_secondary) {
@@ -1238,12 +1247,24 @@ void app_run(app_context_t *app) {
                 decode1_time = (decode_end2.tv_sec - decode_start2.tv_sec) +
                               (decode_end2.tv_nsec - decode_start2.tv_nsec) / 1e9;
                 if (decode_result2 == 0) {
-                    frame_count2++;
-                    new_secondary_frame_ready = true;
-                    if (frame_count2 == 1) {
-                        printf("First frame of video 2 decoded successfully (HW sync)\n");
-                        first_frame_decoded2 = true;
-                        fflush(stdout);
+                    // For pure HW path, verify DMA buffer is ready before marking frame ready
+                    bool frame2_valid = false;
+                    if (app->video2->skip_sw_transfer) {
+                        // Zero-copy path: need valid DMA buffer
+                        frame2_valid = video_has_dma_buffer(app->video2);
+                    } else {
+                        // CPU transfer path: decode success is enough
+                        frame2_valid = true;
+                    }
+
+                    if (frame2_valid) {
+                        frame_count2++;
+                        new_secondary_frame_ready = true;
+                        if (frame_count2 == 1) {
+                            printf("First frame of video 2 decoded successfully (HW sync)\n");
+                            first_frame_decoded2 = true;
+                            fflush(stdout);
+                        }
                     }
                 }
 
@@ -1454,39 +1475,43 @@ void app_run(app_context_t *app) {
             struct timespec nv12_cpu_start2 = {0, 0}, nv12_cpu_end2 = {0, 0};
             struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
 
-        if (app->show_timing) {
-            for (int i = 0; i < 2; ++i) {
-                if (nv12_frame_time[i] >= 0.0) {
-                    nv12_interval_sum[i] += nv12_frame_time[i];
-                    if (nv12_frame_time[i] < nv12_interval_min[i]) {
-                        nv12_interval_min[i] = nv12_frame_time[i];
-                    }
-                    if (nv12_frame_time[i] > nv12_interval_max[i]) {
-                        nv12_interval_max[i] = nv12_frame_time[i];
-                    }
-                    nv12_interval_count[i]++;
-                }
-
-                if (upload_frame_time[i] >= 0.0) {
-                    gl_upload_interval_sum[i] += upload_frame_time[i];
-                    if (upload_frame_time[i] < gl_upload_interval_min[i]) {
-                        gl_upload_interval_min[i] = upload_frame_time[i];
-                    }
-                    if (upload_frame_time[i] > gl_upload_interval_max[i]) {
-                        gl_upload_interval_max[i] = upload_frame_time[i];
-                    }
-                    gl_upload_interval_count[i]++;
-                }
-            }
-        }
-
             // Split rendering path by decode type:
-            // HW decode → NV12 conversion + 2-plane upload
+            // HW decode + DMA → Zero-copy external texture (pure hardware)
+            // HW decode fallback → NV12 conversion + 2-plane upload
             // SW decode → Direct YUV420P 3-plane upload (no conversion)
             bool use_hw_decode2 = app->video2->use_hardware_decode;
+            bool has_dma2 = video_has_dma_buffer(app->video2);
 
-            if (use_hw_decode2 && new_secondary_frame_ready) {
-                // HW DECODE PATH: Convert to NV12 and upload 2 planes
+            // PURE HARDWARE PATH: Zero-copy via external texture (multi-plane YUV EGLImage)
+            if (has_dma2 && use_hw_decode2 && new_secondary_frame_ready && app->gl->supports_external_texture) {
+                int dma_fd2 = video_get_dma_fd(app->video2);
+                if (dma_fd2 >= 0) {
+                    static bool egl_dma2_logged = false;
+                    if (!egl_dma2_logged) {
+                        printf("[Render] Using external texture zero-copy path for video 2\n");
+                        egl_dma2_logged = true;
+                    }
+
+                    int plane_offsets2[3] = {0, 0, 0};
+                    int plane_pitches2[3] = {0, 0, 0};
+                    video_get_dma_plane_layout(app->video2, plane_offsets2, plane_pitches2);
+
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
+                    }
+                    gl_render_frame_external(app->gl, dma_fd2, video_width2, video_height2,
+                                            plane_offsets2, plane_pitches2,
+                                            app->drm, app->keystone2, false, 1);
+                    if (app->show_timing) {
+                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
+                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+                    }
+                    video2_rendered = true;
+                }
+            }
+
+            // HW DECODE FALLBACK: NV12 conversion + 2-plane upload (when no DMA/external texture)
+            if (!video2_rendered && use_hw_decode2 && new_secondary_frame_ready) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start2);
                 }
@@ -1509,8 +1534,10 @@ void app_run(app_context_t *app) {
                     }
                     video2_rendered = true;
                 }
-            } else if (!use_hw_decode2 && new_secondary_frame_ready) {
-                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
+            }
+
+            // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
+            if (!video2_rendered && !use_hw_decode2 && new_secondary_frame_ready) {
                 video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
                 if (y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
                     if (app->show_timing) {
@@ -1526,21 +1553,34 @@ void app_run(app_context_t *app) {
                 }
             }
 
-            // SAFETY: If video 2 failed to render, render black frame to prevent disappearing
-            if (!video2_rendered) {
-                static int black_frame_count = 0;
-                if (black_frame_count < 5) {
-                    fprintf(stderr, "[VIDEO2] No valid frame data, rendering black\n");
-                    black_frame_count++;
+            // When no new frame is ready for video2, skip rendering entirely.
+            // Previous frame stays in GPU texture - no flashing.
+            // (Removed black frame fallback that caused flashing)
+        }
+
+        // Accumulate timing stats for both videos AFTER both are rendered
+        if (app->show_timing) {
+            for (int i = 0; i < 2; ++i) {
+                if (nv12_frame_time[i] >= 0.0) {
+                    nv12_interval_sum[i] += nv12_frame_time[i];
+                    if (nv12_frame_time[i] < nv12_interval_min[i]) {
+                        nv12_interval_min[i] = nv12_frame_time[i];
+                    }
+                    if (nv12_frame_time[i] > nv12_interval_max[i]) {
+                        nv12_interval_max[i] = nv12_frame_time[i];
+                    }
+                    nv12_interval_count[i]++;
                 }
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                }
-                gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
-                              0, 0, 0, app->drm, app->keystone2, false, 1);
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                    upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+
+                if (upload_frame_time[i] >= 0.0) {
+                    gl_upload_interval_sum[i] += upload_frame_time[i];
+                    if (upload_frame_time[i] < gl_upload_interval_min[i]) {
+                        gl_upload_interval_min[i] = upload_frame_time[i];
+                    }
+                    if (upload_frame_time[i] > gl_upload_interval_max[i]) {
+                        gl_upload_interval_max[i] = upload_frame_time[i];
+                    }
+                    gl_upload_interval_count[i]++;
                 }
             }
         }
