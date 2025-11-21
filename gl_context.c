@@ -2689,9 +2689,11 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     clock_gettime(CLOCK_MONOTONIC, &dma_end);
 
 cleanup_dma:
-    // Flush GL commands to GPU (non-blocking)
-    // The driver will ensure EGL images aren't freed until GPU is done with them
-    glFlush();
+    // IMPORTANT: Use glFinish() to ensure GPU completes rendering before destroying EGLImages
+    // glFlush() only guarantees commands are submitted, not completed.
+    // Without this, the EGLImages may be destroyed while GPU is still reading from them,
+    // causing flickering especially visible on the second video.
+    glFinish();
 
     // CRITICAL: Unbind textures from EGL images before destroying
     // Bind NULL/0 to each texture to detach the EGL image
@@ -2821,8 +2823,11 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     // Draw
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
-    // Flush and cleanup
-    glFlush();
+    // IMPORTANT: Use glFinish() to ensure GPU completes rendering before destroying EGLImage
+    // glFlush() only guarantees commands are submitted, not completed.
+    // Without this, the EGLImage may be destroyed while GPU is still reading from it,
+    // causing flickering especially visible on the second video.
+    glFinish();
 
     // Unbind texture from EGL image
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex_external);
