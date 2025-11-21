@@ -433,7 +433,17 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         app_cleanup(app);
         return -1;
     }
-    
+
+    // Enable pure hardware path if external texture is supported (multi-plane YUV EGLImage)
+    // This uses GL_OES_EGL_image_external for true zero-copy rendering
+    if (app->video->use_hardware_decode && app->gl->supports_external_texture) {
+        app->video->skip_sw_transfer = true;
+        printf("[ZERO-COPY] Pure hardware path enabled (external texture)\n");
+    } else if (app->video->use_hardware_decode) {
+        app->video->skip_sw_transfer = false;  // Fallback to CPU transfer
+        printf("[HW_DECODE] Using hardware decode with CPU transfer (V4L2 M2M)\n");
+    }
+
     // Validate video dimensions after decoder opens file
     if (app->video->width > MAX_VIDEO_WIDTH || app->video->height > MAX_VIDEO_HEIGHT) {
         fprintf(stderr, "Error: Video dimensions %dx%d exceed limits (%dx%d max)\n",
@@ -1042,12 +1052,24 @@ void app_run(app_context_t *app) {
                 }
 
                 if (async_decode_wait_frame(app->async_decoder_primary, wait_timeout_ms)) {
-                    uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
-                    int y_stride = 0, u_stride = 0, v_stride = 0;
-                    video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                    // Check for new frame: either YUV data (SW/fallback) or DMA buffer (pure HW)
+                    bool frame_available = false;
 
-                    if (y_data != NULL) {
-                        video_data = y_data;
+                    if (app->video->skip_sw_transfer && video_has_dma_buffer(app->video)) {
+                        // Pure hardware path: DMA buffer is the frame
+                        frame_available = true;
+                    } else {
+                        // Software/fallback path: check YUV data
+                        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                        int y_stride = 0, u_stride = 0, v_stride = 0;
+                        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                        if (y_data != NULL) {
+                            video_data = y_data;
+                            frame_available = true;
+                        }
+                    }
+
+                    if (frame_available) {
                         last_video_data = video_data;
                         frame_count++;
                         new_primary_frame_ready = true;
@@ -1287,18 +1309,11 @@ void app_run(app_context_t *app) {
             video_height = 256;
         }
         
-        // Get YUV data for GPU rendering
-        uint8_t *y_data, *u_data, *v_data;
-        int y_stride, u_stride, v_stride;
-        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-        
-        // PRODUCTION: Removed noisy YUV pointer debug output
-        // Only log if NULL (actual error condition)
-        static bool null_warned = false;
-        if (!y_data && !null_warned) {
-            printf("Warning: NULL YUV data pointer\n");
-            null_warned = true;
-            fflush(stdout);
+        // Get YUV data for GPU rendering (only needed for SW decode path)
+        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+        int y_stride = 0, u_stride = 0, v_stride = 0;
+        if (!app->video->skip_sw_transfer) {
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
         }
         
         // CRITICAL: Start render timing RIGHT BEFORE actual GL operations
@@ -1329,121 +1344,99 @@ void app_run(app_context_t *app) {
         }
 
         // Check if DMA buffer is available for zero-copy rendering
-        // Try KMS direct scanout first, then fall back to OpenGL if not available
         bool has_dma = video_has_dma_buffer(app->video);
-        bool used_kms_overlay = false;  // Track if we used KMS path (no GL work needed)
-        bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
-        
-        // PRODUCTION FIX: Always use CPU/OpenGL path for hardware decode
-        // KMS overlay plane cannot apply keystone correction (no transformation matrix)
-        // Keystone correction is a core feature, so we must use OpenGL rendering
-        // This means hardware decoded frames are uploaded to GPU textures via CPU
-        if (false && has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
-            // KMS DIRECT SCANOUT PATH - DISABLED for keystone support
-            // This path bypasses OpenGL and cannot apply keystone transformation
-            // Keeping code for reference, but disabled to ensure keystone always works
+        bool use_hw_decode = app->video->use_hardware_decode;
+
+        bool rendered = false;
+        struct timespec nv12_cpu_start = {0, 0}, nv12_cpu_end = {0, 0};
+        struct timespec gl_upload_start = {0, 0}, gl_upload_end = {0, 0};
+
+        // PURE HARDWARE PATH: Zero-copy via external texture (multi-plane YUV EGLImage)
+        // GPU imports DMA buffer directly - no CPU copy at all
+        if (has_dma && use_hw_decode && new_primary_frame_ready && app->gl->supports_external_texture) {
             int dma_fd = video_get_dma_fd(app->video);
             if (dma_fd >= 0) {
-                static bool kms_init_done = false;
-                if (!kms_init_done && frame_count == 1) {
-                    printf("[KMS] ✓ Using KMS overlay plane for zero-copy hardware video\n");
-                    kms_init_done = true;
+                static bool egl_dma_logged = false;
+                if (!egl_dma_logged) {
+                    printf("[Render] Using external texture zero-copy path (pure hardware)\n");
+                    egl_dma_logged = true;
                 }
 
-                // Get actual plane layout from hardware decoder
                 int plane_offsets[3] = {0, 0, 0};
                 int plane_pitches[3] = {0, 0, 0};
                 video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
 
-                // Create framebuffer from DMA buffer
-                uint32_t fb_id = 0;
-                if (drm_create_video_fb(app->drm, dma_fd, video_width, video_height,
-                                       plane_offsets, plane_pitches, &fb_id) == 0) {
-                    // Display on overlay plane (hardware scanout, true zero-copy)
-                    // NOTE: drmModeSetPlane waits for vblank (~12-16ms on 60Hz display)
-                    // This is expected behavior for tear-free presentation
-                    drm_display_video_frame(app->drm, fb_id, 0, 0, video_width, video_height);
-                    used_kms_overlay = true;  // Successfully used KMS path
-                }
-
-                // Note: When using KMS overlay, video is on hardware plane
-                // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
-                // This is handled in the standard overlay rendering section below
-            }
-        } else {
-            // CPU RENDERING PATH (DMA currently broken on this hardware)
-            // Use simple direct glTexSubImage2D uploads for now
-            // Used only when: no DMA buffers available (software decode)
-            // PRODUCTION: Only log once on startup
-            static bool cpu_path_logged = false;
-            if (!cpu_path_logged) {
-                printf("[Render] Using CPU upload path (software decode)\n");
-                cpu_path_logged = true;
-            }
-
-            bool rendered = false;
-            struct timespec nv12_cpu_start = {0, 0}, nv12_cpu_end = {0, 0};
-            struct timespec gl_upload_start = {0, 0}, gl_upload_end = {0, 0};
-
-            // Split rendering path by decode type:
-            // HW decode → NV12 conversion + 2-plane upload
-            // SW decode → Direct YUV420P 3-plane upload (no conversion)
-            bool use_hw_decode = app->video->use_hardware_decode;
-
-            if (use_hw_decode && new_primary_frame_ready) {
-                // HW DECODE PATH: Convert to NV12 and upload 2 planes
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start);
-                }
-                uint8_t *nv12_data = video_get_nv12_data(app->video);
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end);
-                    nv12_frame_time[0] = timespec_diff_seconds(&nv12_cpu_start, &nv12_cpu_end);
-                }
-
-                if (nv12_data) {
-                    int nv12_stride = video_get_nv12_stride(app->video);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
-                    }
-                    gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride,
-                                   app->drm, app->keystone, true, 0);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
-                        upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
-                    }
-                    rendered = true;
-                }
-            } else if (!use_hw_decode && new_primary_frame_ready) {
-                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
-                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-                if (y_data && u_data && v_data) {
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
-                    }
-                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
-                        upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
-                    }
-                    rendered = true;
-                }
-            }
-
-            // Fallback: render black frame if no valid data
-            if (!rendered) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
                 }
-                gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                              0, 0, 0, app->drm, app->keystone, true, 0);
+                gl_render_frame_external(app->gl, dma_fd, video_width, video_height,
+                                        plane_offsets, plane_pitches,
+                                        app->drm, app->keystone, true, 0);
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
                     upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
                 }
+                rendered = true;
             }
         }
+
+        // SOFTWARE DECODE PATH: Direct YUV420P upload (no conversion)
+        if (!rendered && !use_hw_decode && new_primary_frame_ready) {
+            static bool sw_path_logged = false;
+            if (!sw_path_logged) {
+                printf("[Render] Using CPU upload path (software decode)\n");
+                sw_path_logged = true;
+            }
+
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+            if (y_data && u_data && v_data) {
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                }
+                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height,
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                    upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                }
+                rendered = true;
+            }
+        }
+
+        // FALLBACK: HW decode without DMA support - use CPU transfer path
+        if (!rendered && use_hw_decode && new_primary_frame_ready) {
+            static bool fallback_logged = false;
+            if (!fallback_logged) {
+                printf("[Render] Using CPU fallback path (HW decode, no EGL/DMA)\n");
+                fallback_logged = true;
+            }
+
+            if (app->show_timing) {
+                clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start);
+            }
+            uint8_t *nv12_data = video_get_nv12_data(app->video);
+            if (app->show_timing) {
+                clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end);
+                nv12_frame_time[0] = timespec_diff_seconds(&nv12_cpu_start, &nv12_cpu_end);
+            }
+
+            if (nv12_data) {
+                int nv12_stride = video_get_nv12_stride(app->video);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                }
+                gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride,
+                               app->drm, app->keystone, true, 0);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                    upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                }
+                rendered = true;
+            }
+        }
+
+        // When no new frame is ready, skip rendering - keep previous frame on screen
+        // Don't render black (causes flashing). Previous frame stays in GPU texture.
         
         // Issue deferred async decode request once we finish uploading the frame
         if (using_async_primary && primary_async_request_pending && !primary_async_requested) {
@@ -1673,11 +1666,8 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Time buffer swapping
         clock_gettime(CLOCK_MONOTONIC, &swap_start);
 
-        // Only swap buffers if we rendered something in OpenGL
-        // When using KMS overlay without GL overlays, skip the swap (no vsync wait needed)
-        if (!used_kms_overlay || any_overlay_visible || any_overlay_visible2) {
-            gl_swap_buffers(app->gl, app->drm);
-        }
+        // Swap buffers to display the rendered frame
+        gl_swap_buffers(app->gl, app->drm);
 
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
 
