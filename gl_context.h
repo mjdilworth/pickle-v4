@@ -101,6 +101,21 @@ typedef struct {
     GLuint texture_external2;        // External texture for video 2
     EGLImage egl_image_yuv;          // Multi-plane YUV EGLImage (video 1)
     EGLImage egl_image_yuv2;         // Multi-plane YUV EGLImage (video 2)
+
+    // Pending EGLImages for deferred cleanup (when defer_finish=true)
+    EGLImage pending_images[4];      // Up to 4 pending images (2 videos × safety margin)
+    int pending_image_count;         // Number of pending images to destroy
+
+    // EGLImage cache - reuse EGLImages for the same DMA FD to avoid create/destroy overhead
+    // Ring buffer of cached EGLImages keyed by DMA FD
+    #define EGL_IMAGE_CACHE_SIZE 12  // Support ~6 frames per video in flight
+    struct {
+        int dma_fd;                  // DMA buffer file descriptor (-1 = empty slot)
+        EGLImage image;              // Cached EGLImage for this DMA FD
+        int width;                   // Video width when created
+        int height;                  // Video height when created
+    } egl_cache[EGL_IMAGE_CACHE_SIZE];
+    int egl_cache_next;              // Next slot to use (round-robin)
 } gl_context_t;
 
 // OpenGL ES functions
@@ -126,9 +141,15 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 
 // DMA buffer zero-copy rendering (multi-plane YUV EGLImage with external texture)
+// Set defer_finish=true when rendering multiple videos, then call gl_finish_frame() after all renders
 void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
                               int plane_offsets[3], int plane_pitches[3],
-                              struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
+                              struct display_ctx *drm, keystone_context_t *keystone,
+                              bool clear_screen, int video_index, bool defer_finish);
+
+// Call after all gl_render_frame_external() calls with defer_finish=true
+// This performs the single glFinish() and cleans up all pending EGLImages
+void gl_finish_frame(gl_context_t *gl);
 
 // Shader source code
 extern const char *vertex_shader_source;

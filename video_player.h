@@ -22,6 +22,7 @@ typedef struct {
     video_context_t *video;
     bool frame_ready;
     bool decoding;
+    double last_decode_time;  // Duration of last decode in seconds
 } async_decode_t;
 
 // Main application context
@@ -64,5 +65,6 @@ void async_decode_destroy(async_decode_t *decoder);
 void async_decode_request_frame(async_decode_t *decoder);
 bool async_decode_frame_ready(async_decode_t *decoder);
 bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms);
+double async_decode_get_last_time(async_decode_t *decoder);
 
 #endif // VIDEO_PLAYER_H
