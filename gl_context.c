@@ -568,13 +568,6 @@ static int create_external_program(gl_context_t *gl) {
 int gl_init(gl_context_t *gl, display_ctx_t *drm) {
     memset(gl, 0, sizeof(*gl));
 
-    // Initialize EGLImage cache slots to empty
-    for (int i = 0; i < EGL_IMAGE_CACHE_SIZE; i++) {
-        gl->egl_cache[i].dma_fd = -1;
-        gl->egl_cache[i].image = EGL_NO_IMAGE;
-    }
-    gl->egl_cache_next = 0;
-
     // Get EGL display
     gl->egl_display = eglGetDisplay((EGLNativeDisplayType)drm->gbm_device);
     if (gl->egl_display == EGL_NO_DISPLAY) {
@@ -650,12 +643,12 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
-    // Disable VSync - we manage our own frame timing with DRM/KMS
-    // swap interval 0 = don't block on VBlank, swap immediately
-    if (!eglSwapInterval(gl->egl_display, 0)) {
-        printf("Warning: Could not disable VSync\n");
+    // FIXED: Enable VSync for smooth, tear-free playback
+    // Set swap interval to 1 to sync with display refresh (eliminates jitter)
+    if (!eglSwapInterval(gl->egl_display, 1)) {
+        printf("Warning: Could not enable VSync (swap interval) - playback may be jittery\n");
     } else {
-        printf("VSync disabled (app-managed frame timing)\n");
+        printf("VSync enabled for smooth playback (synced to display refresh)\n");
     }
 
     // Detect EGL DMA buffer import support (zero-copy rendering)
@@ -885,8 +878,7 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
         gl_state_set = true;
     }
 
-    // PRODUCTION FIX: Always set up full GL state for every video render
-    {
+    if (video_index == 0) {
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
         glUseProgram(0);
@@ -1039,10 +1031,9 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         gl_state_set = true;
     }
     
-    // PRODUCTION FIX: Always set up full GL state for every video render.
-    // The previous optimization (if video_index == 0) caused state corruption
-    // if overlays (corners/help) were drawn between video 0 and video 1.
-    {
+    // CRITICAL: Only do full state setup once per frame (for video_index 0)
+    // For video_index > 0, just update textures and keystone matrix
+    if (video_index == 0) {
         // Complete buffer unbinding before state restoration
         // This is needed to prevent state leakage from previous operations
         glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -1267,28 +1258,29 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
 }
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
     static int swap_count = 0;
+    static struct timespec last_swap_time = {0, 0};
     struct timespec t1, t2;
     
-    // Measure actual eglSwapBuffers() duration
+    // Measure swap time for diagnostics
     clock_gettime(CLOCK_MONOTONIC, &t1);
     
     // EGL swap buffers (this makes the rendered frame available and blocks on VSync)
     EGLBoolean swap_result = eglSwapBuffers(gl->egl_display, gl->egl_surface);
-    
-    clock_gettime(CLOCK_MONOTONIC, &t2);
-    
     if (!swap_result && swap_count < 5) {
         printf("EGL swap failed: 0x%x\n", eglGetError());
+        clock_gettime(CLOCK_MONOTONIC, &last_swap_time);
         return;
     }
     
-    // Calculate actual swap duration (includes VSync wait if enabled)
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    
+    // Calculate swap time (includes VSync wait)
     double swap_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + 
                      (t2.tv_nsec - t1.tv_nsec) / 1000000.0;
     
-    // Warn on long swaps (indicates late arrival to VBlank or slow GPU)
+    // Warn on long swaps (indicates late arrival to VBlank)
     if (swap_ms > 20.0 && swap_count > 10) {
-        printf("PERF: Long swap: %.1fms (eglSwapBuffers blocked)\n", swap_ms);
+        printf("PERF: Long swap: %.1fms (late frame, missed VBlank window)\n", swap_ms);
     }
     
     // Present to display via DRM
@@ -1296,6 +1288,7 @@ void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm) {
         printf("DRM swap failed\n");
     }
     
+    last_swap_time = t2;
     swap_count++;
 }
 
@@ -1308,12 +1301,58 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         return; // Don't render corners if not visible
     }
 
-    // PRODUCTION FIX: Removed static VBOs and complex state tracking.
-    // Using gl->corner_vbo with glBufferData (orphaning) is robust, stateless,
-    // and prevents resource leaks or stale state on context restart.
-    static float corner_vertices[10000]; 
+    // PRODUCTION FIX: Separate VBOs and state tracking for each keystone
+    // This prevents flickering when rendering corners for dual keystones
+    static float corner_vertices1[10000];  // Keystone 1 vertex buffer
+    static float corner_vertices2[10000];  // Keystone 2 vertex buffer
+    static GLuint corner_vbo1 = 0;
+    static GLuint corner_vbo2 = 0;
+    static bool vbo_initialized = false;
 
-    // Always prepare corner colors
+    // Per-keystone state tracking (indexed by keystone: 0 = first seen, 1 = second seen)
+    static keystone_context_t *keystone_ptrs[2] = {NULL, NULL};
+    static int cached_selected_corners[2] = {-2, -2};
+    static bool last_show_corners[2] = {false, false};
+
+    // Initialize VBOs once on first call
+    if (!vbo_initialized) {
+        glGenBuffers(1, &corner_vbo1);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo1);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices1), NULL, GL_DYNAMIC_DRAW);
+
+        glGenBuffers(1, &corner_vbo2);
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo2);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(corner_vertices2), NULL, GL_DYNAMIC_DRAW);
+
+        vbo_initialized = true;
+    }
+
+    // Determine which keystone index (0 or 1) based on pointer
+    int keystone_idx = -1;
+    if (keystone == keystone_ptrs[0] || keystone_ptrs[0] == NULL) {
+        keystone_idx = 0;
+        keystone_ptrs[0] = keystone;
+    } else if (keystone == keystone_ptrs[1] || keystone_ptrs[1] == NULL) {
+        keystone_idx = 1;
+        keystone_ptrs[1] = keystone;
+    } else {
+        // Fallback: use index 0 if pointer doesn't match either
+        keystone_idx = 0;
+    }
+
+    // Select the appropriate VBO and vertex buffer for this keystone
+    GLuint corner_vbo = (keystone_idx == 0) ? corner_vbo1 : corner_vbo2;
+    float *corner_vertices = (keystone_idx == 0) ? corner_vertices1 : corner_vertices2;
+
+    // Check if update needed for THIS specific keystone
+    bool visibility_changed = (last_show_corners[keystone_idx] != keystone->show_corners);
+    bool selection_changed = (cached_selected_corners[keystone_idx] != keystone->selected_corner);
+    bool needs_update = keystone->corners_dirty || visibility_changed || selection_changed;
+
+    // Update cached state for THIS keystone
+    last_show_corners[keystone_idx] = keystone->show_corners;
+    
+    // Always prepare corner colors (outside needs_update so available for rendering)
     float corner_colors[4][4];
     for (int i = 0; i < 4; i++) {
         if (keystone->selected_corner == i) {
@@ -1331,21 +1370,25 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
         }
     }
     
-    // Create corner positions (small squares)
-    float corner_size = 0.008f; // 0.8% of screen size (refined and elegant)
-    
-    // Corner vertices with colors: [x, y, r, g, b, a] per vertex
-    int vertex_count = 0;
-    
-    // Render corner indicators at the keystone corner positions
-    for (int i = 0; i < 4; i++) {
-        // Get the keystone corner position
-        float tx = keystone->corners[i].x;
-        float ty = keystone->corners[i].y;
-        float *color = corner_colors[i];
+    if (needs_update) {
+        cached_selected_corners[keystone_idx] = keystone->selected_corner;
+        keystone->corners_dirty = false;  // Clear dirty flag
         
-        // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
-        if (vertex_count + 4 <= 1600) { // Leave room for text
+        // Create corner positions (small squares)
+        float corner_size = 0.008f; // 0.8% of screen size (refined and elegant)
+        
+        // Corner vertices with colors: [x, y, r, g, b, a] per vertex
+        int vertex_count = 0;
+        
+        // Render corner indicators at the keystone corner positions
+        for (int i = 0; i < 4; i++) {
+            // Get the keystone corner position
+            float tx = keystone->corners[i].x;
+            float ty = keystone->corners[i].y;
+            float *color = corner_colors[i];
+            
+            // Create a small square with per-vertex colors (6 floats per vertex: x, y, r, g, b, a)
+            if (vertex_count + 4 <= 1600) { // Leave room for text
                 // Bottom-left
                 corner_vertices[vertex_count*6 + 0] = tx - corner_size;
                 corner_vertices[vertex_count*6 + 1] = ty - corner_size;
@@ -1382,12 +1425,16 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
                 corner_vertices[vertex_count*6 + 5] = color[3];
                 vertex_count++;
             }
-    }
+        }
+        
+        // OPTIMIZED: Use glBufferSubData instead of glBufferData
+        // glBufferSubData only updates the data, much faster than reallocating
+        glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * 6 * sizeof(float), corner_vertices);
+    }  // End needs_update block
     
-    // OPTIMIZED: Use glBufferData (orphaning) for robustness
-    // This handles synchronization automatically and avoids race conditions
-    glBindBuffer(GL_ARRAY_BUFFER, gl->corner_vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertex_count * 6 * sizeof(float), corner_vertices, GL_DYNAMIC_DRAW);
+    // Always bind and render (even if not updated)
+    glBindBuffer(GL_ARRAY_BUFFER, corner_vbo);
     
     // Enable blending for transparent overlays
     glEnable(GL_BLEND);
@@ -2642,11 +2689,9 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
     clock_gettime(CLOCK_MONOTONIC, &dma_end);
 
 cleanup_dma:
-    // IMPORTANT: Use glFinish() to ensure GPU completes rendering before destroying EGLImages
-    // glFlush() only guarantees commands are submitted, not completed.
-    // Without this, the EGLImages may be destroyed while GPU is still reading from them,
-    // causing flickering especially visible on the second video.
-    glFinish();
+    // Flush GL commands to GPU (non-blocking)
+    // The driver will ensure EGL images aren't freed until GPU is done with them
+    glFlush();
 
     // CRITICAL: Unbind textures from EGL images before destroying
     // Bind NULL/0 to each texture to detach the EGL image
@@ -2679,91 +2724,21 @@ cleanup_dma:
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-// Get or create a cached EGLImage for the given DMA FD
-// Returns cached image if found, or creates new one and caches it
-// Uses round-robin eviction when cache is full
-static EGLImage get_or_create_egl_image(gl_context_t *gl, int dma_fd, int width, int height,
-                                        int plane_offsets[3], int plane_pitches[3]) {
-    // First, check if this DMA FD is already cached
-    for (int i = 0; i < EGL_IMAGE_CACHE_SIZE; i++) {
-        if (gl->egl_cache[i].dma_fd == dma_fd &&
-            gl->egl_cache[i].width == width &&
-            gl->egl_cache[i].height == height) {
-            // Cache hit! Return existing EGLImage
-            return gl->egl_cache[i].image;
-        }
-    }
-
-    // Cache miss - need to create a new EGLImage
-    // First, find the slot to use (round-robin)
-    int slot = gl->egl_cache_next;
-    gl->egl_cache_next = (gl->egl_cache_next + 1) % EGL_IMAGE_CACHE_SIZE;
-
-    // If slot has an existing image, destroy it first
-    if (gl->egl_cache[slot].image != EGL_NO_IMAGE && eglDestroyImageKHR) {
-        (*eglDestroyImageKHR)(gl->egl_display, gl->egl_cache[slot].image);
-        gl->egl_cache[slot].image = EGL_NO_IMAGE;
-        gl->egl_cache[slot].dma_fd = -1;
-    }
-
-    // Create multi-plane YUV EGLImage using DRM_FORMAT_YUV420
-    EGLint attribs[] = {
-        EGL_WIDTH, width,
-        EGL_HEIGHT, height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
-        EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE1_OFFSET_EXT, plane_offsets[1],
-        EGL_DMA_BUF_PLANE1_PITCH_EXT, plane_pitches[1],
-        EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE2_OFFSET_EXT, plane_offsets[2],
-        EGL_DMA_BUF_PLANE2_PITCH_EXT, plane_pitches[2],
-        EGL_NONE
-    };
-
-    EGLImage yuv_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
-                                           EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
-    EGLint egl_err = eglGetError();
-    if (yuv_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        static int err_count = 0;
-        if (err_count < 3) {
-            fprintf(stderr, "[EGL_CACHE] EGLImage creation failed: 0x%x\n", egl_err);
-            err_count++;
-        }
-        return EGL_NO_IMAGE;
-    }
-
-    // Cache the new image
-    gl->egl_cache[slot].dma_fd = dma_fd;
-    gl->egl_cache[slot].image = yuv_image;
-    gl->egl_cache[slot].width = width;
-    gl->egl_cache[slot].height = height;
-
-    static bool cache_logged = false;
-    if (!cache_logged) {
-        printf("[EGL_CACHE] EGLImage caching enabled (%d slots)\n", EGL_IMAGE_CACHE_SIZE);
-        cache_logged = true;
-    }
-
-    return yuv_image;
-}
-
 // Multi-plane YUV EGLImage rendering with external texture (zero-copy)
 // Imports DRM_PRIME buffer as single multi-plane EGLImage and renders via samplerExternalOES
-// Uses EGLImage cache for performance - images are reused when DMA FD matches
 void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
                               int plane_offsets[3], int plane_pitches[3],
                               struct display_ctx *drm, keystone_context_t *keystone,
-                              bool clear_screen, int video_index, bool defer_finish) {
-    (void)defer_finish;  // No longer used - images are cached, not destroyed per-frame
+                              bool clear_screen, int video_index) {
     if (!gl || dma_fd < 0 || !gl->supports_external_texture || !gl->external_program) {
         return;
     }
 
-    // Select texture based on video index
+    // Select texture and texture unit based on video index
+    // CRITICAL: Each video must use its own texture unit to prevent cross-contamination
     GLuint tex_external = (video_index == 0) ? gl->texture_external : gl->texture_external2;
+    GLenum texture_unit = (video_index == 0) ? GL_TEXTURE0 : GL_TEXTURE1;
+    GLint sampler_unit = (video_index == 0) ? 0 : 1;
 
     // Set up rendering state
     glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
@@ -2798,15 +2773,38 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     // Flip Y coordinate for video
     glUniform1f(gl->ext_u_flip_y, 1.0f);
 
-    // Get or create cached EGLImage for this DMA buffer
-    // This is the key optimization - EGLImages are reused across frames
-    EGLImage yuv_image = get_or_create_egl_image(gl, dma_fd, width, height, plane_offsets, plane_pitches);
-    if (yuv_image == EGL_NO_IMAGE) {
+    // Create multi-plane YUV EGLImage using DRM_FORMAT_YUV420
+    // All three planes share the same DMA FD with different offsets
+    EGLint attribs[] = {
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
+        EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT, plane_offsets[1],
+        EGL_DMA_BUF_PLANE1_PITCH_EXT, plane_pitches[1],
+        EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE2_OFFSET_EXT, plane_offsets[2],
+        EGL_DMA_BUF_PLANE2_PITCH_EXT, plane_pitches[2],
+        EGL_NONE
+    };
+
+    EGLImage yuv_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                           EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
+    EGLint egl_err = eglGetError();
+    if (yuv_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[EXT] Multi-plane YUV EGLImage import failed: 0x%x\n", egl_err);
+            err_count++;
+        }
         return;
     }
 
-    // Bind to GL_TEXTURE_EXTERNAL_OES
-    glActiveTexture(GL_TEXTURE0);
+    // Bind to GL_TEXTURE_EXTERNAL_OES using video-specific texture unit
+    glActiveTexture(texture_unit);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex_external);
     if (glEGLImageTargetTexture2DOES) {
         (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)yuv_image);
@@ -2814,47 +2812,39 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
         glGetError();
     }
 
-    // Set texture parameters (only need to set once, but cheap to repeat)
+    // Set texture parameters
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    // Set sampler uniform
-    glUniform1i(gl->ext_u_texture_external, 0);
+    // Set sampler uniform to the video-specific texture unit
+    glUniform1i(gl->ext_u_texture_external, sampler_unit);
 
     // Draw
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
-    // No cleanup needed - EGLImages are cached and reused
-    // The cache uses round-robin eviction when full
+    // Store EGLImage for deferred destruction
+    // We keep track of the previous frame's EGLImage and destroy it when creating a new one
+    // This ensures the GPU has finished using the image before we destroy it
+    static EGLImage prev_image[2] = {EGL_NO_IMAGE, EGL_NO_IMAGE};
+
+    // Destroy the PREVIOUS frame's image (GPU is done with it by now)
+    if (prev_image[video_index] != EGL_NO_IMAGE && eglDestroyImageKHR) {
+        (*eglDestroyImageKHR)(gl->egl_display, prev_image[video_index]);
+    }
+    // Store current image for destruction next frame
+    prev_image[video_index] = yuv_image;
 
     // Log first successful render
     static bool logged = false;
     if (!logged) {
-        printf("[EXT] ✓ Zero-copy YUV420 render via external texture\n");
+        printf("[EXT] Zero-copy YUV420 render via external texture\n");
         logged = true;
     }
 }
 
-// Legacy function - kept for API compatibility but now a no-op
-// With EGLImage caching, we don't need to destroy images per-frame
-void gl_finish_frame(gl_context_t *gl) {
-    (void)gl;  // No-op - EGLImages are now cached and reused
-}
-
 void gl_cleanup(gl_context_t *gl) {
-    // Clean up EGLImage cache
-    if (eglDestroyImageKHR) {
-        for (int i = 0; i < EGL_IMAGE_CACHE_SIZE; i++) {
-            if (gl->egl_cache[i].image != EGL_NO_IMAGE) {
-                (*eglDestroyImageKHR)(gl->egl_display, gl->egl_cache[i].image);
-                gl->egl_cache[i].image = EGL_NO_IMAGE;
-                gl->egl_cache[i].dma_fd = -1;
-            }
-        }
-    }
-
     // Clean up YUV textures (video 1)
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
     if (gl->texture_u) glDeleteTextures(1, &gl->texture_u);
