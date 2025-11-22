@@ -484,37 +484,35 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     }
 
     // Initialize second video decoder if provided
+    // HYBRID MODE: Video 2 always uses SOFTWARE decode to avoid V4L2 M2M contention
+    // Pi 4 has single HW decoder - running two HW streams causes poor performance
+    // Video 1 gets HW decode (if --hw), Video 2 uses SW decode (parallel on CPU)
     if (video_file2) {
-        if (video_init(app->video2, video_file2, app->advanced_diagnostics, enable_hardware_decode) != 0) {
+        bool video2_hw_decode = false;  // Always software decode for video 2
+        if (enable_hardware_decode) {
+            printf("[HYBRID] Video 2 forced to software decode (V4L2 M2M is single-stream)\n");
+        }
+
+        if (video_init(app->video2, video_file2, app->advanced_diagnostics, video2_hw_decode) != 0) {
             fprintf(stderr, "Failed to initialize second video decoder\n");
             app_cleanup(app);
             return -1;
         }
-        
+
         if (app->video2->width > MAX_VIDEO_WIDTH || app->video2->height > MAX_VIDEO_HEIGHT) {
             fprintf(stderr, "Error: Video 2 dimensions %dx%d exceed limits (%dx%d max)\n",
                     app->video2->width, app->video2->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
             app_cleanup(app);
             return -1;
         }
-        
+
         printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
         video_set_loop(app->video2, loop_playback);
 
-        // Create async decoder for video 2 - only for SOFTWARE decode
-        // For HW decode, use synchronous mode since Pi 4 has single V4L2 M2M decoder
-        // Running two async HW decoders causes contention and poor performance
-        if (!app->video2->use_hardware_decode) {
-            app->async_decoder_secondary = async_decode_create(app->video2);
-            if (!app->async_decoder_secondary) {
-                fprintf(stderr, "Failed to create async decoder for video 2\n");
-                app_cleanup(app);
-                return -1;
-            }
-            printf("Async decoder created for video 2 (software path)\n");
-        } else {
-            printf("Video 2 using synchronous HW decode (shared V4L2 M2M)\n");
-        }
+        // Video 2 uses SYNCHRONOUS software decode for stability
+        // Async decode caused flickering due to timing/buffer issues
+        app->async_decoder_secondary = NULL;
+        printf("Video 2 using synchronous software decode\n");
     }
 
     // Initialize keystone correction
@@ -712,8 +710,6 @@ void app_run(app_context_t *app) {
     bool first_decode_attempted = false;
     bool primary_async_requested = false;
     bool primary_async_request_pending = false;
-    bool secondary_async_requested = false;
-    bool secondary_async_request_pending = false;
     
     while (app->running && !g_quit_requested) {
         clock_gettime(CLOCK_MONOTONIC, &current_time);
@@ -1230,64 +1226,28 @@ void app_run(app_context_t *app) {
         } // End of main decode/render block
 
         // Decode second video if available
-        // Hardware decode: SYNCHRONOUS (Pi 4 has single V4L2 M2M decoder)
-        // Software decode: ASYNC (CPU is slow, need background thread)
+        // SYNCHRONOUS software decode for stability (async caused flickering)
         if (app->video2) {
-            if (app->video2->use_hardware_decode) {
-                // HARDWARE: Synchronous decode - shared V4L2 M2M decoder
-                int decode_result2 = video_decode_frame(app->video2);
-                if (decode_result2 == 0) {
+            int decode_result = video_decode_frame(app->video2);
+
+            if (decode_result == 0) {
+                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                   &y_stride2, &u_stride2, &v_stride2);
+
+                if (y_data2 != NULL) {
                     frame_count2++;
-                    new_secondary_frame_ready = true;
-                    if (frame_count2 == 1) {
-                        printf("First frame of video 2 decoded successfully (HW sync)\n");
+                    if (!first_frame_decoded2) {
+                        printf("First frame of video 2 decoded successfully (SW sync)\n");
                         first_frame_decoded2 = true;
                         fflush(stdout);
                     }
+                    new_secondary_frame_ready = true;
                 }
-
-                if (video_is_eof(app->video2)) {
-                    if (app->loop_playback) {
-                        video_seek(app->video2, 0);
-                        first_frame_decoded2 = false;
-                        frame_count2 = 0;
-                    }
-                }
-            } else if (app->async_decoder_secondary) {
-                // SOFTWARE: Async decode (CPU is slow, need background thread)
-                int wait_timeout_ms2 = first_frame_decoded2 ? 0 : 100;
-
-                if (!secondary_async_requested) {
-                    async_decode_request_frame(app->async_decoder_secondary);
-                    secondary_async_requested = true;
-                }
-
-                if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms2)) {
-                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
-                                       &y_stride2, &u_stride2, &v_stride2);
-
-                    if (y_data2 != NULL) {
-                        frame_count2++;
-                        if (!first_frame_decoded2) {
-                            printf("First frame of video 2 decoded successfully (SW async)\n");
-                            first_frame_decoded2 = true;
-                            fflush(stdout);
-                        }
-                        new_secondary_frame_ready = true;
-                    }
-
-                    secondary_async_requested = false;
-                    secondary_async_request_pending = !video_is_eof(app->video2);
-                }
-
-                if (video_is_eof(app->video2)) {
-                    if (app->loop_playback) {
-                        video_seek(app->video2, 0);
-                        first_frame_decoded2 = false;
-                        frame_count2 = 0;
-                        secondary_async_requested = false;
-                        secondary_async_request_pending = false;
-                    }
+            } else if (video_is_eof(app->video2)) {
+                if (app->loop_playback) {
+                    video_seek(app->video2, 0);
+                    first_frame_decoded2 = false;
+                    frame_count2 = 0;
                 }
             }
         }
@@ -1450,7 +1410,6 @@ void app_run(app_context_t *app) {
             int video_width2 = app->video2->width;
             int video_height2 = app->video2->height;
             bool video2_rendered = false;
-            struct timespec nv12_cpu_start2 = {0, 0}, nv12_cpu_end2 = {0, 0};
             struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
 
         if (app->show_timing) {
@@ -1479,108 +1438,19 @@ void app_run(app_context_t *app) {
             }
         }
 
-            // Split rendering path by decode type:
-            // HW decode + DMA → Zero-copy external texture (pure hardware)
-            // HW decode fallback → NV12 conversion + 2-plane upload
-            // SW decode → Direct YUV420P 3-plane upload (no conversion)
-            bool use_hw_decode2 = app->video2->use_hardware_decode;
-            bool has_dma2 = video_has_dma_buffer(app->video2);
-
-            // PURE HARDWARE PATH for video 2: Zero-copy via external texture
-            if (has_dma2 && use_hw_decode2 && new_secondary_frame_ready && app->gl->supports_external_texture) {
-                int dma_fd2 = video_get_dma_fd(app->video2);
-                if (dma_fd2 >= 0) {
-                    static bool egl_dma2_logged = false;
-                    if (!egl_dma2_logged) {
-                        printf("[Render] Using external texture zero-copy path for video 2\n");
-                        egl_dma2_logged = true;
-                    }
-
-                    int plane_offsets2[3] = {0, 0, 0};
-                    int plane_pitches2[3] = {0, 0, 0};
-                    video_get_dma_plane_layout(app->video2, plane_offsets2, plane_pitches2);
-
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                    }
-                    gl_render_frame_external(app->gl, dma_fd2, video_width2, video_height2,
-                                            plane_offsets2, plane_pitches2,
-                                            app->drm, app->keystone2, false, 1);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
-                    }
-                    video2_rendered = true;
-                }
-            }
-
-            // HW DECODE FALLBACK: NV12 conversion + 2-plane upload (when no DMA/external texture)
-            if (!video2_rendered && use_hw_decode2 && new_secondary_frame_ready) {
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start2);
-                }
-                uint8_t *nv12_data2 = video_get_nv12_data(app->video2);
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end2);
-                    nv12_frame_time[1] = timespec_diff_seconds(&nv12_cpu_start2, &nv12_cpu_end2);
-                }
-
-                if (nv12_data2) {
-                    int nv12_stride2 = video_get_nv12_stride(app->video2);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                    }
-                    gl_render_nv12(app->gl, nv12_data2, video_width2, video_height2, nv12_stride2,
-                                   app->drm, app->keystone2, false, 1);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
-                    }
-                    video2_rendered = true;
-                }
-            }
-
-            if (!video2_rendered && !use_hw_decode2 && new_secondary_frame_ready) {
-                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
-                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                if (y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                    }
-                    gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
-                                  y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
-                    }
-                    video2_rendered = true;
-                }
-            }
-
-            // SAFETY: If video 2 failed to render, render black frame to prevent disappearing
-            if (!video2_rendered) {
-                static int black_frame_count = 0;
-                if (black_frame_count < 5) {
-                    fprintf(stderr, "[VIDEO2] No valid frame data, rendering black\n");
-                    black_frame_count++;
-                }
+            // SYNC DECODE: Video 2 always has fresh data when new_secondary_frame_ready is true
+            if (new_secondary_frame_ready && y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
                 }
-                gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
-                              0, 0, 0, app->drm, app->keystone2, false, 1);
+                gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
+                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
                     upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
                 }
+                video2_rendered = true;
             }
-        }
-
-        if (app->video2 && app->async_decoder_secondary &&
-            secondary_async_request_pending && !secondary_async_requested) {
-            async_decode_request_frame(app->async_decoder_secondary);
-            secondary_async_requested = true;
-            secondary_async_request_pending = false;
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);

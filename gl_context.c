@@ -1031,38 +1031,32 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         gl_state_set = true;
     }
     
-    // CRITICAL: Only do full state setup once per frame (for video_index 0)
-    // For video_index > 0, just update textures and keystone matrix
-    if (video_index == 0) {
-        // Complete buffer unbinding before state restoration
-        // This is needed to prevent state leakage from previous operations
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        glUseProgram(0);
-        
-        // Reset vertex attribute arrays
-        glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
-        
-        // Now set up the correct state for video rendering
-        glUseProgram(gl->program);
-        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
-        
-        // Position attribute
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-        glEnableVertexAttribArray(0);
-        
-        // Texture coordinate attribute
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-        glEnableVertexAttribArray(1);
+    // CRITICAL: Always set up shader program - external_program may have been used by video 1 HW decode
+    // This ensures gl_render_frame uses the correct program regardless of what rendered before it
+    glUseProgram(gl->program);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
 
-        // Explicitly disable blending - overlays might have enabled it
-        glDisable(GL_BLEND);
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
 
-        // Disable depth test - make sure video is always visible
-        glDisable(GL_DEPTH_TEST);
-    }
+    // Texture coordinate attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Explicitly disable blending - overlays might have enabled it
+    glDisable(GL_BLEND);
+
+    // Disable depth test - make sure video is always visible
+    glDisable(GL_DEPTH_TEST);
+
+    // CRITICAL: Unbind any external textures that may have been bound by HW decode path
+    // This prevents GL_TEXTURE_EXTERNAL_OES from interfering with GL_TEXTURE_2D
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
 
     // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
     // This is OUTSIDE the video_index==0 block so each video gets its own aspect ratio
