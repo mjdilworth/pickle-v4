@@ -789,9 +789,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             printf("[HW_DECODE] V4L2 output buffers will be accessed via VIDIOC_EXPBUF for zero-copy GPU mapping\n");
         }
     } else {
-        // Software decoding settings
-        video->codec_ctx->thread_count = 4;
-        video->codec_ctx->thread_type = FF_THREAD_FRAME;
+        // Software decoding settings - optimized for parallel decode
+        video->codec_ctx->thread_count = 0; // 0 = auto-detect CPU cores
+        video->codec_ctx->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
+        printf("[SW_DECODE] Multi-threaded decode enabled (auto CPU cores, slice+frame threading)\n");
         
         // Open codec
         if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
@@ -1226,9 +1227,9 @@ int video_decode_frame(video_context_t *video) {
             return -1;
         }
         
-        // Configure for software decoding
-        video->codec_ctx->thread_count = 4;
-        video->codec_ctx->thread_type = FF_THREAD_FRAME;
+        // Configure for software decoding - optimized for parallel decode
+        video->codec_ctx->thread_count = 0; // 0 = auto-detect CPU cores
+        video->codec_ctx->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
         
         // Open software codec
         if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
