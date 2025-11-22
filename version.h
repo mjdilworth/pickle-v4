@@ -12,7 +12,7 @@
 #define VERSION_PATCH 0
 
 // Build metadata (optional)
-#define VERSION_BUILD "fast-hw"
+#define VERSION_BUILD "main"
 
 // Helper macros for version string construction
 #define STRINGIFY(x) #x
