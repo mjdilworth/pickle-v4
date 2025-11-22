@@ -8,7 +8,7 @@
 // PATCH: Backward-compatible bug fixes
 
 #define VERSION_MAJOR 1
-#define VERSION_MINOR 0
+#define VERSION_MINOR 1
 #define VERSION_PATCH 0
 
 // Build metadata (optional)

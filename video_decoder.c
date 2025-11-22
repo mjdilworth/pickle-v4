@@ -995,6 +995,11 @@ int video_decode_frame(video_context_t *video) {
                     // Duplicate the FD so we own it (FFmpeg may close the original)
                     // This FD can be passed directly to EGL for DMA-BUF import
                     int dup_fd = dup(new_dma_fd);
+                    if (dup_fd < 0) {
+                        fprintf(stderr, "[ZERO-COPY] Failed to dup DMA FD %d: %s\n", new_dma_fd, strerror(errno));
+                        av_frame_unref(video->frame);
+                        return -1;
+                    }
                     video->dma_fd = dup_fd;
                     video->dma_size = drm_size;
                     
@@ -1827,6 +1832,17 @@ void video_cleanup(video_context_t *video) {
         video->cached_v_size = 0;
     }
 
+    // PRODUCTION: Ensure mutex is unlocked before destroy (prevent EBUSY deadlock)
+    // Try to lock and unlock to verify state, then destroy
+    int lock_result = pthread_mutex_trylock(&video->lock);
+    if (lock_result == 0) {
+        // We acquired the lock, unlock it before destroying
+        pthread_mutex_unlock(&video->lock);
+    } else if (lock_result == EBUSY) {
+        // Mutex is locked (shouldn't happen, but handle it)
+        fprintf(stderr, "[CLEANUP] Warning: Mutex still locked during cleanup\n");
+    }
+    
     // Safe pthread cleanup with error checking
     int mutex_result = pthread_mutex_destroy(&video->lock);
     if (mutex_result != 0 && mutex_result != EINVAL) {

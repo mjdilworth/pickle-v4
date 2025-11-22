@@ -423,6 +423,11 @@ int drm_swap_buffers(display_ctx_t *drm) {
         fprintf(stderr, "Failed to queue page flip: %s\n", strerror(errno));
         drm->waiting_for_flip = false;
         gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
+        // PRODUCTION: Clean up framebuffer on error to prevent resource leak
+        if (drm->next_fb_id) {
+            drmModeRmFB(drm->drm_fd, drm->next_fb_id);
+            drm->next_fb_id = 0;
+        }
         return -1;
     }
     

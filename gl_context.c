@@ -8,6 +8,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+#include <errno.h>
 
 // PRODUCTION: Validate EGL context before critical operations
 static bool validate_egl_context(void) {
@@ -159,8 +161,21 @@ static void allocate_yuv_buffers(int needed_size) {
         g_yuv_buffers.y_temp_buffer = malloc(alloc_size);
         g_yuv_buffers.u_temp_buffer = malloc(alloc_size / 4);  // U/V are half size
         g_yuv_buffers.v_temp_buffer = malloc(alloc_size / 4);
-        g_yuv_buffers.allocated_size = alloc_size;
         
+        // Check for allocation failures (critical for production)
+        if (!g_yuv_buffers.y_temp_buffer || !g_yuv_buffers.u_temp_buffer || !g_yuv_buffers.v_temp_buffer) {
+            fprintf(stderr, "[GL] CRITICAL: Failed to allocate YUV temp buffers (%d bytes)\n", alloc_size);
+            free(g_yuv_buffers.y_temp_buffer);
+            free(g_yuv_buffers.u_temp_buffer);
+            free(g_yuv_buffers.v_temp_buffer);
+            g_yuv_buffers.y_temp_buffer = NULL;
+            g_yuv_buffers.u_temp_buffer = NULL;
+            g_yuv_buffers.v_temp_buffer = NULL;
+            g_yuv_buffers.allocated_size = 0;
+            return;  // Return without updating allocated_size to trigger fallback
+        }
+        
+        g_yuv_buffers.allocated_size = alloc_size;
         if (g_yuv_buffers.y_temp_buffer && g_yuv_buffers.u_temp_buffer && g_yuv_buffers.v_temp_buffer) {
             // printf("DEBUG: Pre-allocated YUV buffers: Y=%p U=%p V=%p (size %d)\n",
             //        g_yuv_buffers.y_temp_buffer, g_yuv_buffers.u_temp_buffer, g_yuv_buffers.v_temp_buffer, alloc_size);
@@ -216,15 +231,26 @@ static bool upload_plane_with_pbo(gl_context_t *gl, int plane, const uint8_t *sr
     }
 
     // Wait for fence if this PBO set is still in use by GPU
+    // Use non-blocking check to avoid stalling the CPU
     if (gl->pbo_fences[gl->pbo_index]) {
         GLenum result = glClientWaitSync(gl->pbo_fences[gl->pbo_index], 
-                                         GL_SYNC_FLUSH_COMMANDS_BIT, 
-                                         1000000000); // 1s timeout
-        if (result == GL_TIMEOUT_EXPIRED || result == GL_WAIT_FAILED) {
+                                         0,  // flags: non-blocking check
+                                         0); // 0 timeout = non-blocking
+        if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
+            // GPU is done with this PBO, safe to reuse
+            glDeleteSync(gl->pbo_fences[gl->pbo_index]);
+            gl->pbo_fences[gl->pbo_index] = 0;
+        } else if (result == GL_TIMEOUT_EXPIRED) {
+            // GPU still using this PBO - this is normal with double-buffering
+            // The GL_MAP_UNSYNCHRONIZED_BIT below allows us to proceed anyway
+        } else {
+            // GL_WAIT_FAILED - something went wrong
+            if (!gl->pbo_warned) {
+                fprintf(stderr, "[PBO] Warning: fence wait failed, falling back to direct upload\\n");
+                gl->pbo_warned = true;
+            }
             return false;
         }
-        glDeleteSync(gl->pbo_fences[gl->pbo_index]);
-        gl->pbo_fences[gl->pbo_index] = 0;
     }
 
     if (!ensure_pbo_capacity(gl, plane, total_bytes)) {
@@ -705,13 +731,16 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
     for (int i = 0; i < PBO_RING_COUNT; i++) {
         gl->pbo_fences[i] = 0;
     }
+    // PRODUCTION: PBOs disabled by default due to flickering issues with fence synchronization
+    // Enable with PICKLE_ENABLE_PBO=1 for testing (requires more work on sync)
     const char *enable_pbo = getenv("PICKLE_ENABLE_PBO");
-    gl->use_pbo = (enable_pbo && enable_pbo[0] == '1');
+    gl->use_pbo = (enable_pbo && enable_pbo[0] == '1');  // Default: disabled
     if (gl->use_pbo) {
         glGenBuffers(PBO_RING_COUNT * 3, &gl->pbo[0][0]);
-        printf("[Render] PBO staging enabled (PICKLE_ENABLE_PBO=1)\n");
+        printf("[Render] PBO async uploads enabled (PICKLE_ENABLE_PBO=1)\n");
+    } else {
+        printf("[Render] Using direct glTexSubImage2D uploads (stable baseline)\n");
     }
-    printf("[Render] Using direct glTexSubImage2D uploads (simple baseline)\n");
 
     // OpenGL ES initialization complete
     return 0;
@@ -857,6 +886,12 @@ void gl_setup_buffers(gl_context_t *gl) {
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
                     display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render NV12 - EGL context lost\n");
+        return;
+    }
+    
     static int frame_rendered[2] = {0, 0};
     static int last_width[2] = {0, 0};
     static int last_height[2] = {0, 0};
@@ -2447,6 +2482,12 @@ void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
 void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
                         int plane_offsets[3], int plane_pitches[3],
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render DMA - EGL context lost\n");
+        return;
+    }
+    
     if (!gl || dma_fd < 0) {
         fprintf(stderr, "[DMA] Invalid arguments (gl=%p, fd=%d)\n", (void*)gl, dma_fd);
         return;
@@ -2724,6 +2765,12 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
                               int plane_offsets[3], int plane_pitches[3],
                               struct display_ctx *drm, keystone_context_t *keystone,
                               bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render external - EGL context lost\n");
+        return;
+    }
+    
     if (!gl || dma_fd < 0 || !gl->supports_external_texture || !gl->external_program) {
         return;
     }
@@ -2822,13 +2869,17 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     // We keep track of the previous frame's EGLImage and destroy it when creating a new one
     // This ensures the GPU has finished using the image before we destroy it
     static EGLImage prev_image[2] = {EGL_NO_IMAGE, EGL_NO_IMAGE};
+    static pthread_mutex_t prev_image_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+    // Thread-safe EGLImage destruction (protect against concurrent dual-video rendering)
+    pthread_mutex_lock(&prev_image_mutex);
     // Destroy the PREVIOUS frame's image (GPU is done with it by now)
     if (prev_image[video_index] != EGL_NO_IMAGE && eglDestroyImageKHR) {
         (*eglDestroyImageKHR)(gl->egl_display, prev_image[video_index]);
     }
     // Store current image for destruction next frame
     prev_image[video_index] = yuv_image;
+    pthread_mutex_unlock(&prev_image_mutex);
 
     // Log first successful render
     static bool logged = false;
@@ -2855,6 +2906,14 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->pbo[0][0] || gl->pbo[0][1] || gl->pbo[0][2] ||
         gl->pbo[1][0] || gl->pbo[1][1] || gl->pbo[1][2]) {
         glDeleteBuffers(PBO_RING_COUNT * 3, &gl->pbo[0][0]);
+    }
+    
+    // Clean up PBO fences
+    for (int i = 0; i < PBO_RING_COUNT; i++) {
+        if (gl->pbo_fences[i]) {
+            glDeleteSync(gl->pbo_fences[i]);
+            gl->pbo_fences[i] = 0;
+        }
     }
     
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);

@@ -265,6 +265,14 @@ void async_decode_destroy(async_decode_t *decoder) {
         decoder->running = false;
     }
 
+    // PRODUCTION: Ensure mutex is unlocked before destroy (prevent EBUSY deadlock)
+    int trylock_result = pthread_mutex_trylock(&decoder->mutex);
+    if (trylock_result == 0) {
+        pthread_mutex_unlock(&decoder->mutex);
+    } else if (trylock_result == EBUSY) {
+        fprintf(stderr, "[ASYNC] Warning: Mutex still locked during cleanup\n");
+    }
+    
     // Safe cleanup of synchronization primitives
     int mutex_result = pthread_mutex_destroy(&decoder->mutex);
     if (mutex_result != 0 && mutex_result != EINVAL) {
