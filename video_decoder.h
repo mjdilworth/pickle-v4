@@ -40,6 +40,7 @@ typedef struct {
     bool using_drm_prime;
     bool advanced_diagnostics; // Flag for detailed diagnostics output
     bool enable_hardware_decode; // Flag to enable hardware decode (--hw flag)
+    bool skip_sw_transfer;     // Skip av_hwframe_transfer_data when using EGL/DMA zero-copy
     
     // 2-stage Bitstream filter chain for V4L2 M2M: avcC→Annex-B + AUD insertion
     AVBSFContext *bsf_annexb_ctx;    // Stage 1: h264_mp4toannexb (avcC to Annex-B conversion)

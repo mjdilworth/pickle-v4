@@ -35,6 +35,7 @@ typedef struct {
     
     // Pixel Buffer Objects for async texture staging
     GLuint pbo[2][3];     // Double-buffered PBOs per Y/U/V plane
+    GLsync pbo_fences[2]; // Fences for PBO synchronization
     size_t pbo_size[3];   // Allocated bytes per plane
     int pbo_index;        // Current staging buffer slot
     bool use_pbo;         // Enable PBO async uploads
@@ -84,10 +85,22 @@ typedef struct {
     
     // EGL DMA buffer zero-copy support
     bool supports_egl_image;         // True if EGL_EXT_image_dma_buf_import supported
+    bool supports_external_texture;  // True if GL_OES_EGL_image_external supported
     EGLImage egl_image_y;            // EGL image for Y plane (DMA-backed)
     EGLImage egl_image_uv;           // EGL image for UV plane (DMA-backed) - NV12 packed
     EGLImage egl_image_y2;           // EGL image for Y plane (video 2)
     EGLImage egl_image_uv2;          // EGL image for UV plane (video 2)
+
+    // External texture program (for zero-copy YUV import)
+    GLuint external_program;         // Shader program using samplerExternalOES
+    GLint ext_u_mvp_matrix;          // MVP matrix uniform
+    GLint ext_u_keystone_matrix;     // Keystone matrix uniform
+    GLint ext_u_flip_y;              // Flip Y uniform
+    GLint ext_u_texture_external;    // External texture sampler uniform
+    GLuint texture_external;         // External texture for YUV EGLImage
+    GLuint texture_external2;        // External texture for video 2
+    EGLImage egl_image_yuv;          // Multi-plane YUV EGLImage (video 1)
+    EGLImage egl_image_yuv2;         // Multi-plane YUV EGLImage (video 2)
 } gl_context_t;
 
 // OpenGL ES functions
@@ -102,14 +115,20 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
                     struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_border(gl_context_t *gl, keystone_context_t *keystone);
+void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_help_overlay(gl_context_t *gl, keystone_context_t *keystone);
 void gl_render_notification_overlay(gl_context_t *gl, const char *message);
 void gl_swap_buffers(gl_context_t *gl, struct display_ctx *drm);
 
-// DMA buffer zero-copy rendering (NV12 format)
+// DMA buffer zero-copy rendering (NV12 format) - legacy separate planes
 void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
                         int plane_offsets[3], int plane_pitches[3],
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
+
+// DMA buffer zero-copy rendering (multi-plane YUV EGLImage with external texture)
+void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
+                              int plane_offsets[3], int plane_pitches[3],
+                              struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 
 // Shader source code
 extern const char *vertex_shader_source;

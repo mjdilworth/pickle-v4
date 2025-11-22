@@ -8,6 +8,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+#include <errno.h>
 
 // PRODUCTION: Validate EGL context before critical operations
 static bool validate_egl_context(void) {
@@ -130,6 +132,12 @@ static eglDestroyImageKHR_func eglDestroyImageKHR = NULL;
 #ifndef GL_RED
 #define GL_RED 0x1903
 #endif
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+#ifndef DRM_FORMAT_YUV420
+#define DRM_FORMAT_YUV420 0x32315559  // YU12
+#endif
 
 typedef struct {
     uint8_t *y_temp_buffer;
@@ -153,8 +161,21 @@ static void allocate_yuv_buffers(int needed_size) {
         g_yuv_buffers.y_temp_buffer = malloc(alloc_size);
         g_yuv_buffers.u_temp_buffer = malloc(alloc_size / 4);  // U/V are half size
         g_yuv_buffers.v_temp_buffer = malloc(alloc_size / 4);
-        g_yuv_buffers.allocated_size = alloc_size;
         
+        // Check for allocation failures (critical for production)
+        if (!g_yuv_buffers.y_temp_buffer || !g_yuv_buffers.u_temp_buffer || !g_yuv_buffers.v_temp_buffer) {
+            fprintf(stderr, "[GL] CRITICAL: Failed to allocate YUV temp buffers (%d bytes)\n", alloc_size);
+            free(g_yuv_buffers.y_temp_buffer);
+            free(g_yuv_buffers.u_temp_buffer);
+            free(g_yuv_buffers.v_temp_buffer);
+            g_yuv_buffers.y_temp_buffer = NULL;
+            g_yuv_buffers.u_temp_buffer = NULL;
+            g_yuv_buffers.v_temp_buffer = NULL;
+            g_yuv_buffers.allocated_size = 0;
+            return;  // Return without updating allocated_size to trigger fallback
+        }
+        
+        g_yuv_buffers.allocated_size = alloc_size;
         if (g_yuv_buffers.y_temp_buffer && g_yuv_buffers.u_temp_buffer && g_yuv_buffers.v_temp_buffer) {
             // printf("DEBUG: Pre-allocated YUV buffers: Y=%p U=%p V=%p (size %d)\n",
             //        g_yuv_buffers.y_temp_buffer, g_yuv_buffers.u_temp_buffer, g_yuv_buffers.v_temp_buffer, alloc_size);
@@ -207,6 +228,29 @@ static bool upload_plane_with_pbo(gl_context_t *gl, int plane, const uint8_t *sr
     size_t total_bytes = row_bytes * (size_t)height;
     if (total_bytes == 0) {
         return false;
+    }
+
+    // Wait for fence if this PBO set is still in use by GPU
+    // Use non-blocking check to avoid stalling the CPU
+    if (gl->pbo_fences[gl->pbo_index]) {
+        GLenum result = glClientWaitSync(gl->pbo_fences[gl->pbo_index], 
+                                         0,  // flags: non-blocking check
+                                         0); // 0 timeout = non-blocking
+        if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
+            // GPU is done with this PBO, safe to reuse
+            glDeleteSync(gl->pbo_fences[gl->pbo_index]);
+            gl->pbo_fences[gl->pbo_index] = 0;
+        } else if (result == GL_TIMEOUT_EXPIRED) {
+            // GPU still using this PBO - this is normal with double-buffering
+            // The GL_MAP_UNSYNCHRONIZED_BIT below allows us to proceed anyway
+        } else {
+            // GL_WAIT_FAILED - something went wrong
+            if (!gl->pbo_warned) {
+                fprintf(stderr, "[PBO] Warning: fence wait failed, falling back to direct upload\\n");
+                gl->pbo_warned = true;
+            }
+            return false;
+        }
     }
 
     if (!ensure_pbo_capacity(gl, plane, total_bytes)) {
@@ -335,13 +379,43 @@ const char *corner_vertex_shader_source =
     "    v_color = a_color;\n"
     "}\n";
 
-const char *corner_fragment_shader_source = 
+const char *corner_fragment_shader_source =
     "#version 310 es\n"
     "precision mediump float;\n"  // OPTIMIZED: mediump for overlay colors
     "in vec4 v_color;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
     "    fragColor = v_color;\n"
+    "}\n";
+
+// External texture shader for zero-copy YUV EGLImage import
+// Uses GL_OES_EGL_image_external extension with samplerExternalOES
+// Note: ESSL 1.00 required for samplerExternalOES (not ESSL 3.x)
+static const char *external_vertex_shader_source =
+    "#version 100\n"
+    "precision highp float;\n"
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_texcoord;\n"
+    "uniform mat4 u_mvp_matrix;\n"
+    "uniform mat4 u_keystone_matrix;\n"
+    "uniform float u_flip_y;\n"
+    "varying vec2 v_texcoord;\n"
+    "void main() {\n"
+    "    vec4 pos = vec4(a_position, 0.0, 1.0);\n"
+    "    pos = u_keystone_matrix * pos;\n"
+    "    gl_Position = u_mvp_matrix * pos;\n"
+    "    v_texcoord = vec2(a_texcoord.x, u_flip_y > 0.5 ? 1.0 - a_texcoord.y : a_texcoord.y);\n"
+    "}\n";
+
+static const char *external_fragment_shader_source =
+    "#version 100\n"
+    "#extension GL_OES_EGL_image_external : require\n"
+    "precision highp float;\n"
+    "uniform samplerExternalOES u_texture_external;\n"
+    "varying vec2 v_texcoord;\n"
+    "void main() {\n"
+    "    // Sample from external YUV texture - driver does YUV->RGB conversion\n"
+    "    gl_FragColor = texture2D(u_texture_external, v_texcoord);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *source) {
@@ -447,6 +521,72 @@ static int create_corner_program(gl_context_t *gl) {
     // Clean up shaders (they're linked into the program now)
     glDeleteShader(corner_vertex_shader);
     glDeleteShader(corner_fragment_shader);
+
+    return 0;
+}
+
+static int create_external_program(gl_context_t *gl) {
+    // Check for GL_OES_EGL_image_external extension
+    const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+    if (!extensions || !strstr(extensions, "GL_OES_EGL_image_external")) {
+        printf("[GL] GL_OES_EGL_image_external not supported - external texture disabled\n");
+        gl->supports_external_texture = false;
+        return 0;  // Not an error, just not supported
+    }
+
+    GLuint ext_vertex_shader = compile_shader(GL_VERTEX_SHADER, external_vertex_shader_source);
+    if (!ext_vertex_shader) {
+        fprintf(stderr, "[GL] Failed to compile external vertex shader\n");
+        gl->supports_external_texture = false;
+        return 0;
+    }
+
+    GLuint ext_fragment_shader = compile_shader(GL_FRAGMENT_SHADER, external_fragment_shader_source);
+    if (!ext_fragment_shader) {
+        fprintf(stderr, "[GL] Failed to compile external fragment shader\n");
+        glDeleteShader(ext_vertex_shader);
+        gl->supports_external_texture = false;
+        return 0;
+    }
+
+    gl->external_program = glCreateProgram();
+    glAttachShader(gl->external_program, ext_vertex_shader);
+    glAttachShader(gl->external_program, ext_fragment_shader);
+    glLinkProgram(gl->external_program);
+
+    GLint linked;
+    glGetProgramiv(gl->external_program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint length;
+        glGetProgramiv(gl->external_program, GL_INFO_LOG_LENGTH, &length);
+        char *log = malloc(length);
+        glGetProgramInfoLog(gl->external_program, length, NULL, log);
+        fprintf(stderr, "[GL] External program linking failed: %s\n", log);
+        free(log);
+        glDeleteProgram(gl->external_program);
+        glDeleteShader(ext_vertex_shader);
+        glDeleteShader(ext_fragment_shader);
+        gl->external_program = 0;
+        gl->supports_external_texture = false;
+        return 0;
+    }
+
+    // Get uniform locations
+    gl->ext_u_mvp_matrix = glGetUniformLocation(gl->external_program, "u_mvp_matrix");
+    gl->ext_u_keystone_matrix = glGetUniformLocation(gl->external_program, "u_keystone_matrix");
+    gl->ext_u_flip_y = glGetUniformLocation(gl->external_program, "u_flip_y");
+    gl->ext_u_texture_external = glGetUniformLocation(gl->external_program, "u_texture_external");
+
+    // Clean up shaders
+    glDeleteShader(ext_vertex_shader);
+    glDeleteShader(ext_fragment_shader);
+
+    // Create external textures
+    glGenTextures(1, &gl->texture_external);
+    glGenTextures(1, &gl->texture_external2);
+
+    gl->supports_external_texture = true;
+    printf("[GL] External texture program created (GL_OES_EGL_image_external)\n");
 
     return 0;
 }
@@ -579,19 +719,28 @@ int gl_init(gl_context_t *gl, display_ctx_t *drm) {
         return -1;
     }
 
+    // Create external texture program (for zero-copy YUV import)
+    create_external_program(gl);  // Non-fatal if unsupported
+
     // Initialize PBOs for async texture uploads (double-buffered per plane)
     // DISABLED BY DEFAULT: Use only if PICKLE_ENABLE_PBO=1 (profiling builds)
     memset(gl->pbo, 0, sizeof(gl->pbo));
     memset(gl->pbo_size, 0, sizeof(gl->pbo_size));
     gl->pbo_index = 0;
     gl->pbo_warned = false;
+    for (int i = 0; i < PBO_RING_COUNT; i++) {
+        gl->pbo_fences[i] = 0;
+    }
+    // PRODUCTION: PBOs disabled by default due to flickering issues with fence synchronization
+    // Enable with PICKLE_ENABLE_PBO=1 for testing (requires more work on sync)
     const char *enable_pbo = getenv("PICKLE_ENABLE_PBO");
-    gl->use_pbo = (enable_pbo && enable_pbo[0] == '1');
+    gl->use_pbo = (enable_pbo && enable_pbo[0] == '1');  // Default: disabled
     if (gl->use_pbo) {
         glGenBuffers(PBO_RING_COUNT * 3, &gl->pbo[0][0]);
-        printf("[Render] PBO staging enabled (PICKLE_ENABLE_PBO=1)\n");
+        printf("[Render] PBO async uploads enabled (PICKLE_ENABLE_PBO=1)\n");
+    } else {
+        printf("[Render] Using direct glTexSubImage2D uploads (stable baseline)\n");
     }
-    printf("[Render] Using direct glTexSubImage2D uploads (simple baseline)\n");
 
     // OpenGL ES initialization complete
     return 0;
@@ -737,6 +886,12 @@ void gl_setup_buffers(gl_context_t *gl) {
 // Helper function to upload NV12 data to GPU
 void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height, int stride,
                     display_ctx_t *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render NV12 - EGL context lost\n");
+        return;
+    }
+    
     static int frame_rendered[2] = {0, 0};
     static int last_width[2] = {0, 0};
     static int last_height[2] = {0, 0};
@@ -858,11 +1013,19 @@ void gl_render_nv12(gl_context_t *gl, uint8_t *nv12_data, int width, int height,
         last_height[video_index] = height;
         frame_rendered[video_index]++;
         if (gl->use_pbo && pbo_uploaded) {
+            // Create fence for the current PBO set
+            if (gl->pbo_fences[gl->pbo_index]) {
+                glDeleteSync(gl->pbo_fences[gl->pbo_index]);
+            }
+            gl->pbo_fences[gl->pbo_index] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
             gl->pbo_index = (gl->pbo_index + 1) % PBO_RING_COUNT;
         }
     }
 
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    if (frame_rendered[video_index] > 0) {
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    }
 }
 
 void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t *v_data, 
@@ -903,38 +1066,32 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         gl_state_set = true;
     }
     
-    // CRITICAL: Only do full state setup once per frame (for video_index 0)
-    // For video_index > 0, just update textures and keystone matrix
-    if (video_index == 0) {
-        // Complete buffer unbinding before state restoration
-        // This is needed to prevent state leakage from previous operations
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-        glUseProgram(0);
-        
-        // Reset vertex attribute arrays
-        glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
-        
-        // Now set up the correct state for video rendering
-        glUseProgram(gl->program);
-        glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
-        
-        // Position attribute
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-        glEnableVertexAttribArray(0);
-        
-        // Texture coordinate attribute
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-        glEnableVertexAttribArray(1);
+    // CRITICAL: Always set up shader program - external_program may have been used by video 1 HW decode
+    // This ensures gl_render_frame uses the correct program regardless of what rendered before it
+    glUseProgram(gl->program);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
 
-        // Explicitly disable blending - overlays might have enabled it
-        glDisable(GL_BLEND);
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
 
-        // Disable depth test - make sure video is always visible
-        glDisable(GL_DEPTH_TEST);
-    }
+    // Texture coordinate attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Explicitly disable blending - overlays might have enabled it
+    glDisable(GL_BLEND);
+
+    // Disable depth test - make sure video is always visible
+    glDisable(GL_DEPTH_TEST);
+
+    // CRITICAL: Unbind any external textures that may have been bound by HW decode path
+    // This prevents GL_TEXTURE_EXTERNAL_OES from interfering with GL_TEXTURE_2D
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
 
     // Set MVP matrix with aspect ratio preservation (recalculate for each video!)
     // This is OUTSIDE the video_index==0 block so each video gets its own aspect ratio
@@ -1089,6 +1246,12 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         
         frame_rendered[video_index]++;
         if (gl->use_pbo && pbo_uploaded) {
+            // Create fence for the current PBO set to track when GPU is done reading
+            if (gl->pbo_fences[gl->pbo_index]) {
+                glDeleteSync(gl->pbo_fences[gl->pbo_index]);
+            }
+            gl->pbo_fences[gl->pbo_index] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
             gl->pbo_index = (gl->pbo_index + 1) % PBO_RING_COUNT;
         }
     } else if (frame_rendered[video_index] == 0) {
@@ -1103,8 +1266,10 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
     struct timespec draw_start, draw_end;
     clock_gettime(CLOCK_MONOTONIC, &draw_start);
     
-    // Draw quad
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    // Draw quad only if we have valid texture data
+    if (frame_rendered[video_index] > 0) {
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    }
     
     clock_gettime(CLOCK_MONOTONIC, &draw_end);
     double draw_time = (draw_end.tv_sec - draw_start.tv_sec) + (draw_end.tv_nsec - draw_start.tv_nsec) / 1e9;
@@ -1220,17 +1385,17 @@ void gl_render_corners(gl_context_t *gl, keystone_context_t *keystone) {
     float corner_colors[4][4];
     for (int i = 0; i < 4; i++) {
         if (keystone->selected_corner == i) {
-            // Bright green for selected
+            // Bright green for selected - semi-transparent to show border
             corner_colors[i][0] = 0.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 0.0f;
-            corner_colors[i][3] = 1.0f;
+            corner_colors[i][3] = 0.5f;  // 50% opacity for selected
         } else {
-            // White with subtle transparency for unselected (more elegant)
+            // White with transparency for unselected - allow border to show through
             corner_colors[i][0] = 1.0f;
             corner_colors[i][1] = 1.0f;
             corner_colors[i][2] = 1.0f;
-            corner_colors[i][3] = 0.7f;
+            corner_colors[i][3] = 0.3f;  // 30% opacity for unselected
         }
     }
     
@@ -1442,7 +1607,110 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     // NOTE: Don't unbind buffers here - video_player.c handles complete state restoration
 }
 
-// Complete 5x7 bitmap font data - each byte represents one row, 5 bits used
+// Render display boundary (red rectangle showing max projector/display area)
+void gl_render_display_boundary(gl_context_t *gl, keystone_context_t *keystone) {
+    if (!keystone || !keystone->show_border) {
+        return; // Don't render boundary if border not visible
+    }
+    
+    // Enable blending for transparent overlay
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Disable depth testing to ensure overlay is always visible
+    glDisable(GL_DEPTH_TEST);
+    
+    // Create boundary line vertices - rectangle covering full display
+    // Normalized coordinates: (-1, -1) to (1, 1)
+    // Each vertex: x, y, r, g, b, a (6 floats per vertex)
+    float boundary_vertices[48]; // 8 vertices * 6 floats = 48 floats
+    
+    // Red color for boundary
+    float r = 1.0f, g = 0.0f, b = 0.0f, a = 0.8f;  // 80% opaque red
+    
+    // Line 1: Top edge (left to right)
+    boundary_vertices[0] = -1.0f;   // top-left x
+    boundary_vertices[1] = 1.0f;    // top-left y
+    boundary_vertices[2] = r; boundary_vertices[3] = g; boundary_vertices[4] = b; boundary_vertices[5] = a;
+    
+    boundary_vertices[6] = 1.0f;    // top-right x
+    boundary_vertices[7] = 1.0f;    // top-right y
+    boundary_vertices[8] = r; boundary_vertices[9] = g; boundary_vertices[10] = b; boundary_vertices[11] = a;
+    
+    // Line 2: Right edge (top to bottom)
+    boundary_vertices[12] = 1.0f;   // top-right x
+    boundary_vertices[13] = 1.0f;   // top-right y
+    boundary_vertices[14] = r; boundary_vertices[15] = g; boundary_vertices[16] = b; boundary_vertices[17] = a;
+    
+    boundary_vertices[18] = 1.0f;   // bottom-right x
+    boundary_vertices[19] = -1.0f;  // bottom-right y
+    boundary_vertices[20] = r; boundary_vertices[21] = g; boundary_vertices[22] = b; boundary_vertices[23] = a;
+    
+    // Line 3: Bottom edge (right to left)
+    boundary_vertices[24] = 1.0f;   // bottom-right x
+    boundary_vertices[25] = -1.0f;  // bottom-right y
+    boundary_vertices[26] = r; boundary_vertices[27] = g; boundary_vertices[28] = b; boundary_vertices[29] = a;
+    
+    boundary_vertices[30] = -1.0f;  // bottom-left x
+    boundary_vertices[31] = -1.0f;  // bottom-left y
+    boundary_vertices[32] = r; boundary_vertices[33] = g; boundary_vertices[34] = b; boundary_vertices[35] = a;
+    
+    // Line 4: Left edge (bottom to top)
+    boundary_vertices[36] = -1.0f;  // bottom-left x
+    boundary_vertices[37] = -1.0f;  // bottom-left y
+    boundary_vertices[38] = r; boundary_vertices[39] = g; boundary_vertices[40] = b; boundary_vertices[41] = a;
+    
+    boundary_vertices[42] = -1.0f;  // top-left x
+    boundary_vertices[43] = 1.0f;   // top-left y
+    boundary_vertices[44] = r; boundary_vertices[45] = g; boundary_vertices[46] = b; boundary_vertices[47] = a;
+    
+    // Create temporary VBO for boundary if needed
+    static GLuint boundary_vbo = 0;
+    if (boundary_vbo == 0) {
+        glGenBuffers(1, &boundary_vbo);
+    }
+    
+    // Update boundary VBO
+    glBindBuffer(GL_ARRAY_BUFFER, boundary_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(boundary_vertices), boundary_vertices, GL_DYNAMIC_DRAW);
+    
+    // Use corner shader program
+    glUseProgram(gl->corner_program);
+    
+    // Set up vertex attributes (interleaved position + color)
+    int stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl->corner_a_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(gl->corner_a_position);
+    
+    // Color attribute at location 1
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    // Set identity matrix for MVP
+    float identity[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    };
+    glUniformMatrix4fv(gl->corner_u_mvp_matrix, 1, GL_FALSE, identity);
+    
+    // Set line width - thinner than keystone border for clarity
+    glLineWidth(1.5f);
+    
+    // Draw boundary as 4 lines (8 vertices)
+    glDrawArrays(GL_LINES, 0, 8);
+    
+    // Reset line width
+    glLineWidth(1.0f);
+    
+    glDisableVertexAttribArray(gl->corner_a_position);
+    glDisableVertexAttribArray(1);
+    
+    // Disable blending and restore depth testing
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+}
 static const unsigned char font_5x7[128][7] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     ['!'] = {0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00},
@@ -2214,6 +2482,12 @@ void gl_render_wifi_overlay(gl_context_t *gl, wifi_manager_t *mgr) {
 void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
                         int plane_offsets[3], int plane_pitches[3],
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render DMA - EGL context lost\n");
+        return;
+    }
+    
     if (!gl || dma_fd < 0) {
         fprintf(stderr, "[DMA] Invalid arguments (gl=%p, fd=%d)\n", (void*)gl, dma_fd);
         return;
@@ -2485,6 +2759,136 @@ cleanup_dma:
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+// Multi-plane YUV EGLImage rendering with external texture (zero-copy)
+// Imports DRM_PRIME buffer as single multi-plane EGLImage and renders via samplerExternalOES
+void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
+                              int plane_offsets[3], int plane_pitches[3],
+                              struct display_ctx *drm, keystone_context_t *keystone,
+                              bool clear_screen, int video_index) {
+    // PRODUCTION: Validate EGL context before rendering
+    if (!validate_egl_context()) {
+        fprintf(stderr, "ERROR: Cannot render external - EGL context lost\n");
+        return;
+    }
+    
+    if (!gl || dma_fd < 0 || !gl->supports_external_texture || !gl->external_program) {
+        return;
+    }
+
+    // Select texture and texture unit based on video index
+    // CRITICAL: Each video must use its own texture unit to prevent cross-contamination
+    GLuint tex_external = (video_index == 0) ? gl->texture_external : gl->texture_external2;
+    GLenum texture_unit = (video_index == 0) ? GL_TEXTURE0 : GL_TEXTURE1;
+    GLint sampler_unit = (video_index == 0) ? 0 : 1;
+
+    // Set up rendering state
+    glViewport(0, 0, drm->mode.hdisplay, drm->mode.vdisplay);
+    if (clear_screen && video_index == 0) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+
+    // Use external shader program
+    glUseProgram(gl->external_program);
+
+    // Set up vertex attributes (using existing VBO)
+    glBindBuffer(GL_ARRAY_BUFFER, gl->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl->ebo);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+
+    // Set MVP matrix with aspect ratio preservation
+    float mvp_matrix[16];
+    calculate_aspect_ratio_matrix(mvp_matrix, width, height, drm->mode.hdisplay, drm->mode.vdisplay);
+    glUniformMatrix4fv(gl->ext_u_mvp_matrix, 1, GL_FALSE, mvp_matrix);
+
+    // Set keystone matrix
+    const float *keystone_matrix = keystone_get_matrix(keystone);
+    glUniformMatrix4fv(gl->ext_u_keystone_matrix, 1, GL_FALSE, keystone_matrix);
+
+    // Flip Y coordinate for video
+    glUniform1f(gl->ext_u_flip_y, 1.0f);
+
+    // Create multi-plane YUV EGLImage using DRM_FORMAT_YUV420
+    // All three planes share the same DMA FD with different offsets
+    EGLint attribs[] = {
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_YUV420,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, plane_offsets[0],
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, plane_pitches[0],
+        EGL_DMA_BUF_PLANE1_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT, plane_offsets[1],
+        EGL_DMA_BUF_PLANE1_PITCH_EXT, plane_pitches[1],
+        EGL_DMA_BUF_PLANE2_FD_EXT, dma_fd,
+        EGL_DMA_BUF_PLANE2_OFFSET_EXT, plane_offsets[2],
+        EGL_DMA_BUF_PLANE2_PITCH_EXT, plane_pitches[2],
+        EGL_NONE
+    };
+
+    EGLImage yuv_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
+                                           EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
+    EGLint egl_err = eglGetError();
+    if (yuv_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
+        static int err_count = 0;
+        if (err_count < 3) {
+            fprintf(stderr, "[EXT] Multi-plane YUV EGLImage import failed: 0x%x\n", egl_err);
+            err_count++;
+        }
+        return;
+    }
+
+    // Bind to GL_TEXTURE_EXTERNAL_OES using video-specific texture unit
+    glActiveTexture(texture_unit);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex_external);
+    if (glEGLImageTargetTexture2DOES) {
+        (*glEGLImageTargetTexture2DOES)(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)yuv_image);
+        // Clear any GL error - some drivers report spurious errors on first few frames
+        glGetError();
+    }
+
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Set sampler uniform to the video-specific texture unit
+    glUniform1i(gl->ext_u_texture_external, sampler_unit);
+
+    // Draw
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    // Store EGLImage for deferred destruction
+    // We keep track of the previous frame's EGLImage and destroy it when creating a new one
+    // This ensures the GPU has finished using the image before we destroy it
+    static EGLImage prev_image[2] = {EGL_NO_IMAGE, EGL_NO_IMAGE};
+    static pthread_mutex_t prev_image_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    // Thread-safe EGLImage destruction (protect against concurrent dual-video rendering)
+    pthread_mutex_lock(&prev_image_mutex);
+    // Destroy the PREVIOUS frame's image (GPU is done with it by now)
+    if (prev_image[video_index] != EGL_NO_IMAGE && eglDestroyImageKHR) {
+        (*eglDestroyImageKHR)(gl->egl_display, prev_image[video_index]);
+    }
+    // Store current image for destruction next frame
+    prev_image[video_index] = yuv_image;
+    pthread_mutex_unlock(&prev_image_mutex);
+
+    // Log first successful render
+    static bool logged = false;
+    if (!logged) {
+        printf("[EXT] Zero-copy YUV420 render via external texture\n");
+        logged = true;
+    }
+}
+
 void gl_cleanup(gl_context_t *gl) {
     // Clean up YUV textures (video 1)
     if (gl->texture_y) glDeleteTextures(1, &gl->texture_y);
@@ -2504,6 +2908,14 @@ void gl_cleanup(gl_context_t *gl) {
         glDeleteBuffers(PBO_RING_COUNT * 3, &gl->pbo[0][0]);
     }
     
+    // Clean up PBO fences
+    for (int i = 0; i < PBO_RING_COUNT; i++) {
+        if (gl->pbo_fences[i]) {
+            glDeleteSync(gl->pbo_fences[i]);
+            gl->pbo_fences[i] = 0;
+        }
+    }
+    
     if (gl->vbo) glDeleteBuffers(1, &gl->vbo);
     if (gl->ebo) glDeleteBuffers(1, &gl->ebo);
     if (gl->corner_vbo) glDeleteBuffers(1, &gl->corner_vbo);
@@ -2511,9 +2923,14 @@ void gl_cleanup(gl_context_t *gl) {
     if (gl->help_vbo) glDeleteBuffers(1, &gl->help_vbo);
     if (gl->program) glDeleteProgram(gl->program);
     if (gl->corner_program) glDeleteProgram(gl->corner_program);
+    if (gl->external_program) glDeleteProgram(gl->external_program);
     if (gl->vertex_shader) glDeleteShader(gl->vertex_shader);
     if (gl->fragment_shader) glDeleteShader(gl->fragment_shader);
-    
+
+    // Clean up external textures
+    if (gl->texture_external) glDeleteTextures(1, &gl->texture_external);
+    if (gl->texture_external2) glDeleteTextures(1, &gl->texture_external2);
+
     // Clean up pre-allocated YUV buffers
     free_yuv_buffers();
     

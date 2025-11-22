@@ -265,6 +265,14 @@ void async_decode_destroy(async_decode_t *decoder) {
         decoder->running = false;
     }
 
+    // PRODUCTION: Ensure mutex is unlocked before destroy (prevent EBUSY deadlock)
+    int trylock_result = pthread_mutex_trylock(&decoder->mutex);
+    if (trylock_result == 0) {
+        pthread_mutex_unlock(&decoder->mutex);
+    } else if (trylock_result == EBUSY) {
+        fprintf(stderr, "[ASYNC] Warning: Mutex still locked during cleanup\n");
+    }
+    
     // Safe cleanup of synchronization primitives
     int mutex_result = pthread_mutex_destroy(&decoder->mutex);
     if (mutex_result != 0 && mutex_result != EINVAL) {
@@ -433,7 +441,17 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         app_cleanup(app);
         return -1;
     }
-    
+
+    // Enable pure hardware path if external texture is supported (multi-plane YUV EGLImage)
+    // This uses GL_OES_EGL_image_external for true zero-copy rendering
+    if (app->video->use_hardware_decode && app->gl->supports_external_texture) {
+        app->video->skip_sw_transfer = true;
+        printf("[ZERO-COPY] Pure hardware path enabled (external texture)\n");
+    } else if (app->video->use_hardware_decode) {
+        app->video->skip_sw_transfer = false;  // Fallback to CPU transfer
+        printf("[HW_DECODE] Using hardware decode with CPU transfer (V4L2 M2M)\n");
+    }
+
     // Validate video dimensions after decoder opens file
     if (app->video->width > MAX_VIDEO_WIDTH || app->video->height > MAX_VIDEO_HEIGHT) {
         fprintf(stderr, "Error: Video dimensions %dx%d exceed limits (%dx%d max)\n",
@@ -474,32 +492,35 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     }
 
     // Initialize second video decoder if provided
+    // HYBRID MODE: Video 2 always uses SOFTWARE decode to avoid V4L2 M2M contention
+    // Pi 4 has single HW decoder - running two HW streams causes poor performance
+    // Video 1 gets HW decode (if --hw), Video 2 uses SW decode (parallel on CPU)
     if (video_file2) {
-        if (video_init(app->video2, video_file2, app->advanced_diagnostics, enable_hardware_decode) != 0) {
+        bool video2_hw_decode = false;  // Always software decode for video 2
+        if (enable_hardware_decode) {
+            printf("[HYBRID] Video 2 forced to software decode (V4L2 M2M is single-stream)\n");
+        }
+
+        if (video_init(app->video2, video_file2, app->advanced_diagnostics, video2_hw_decode) != 0) {
             fprintf(stderr, "Failed to initialize second video decoder\n");
             app_cleanup(app);
             return -1;
         }
-        
+
         if (app->video2->width > MAX_VIDEO_WIDTH || app->video2->height > MAX_VIDEO_HEIGHT) {
             fprintf(stderr, "Error: Video 2 dimensions %dx%d exceed limits (%dx%d max)\n",
                     app->video2->width, app->video2->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
             app_cleanup(app);
             return -1;
         }
-        
+
         printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
         video_set_loop(app->video2, loop_playback);
 
-        if (!app->video2->use_hardware_decode) {
-            app->async_decoder_secondary = async_decode_create(app->video2);
-            if (!app->async_decoder_secondary) {
-                fprintf(stderr, "Failed to create async decoder for video 2\n");
-                app_cleanup(app);
-                return -1;
-            }
-            printf("Async decoder created for video 2 (software path)\n");
-        }
+        // Video 2 uses SYNCHRONOUS software decode for stability
+        // Async decode caused flickering due to timing/buffer issues
+        app->async_decoder_secondary = NULL;
+        printf("Video 2 using synchronous software decode\n");
     }
 
     // Initialize keystone correction
@@ -697,8 +718,6 @@ void app_run(app_context_t *app) {
     bool first_decode_attempted = false;
     bool primary_async_requested = false;
     bool primary_async_request_pending = false;
-    bool secondary_async_requested = false;
-    bool secondary_async_request_pending = false;
     
     while (app->running && !g_quit_requested) {
         clock_gettime(CLOCK_MONOTONIC, &current_time);
@@ -1042,12 +1061,24 @@ void app_run(app_context_t *app) {
                 }
 
                 if (async_decode_wait_frame(app->async_decoder_primary, wait_timeout_ms)) {
-                    uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
-                    int y_stride = 0, u_stride = 0, v_stride = 0;
-                    video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                    // Check for new frame: either YUV data (SW/fallback) or DMA buffer (pure HW)
+                    bool frame_available = false;
 
-                    if (y_data != NULL) {
-                        video_data = y_data;
+                    if (app->video->skip_sw_transfer && video_has_dma_buffer(app->video)) {
+                        // Pure hardware path: DMA buffer is the frame
+                        frame_available = true;
+                    } else {
+                        // Software/fallback path: check YUV data
+                        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+                        int y_stride = 0, u_stride = 0, v_stride = 0;
+                        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+                        if (y_data != NULL) {
+                            video_data = y_data;
+                            frame_available = true;
+                        }
+                    }
+
+                    if (frame_available) {
                         last_video_data = video_data;
                         frame_count++;
                         new_primary_frame_ready = true;
@@ -1203,70 +1234,28 @@ void app_run(app_context_t *app) {
         } // End of main decode/render block
 
         // Decode second video if available
-        // Hardware decode: SYNCHRONOUS (both decoders in main thread - no competition)
-        // Software decode: ASYNC (CPU is slow, need background thread)
+        // SYNCHRONOUS software decode for stability (async caused flickering)
         if (app->video2) {
-            struct timespec decode_start2, decode_end2;
-            
-            if (app->video2->use_hardware_decode) {
-                // HARDWARE: Synchronous decode works better (no thread competition)
-                clock_gettime(CLOCK_MONOTONIC, &decode_start2);
-                int decode_result2 = video_decode_frame(app->video2);
-                clock_gettime(CLOCK_MONOTONIC, &decode_end2);
-                decode1_time = (decode_end2.tv_sec - decode_start2.tv_sec) +
-                              (decode_end2.tv_nsec - decode_start2.tv_nsec) / 1e9;
-                if (decode_result2 == 0) {
+            int decode_result = video_decode_frame(app->video2);
+
+            if (decode_result == 0) {
+                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                   &y_stride2, &u_stride2, &v_stride2);
+
+                if (y_data2 != NULL) {
                     frame_count2++;
-                    new_secondary_frame_ready = true;
-                    if (frame_count2 == 1) {
-                        printf("First frame of video 2 decoded successfully (HW sync)\n");
+                    if (!first_frame_decoded2) {
+                        printf("First frame of video 2 decoded successfully (SW sync)\n");
                         first_frame_decoded2 = true;
                         fflush(stdout);
                     }
+                    new_secondary_frame_ready = true;
                 }
-
-                if (video_is_eof(app->video2)) {
-                    if (app->loop_playback) {
-                        video_seek(app->video2, 0);
-                        first_frame_decoded2 = false;
-                        frame_count2 = 0;
-                    }
-                }
-            } else if (app->async_decoder_secondary) {
-                // SOFTWARE: Async decode (CPU is slow, need background thread)
-                int wait_timeout_ms2 = first_frame_decoded2 ? 0 : 100;
-
-                if (!secondary_async_requested) {
-                    async_decode_request_frame(app->async_decoder_secondary);
-                    secondary_async_requested = true;
-                }
-
-                if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms2)) {
-                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
-                                       &y_stride2, &u_stride2, &v_stride2);
-
-                    if (y_data2 != NULL) {
-                        frame_count2++;
-                        if (!first_frame_decoded2) {
-                            printf("First frame of video 2 decoded successfully (SW async)\n");
-                            first_frame_decoded2 = true;
-                            fflush(stdout);
-                        }
-                        new_secondary_frame_ready = true;
-                    }
-
-                    secondary_async_requested = false;
-                    secondary_async_request_pending = !video_is_eof(app->video2);
-                }
-
-                if (video_is_eof(app->video2)) {
-                    if (app->loop_playback) {
-                        video_seek(app->video2, 0);
-                        first_frame_decoded2 = false;
-                        frame_count2 = 0;
-                        secondary_async_requested = false;
-                        secondary_async_request_pending = false;
-                    }
+            } else if (video_is_eof(app->video2)) {
+                if (app->loop_playback) {
+                    video_seek(app->video2, 0);
+                    first_frame_decoded2 = false;
+                    frame_count2 = 0;
                 }
             }
         }
@@ -1287,18 +1276,11 @@ void app_run(app_context_t *app) {
             video_height = 256;
         }
         
-        // Get YUV data for GPU rendering
-        uint8_t *y_data, *u_data, *v_data;
-        int y_stride, u_stride, v_stride;
-        video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-        
-        // PRODUCTION: Removed noisy YUV pointer debug output
-        // Only log if NULL (actual error condition)
-        static bool null_warned = false;
-        if (!y_data && !null_warned) {
-            printf("Warning: NULL YUV data pointer\n");
-            null_warned = true;
-            fflush(stdout);
+        // Get YUV data for GPU rendering (only needed for SW decode path)
+        uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
+        int y_stride = 0, u_stride = 0, v_stride = 0;
+        if (!app->video->skip_sw_transfer) {
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
         }
         
         // CRITICAL: Start render timing RIGHT BEFORE actual GL operations
@@ -1329,121 +1311,99 @@ void app_run(app_context_t *app) {
         }
 
         // Check if DMA buffer is available for zero-copy rendering
-        // Try KMS direct scanout first, then fall back to OpenGL if not available
         bool has_dma = video_has_dma_buffer(app->video);
-        bool used_kms_overlay = false;  // Track if we used KMS path (no GL work needed)
-        bool need_opengl_for_overlays = (any_overlay_visible || any_overlay_visible2);
-        
-        // PRODUCTION FIX: Always use CPU/OpenGL path for hardware decode
-        // KMS overlay plane cannot apply keystone correction (no transformation matrix)
-        // Keystone correction is a core feature, so we must use OpenGL rendering
-        // This means hardware decoded frames are uploaded to GPU textures via CPU
-        if (false && has_dma && app->drm->video_plane_available && !need_opengl_for_overlays) {
-            // KMS DIRECT SCANOUT PATH - DISABLED for keystone support
-            // This path bypasses OpenGL and cannot apply keystone transformation
-            // Keeping code for reference, but disabled to ensure keystone always works
+        bool use_hw_decode = app->video->use_hardware_decode;
+
+        bool rendered = false;
+        struct timespec nv12_cpu_start = {0, 0}, nv12_cpu_end = {0, 0};
+        struct timespec gl_upload_start = {0, 0}, gl_upload_end = {0, 0};
+
+        // PURE HARDWARE PATH: Zero-copy via external texture (multi-plane YUV EGLImage)
+        // GPU imports DMA buffer directly - no CPU copy at all
+        if (has_dma && use_hw_decode && new_primary_frame_ready && app->gl->supports_external_texture) {
             int dma_fd = video_get_dma_fd(app->video);
             if (dma_fd >= 0) {
-                static bool kms_init_done = false;
-                if (!kms_init_done && frame_count == 1) {
-                    printf("[KMS] ✓ Using KMS overlay plane for zero-copy hardware video\n");
-                    kms_init_done = true;
+                static bool egl_dma_logged = false;
+                if (!egl_dma_logged) {
+                    printf("[Render] Using external texture zero-copy path (pure hardware)\n");
+                    egl_dma_logged = true;
                 }
 
-                // Get actual plane layout from hardware decoder
                 int plane_offsets[3] = {0, 0, 0};
                 int plane_pitches[3] = {0, 0, 0};
                 video_get_dma_plane_layout(app->video, plane_offsets, plane_pitches);
 
-                // Create framebuffer from DMA buffer
-                uint32_t fb_id = 0;
-                if (drm_create_video_fb(app->drm, dma_fd, video_width, video_height,
-                                       plane_offsets, plane_pitches, &fb_id) == 0) {
-                    // Display on overlay plane (hardware scanout, true zero-copy)
-                    // NOTE: drmModeSetPlane waits for vblank (~12-16ms on 60Hz display)
-                    // This is expected behavior for tear-free presentation
-                    drm_display_video_frame(app->drm, fb_id, 0, 0, video_width, video_height);
-                    used_kms_overlay = true;  // Successfully used KMS path
-                }
-
-                // Note: When using KMS overlay, video is on hardware plane
-                // OpenGL framebuffer will only be touched if overlays (borders/corners) are visible
-                // This is handled in the standard overlay rendering section below
-            }
-        } else {
-            // CPU RENDERING PATH (DMA currently broken on this hardware)
-            // Use simple direct glTexSubImage2D uploads for now
-            // Used only when: no DMA buffers available (software decode)
-            // PRODUCTION: Only log once on startup
-            static bool cpu_path_logged = false;
-            if (!cpu_path_logged) {
-                printf("[Render] Using CPU upload path (software decode)\n");
-                cpu_path_logged = true;
-            }
-
-            bool rendered = false;
-            struct timespec nv12_cpu_start = {0, 0}, nv12_cpu_end = {0, 0};
-            struct timespec gl_upload_start = {0, 0}, gl_upload_end = {0, 0};
-
-            // Split rendering path by decode type:
-            // HW decode → NV12 conversion + 2-plane upload
-            // SW decode → Direct YUV420P 3-plane upload (no conversion)
-            bool use_hw_decode = app->video->use_hardware_decode;
-
-            if (use_hw_decode && new_primary_frame_ready) {
-                // HW DECODE PATH: Convert to NV12 and upload 2 planes
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start);
-                }
-                uint8_t *nv12_data = video_get_nv12_data(app->video);
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end);
-                    nv12_frame_time[0] = timespec_diff_seconds(&nv12_cpu_start, &nv12_cpu_end);
-                }
-
-                if (nv12_data) {
-                    int nv12_stride = video_get_nv12_stride(app->video);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
-                    }
-                    gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride,
-                                   app->drm, app->keystone, true, 0);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
-                        upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
-                    }
-                    rendered = true;
-                }
-            } else if (!use_hw_decode && new_primary_frame_ready) {
-                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
-                video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
-                if (y_data && u_data && v_data) {
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
-                    }
-                    gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height, 
-                                  y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
-                        upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
-                    }
-                    rendered = true;
-                }
-            }
-
-            // Fallback: render black frame if no valid data
-            if (!rendered) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
                 }
-                gl_render_frame(app->gl, NULL, NULL, NULL, video_width, video_height, 
-                              0, 0, 0, app->drm, app->keystone, true, 0);
+                gl_render_frame_external(app->gl, dma_fd, video_width, video_height,
+                                        plane_offsets, plane_pitches,
+                                        app->drm, app->keystone, true, 0);
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
                     upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
                 }
+                rendered = true;
             }
         }
+
+        // SOFTWARE DECODE PATH: Direct YUV420P upload (no conversion)
+        if (!rendered && !use_hw_decode && new_primary_frame_ready) {
+            static bool sw_path_logged = false;
+            if (!sw_path_logged) {
+                printf("[Render] Using CPU upload path (software decode)\n");
+                sw_path_logged = true;
+            }
+
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+            if (y_data && u_data && v_data) {
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                }
+                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height,
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                    upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                }
+                rendered = true;
+            }
+        }
+
+        // FALLBACK: HW decode without DMA support - use CPU transfer path
+        if (!rendered && use_hw_decode && new_primary_frame_ready) {
+            static bool fallback_logged = false;
+            if (!fallback_logged) {
+                printf("[Render] Using CPU fallback path (HW decode, no EGL/DMA)\n");
+                fallback_logged = true;
+            }
+
+            if (app->show_timing) {
+                clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start);
+            }
+            uint8_t *nv12_data = video_get_nv12_data(app->video);
+            if (app->show_timing) {
+                clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end);
+                nv12_frame_time[0] = timespec_diff_seconds(&nv12_cpu_start, &nv12_cpu_end);
+            }
+
+            if (nv12_data) {
+                int nv12_stride = video_get_nv12_stride(app->video);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
+                }
+                gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride,
+                               app->drm, app->keystone, true, 0);
+                if (app->show_timing) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
+                    upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
+                }
+                rendered = true;
+            }
+        }
+
+        // When no new frame is ready, skip rendering - keep previous frame on screen
+        // Don't render black (causes flashing). Previous frame stays in GPU texture.
         
         // Issue deferred async decode request once we finish uploading the frame
         if (using_async_primary && primary_async_request_pending && !primary_async_requested) {
@@ -1458,7 +1418,6 @@ void app_run(app_context_t *app) {
             int video_width2 = app->video2->width;
             int video_height2 = app->video2->height;
             bool video2_rendered = false;
-            struct timespec nv12_cpu_start2 = {0, 0}, nv12_cpu_end2 = {0, 0};
             struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
 
         if (app->show_timing) {
@@ -1487,77 +1446,19 @@ void app_run(app_context_t *app) {
             }
         }
 
-            // Split rendering path by decode type:
-            // HW decode → NV12 conversion + 2-plane upload
-            // SW decode → Direct YUV420P 3-plane upload (no conversion)
-            bool use_hw_decode2 = app->video2->use_hardware_decode;
-
-            if (use_hw_decode2 && new_secondary_frame_ready) {
-                // HW DECODE PATH: Convert to NV12 and upload 2 planes
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start2);
-                }
-                uint8_t *nv12_data2 = video_get_nv12_data(app->video2);
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end2);
-                    nv12_frame_time[1] = timespec_diff_seconds(&nv12_cpu_start2, &nv12_cpu_end2);
-                }
-
-                if (nv12_data2) {
-                    int nv12_stride2 = video_get_nv12_stride(app->video2);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                    }
-                    gl_render_nv12(app->gl, nv12_data2, video_width2, video_height2, nv12_stride2,
-                                   app->drm, app->keystone2, false, 1);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
-                    }
-                    video2_rendered = true;
-                }
-            } else if (!use_hw_decode2 && new_secondary_frame_ready) {
-                // SW DECODE PATH: Direct YUV420P upload (no NV12 conversion)
-                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2, &y_stride2, &u_stride2, &v_stride2);
-                if (y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                    }
-                    gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
-                                  y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
-                    if (app->show_timing) {
-                        clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                        upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
-                    }
-                    video2_rendered = true;
-                }
-            }
-
-            // SAFETY: If video 2 failed to render, render black frame to prevent disappearing
-            if (!video2_rendered) {
-                static int black_frame_count = 0;
-                if (black_frame_count < 5) {
-                    fprintf(stderr, "[VIDEO2] No valid frame data, rendering black\n");
-                    black_frame_count++;
-                }
+            // SYNC DECODE: Video 2 always has fresh data when new_secondary_frame_ready is true
+            if (new_secondary_frame_ready && y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
                 }
-                gl_render_frame(app->gl, NULL, NULL, NULL, video_width2, video_height2,
-                              0, 0, 0, app->drm, app->keystone2, false, 1);
+                gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
+                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
                     upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
                 }
+                video2_rendered = true;
             }
-        }
-
-        if (app->video2 && app->async_decoder_secondary &&
-            !app->video2->use_hardware_decode &&
-            secondary_async_request_pending && !secondary_async_requested) {
-            async_decode_request_frame(app->async_decoder_secondary);
-            secondary_async_requested = true;
-            secondary_async_request_pending = false;
         }
         
         clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
@@ -1589,6 +1490,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
             if (app->keystone->show_border) {
                 gl_render_border(app->gl, app->keystone);
+                gl_render_display_boundary(app->gl, app->keystone);
             }
             if (app->keystone->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone);
@@ -1620,7 +1522,8 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Render overlays for second keystone
         // PRODUCTION FIX: Only render keystone2 overlays when video2 has valid frame data
         // This prevents flickering during initial startup before first frame is decoded
-        if (any_overlay_visible2 && y_data2) {
+        // NOTE: Use first_frame_decoded2 instead of y_data2 for HW decode (y_data2 is NULL in HW path)
+        if (any_overlay_visible2 && first_frame_decoded2) {
             // PRODUCTION FIX: Only deselect keystone2 if keystone1 is the active one
             // This ensures only the ACTIVE keystone's corner is highlighted
             int saved_selected_corner = -1;
@@ -1635,6 +1538,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
             if (app->keystone2->show_border) {
                 gl_render_border(app->gl, app->keystone2);
+                gl_render_display_boundary(app->gl, app->keystone2);
             }
             if (app->keystone2->show_help) {
                 gl_render_help_overlay(app->gl, app->keystone2);
@@ -1671,11 +1575,8 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         // Time buffer swapping
         clock_gettime(CLOCK_MONOTONIC, &swap_start);
 
-        // Only swap buffers if we rendered something in OpenGL
-        // When using KMS overlay without GL overlays, skip the swap (no vsync wait needed)
-        if (!used_kms_overlay || any_overlay_visible || any_overlay_visible2) {
-            gl_swap_buffers(app->gl, app->drm);
-        }
+        // Swap buffers to display the rendered frame
+        gl_swap_buffers(app->gl, app->drm);
 
         clock_gettime(CLOCK_MONOTONIC, &swap_end);
 

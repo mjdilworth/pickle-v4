@@ -789,9 +789,10 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             printf("[HW_DECODE] V4L2 output buffers will be accessed via VIDIOC_EXPBUF for zero-copy GPU mapping\n");
         }
     } else {
-        // Software decoding settings
-        video->codec_ctx->thread_count = 4;
-        video->codec_ctx->thread_type = FF_THREAD_FRAME;
+        // Software decoding settings - optimized for parallel decode
+        video->codec_ctx->thread_count = 0; // 0 = auto-detect CPU cores
+        video->codec_ctx->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
+        printf("[SW_DECODE] Multi-threaded decode enabled (auto CPU cores, slice+frame threading)\n");
         
         // Open codec
         if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
@@ -994,6 +995,11 @@ int video_decode_frame(video_context_t *video) {
                     // Duplicate the FD so we own it (FFmpeg may close the original)
                     // This FD can be passed directly to EGL for DMA-BUF import
                     int dup_fd = dup(new_dma_fd);
+                    if (dup_fd < 0) {
+                        fprintf(stderr, "[ZERO-COPY] Failed to dup DMA FD %d: %s\n", new_dma_fd, strerror(errno));
+                        av_frame_unref(video->frame);
+                        return -1;
+                    }
                     video->dma_fd = dup_fd;
                     video->dma_size = drm_size;
                     
@@ -1012,16 +1018,28 @@ int video_decode_frame(video_context_t *video) {
             // If this is a hardware frame (e.g. DRM_PRIME), transfer it to
             // a software YUV420P frame so the rest of the code can treat
             // hardware and software decode uniformly via video_get_yuv_data().
-            if (video->use_hardware_decode && video->frame->format == AV_PIX_FMT_DRM_PRIME) {
+            // SKIP this when using EGL/DMA zero-copy path (pure hardware)
+            if (video->use_hardware_decode && video->frame->format == AV_PIX_FMT_DRM_PRIME && !video->skip_sw_transfer) {
                 if (!video->sw_frame) {
                     video->sw_frame = av_frame_alloc();
                 }
                 if (video->sw_frame) {
+                    // Lock to prevent race with render thread reading sw_frame
+                    pthread_mutex_lock(&video->lock);
                     // Ensure sw_frame uses a CPU-accessible format
                     av_frame_unref(video->sw_frame);
                     int tr_ret = av_hwframe_transfer_data(video->sw_frame, video->frame, 0);
+                    pthread_mutex_unlock(&video->lock);
                     if (tr_ret < 0) {
                         fprintf(stderr, "[HW_DECODE] Failed to transfer DRM_PRIME frame to software: %s\n", av_err2str(tr_ret));
+                    } else {
+                        // Log sw_frame format on first successful transfer
+                        static bool sw_format_logged = false;
+                        if (!sw_format_logged) {
+                            printf("[HW_DECODE] sw_frame format after transfer: %s (%d)\n",
+                                   av_get_pix_fmt_name(video->sw_frame->format), video->sw_frame->format);
+                            sw_format_logged = true;
+                        }
                     }
                 }
             }
@@ -1214,9 +1232,9 @@ int video_decode_frame(video_context_t *video) {
             return -1;
         }
         
-        // Configure for software decoding
-        video->codec_ctx->thread_count = 4;
-        video->codec_ctx->thread_type = FF_THREAD_FRAME;
+        // Configure for software decoding - optimized for parallel decode
+        video->codec_ctx->thread_count = 0; // 0 = auto-detect CPU cores
+        video->codec_ctx->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
         
         // Open software codec
         if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
@@ -1506,6 +1524,9 @@ direct_ptrs:
 uint8_t* video_get_nv12_data(video_context_t *video) {
     if (!video || !video->frame) return NULL;
 
+    // Lock to prevent race with decoder thread overwriting sw_frame
+    pthread_mutex_lock(&video->lock);
+
     // When using DRM_PRIME, build NV12 from the transferred software frame.
     AVFrame *src = video->frame;
     if (video->frame->format == AV_PIX_FMT_DRM_PRIME && video->sw_frame) {
@@ -1515,6 +1536,7 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
     int width = video->width;
     int height = video->height;
     if (width <= 0 || height <= 0) {
+        pthread_mutex_unlock(&video->lock);
         return NULL;
     }
 
@@ -1524,26 +1546,34 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
 
     if (!frame_is_nv12 && !frame_is_planar) {
         // Unsupported format for NV12 uploads
+        pthread_mutex_unlock(&video->lock);
         return NULL;
     }
-    
+
     int needed_size = (width * height * 3) / 2;  // Y plane + packed UV plane
 
     if (video->nv12_buffer_size < needed_size) {
         uint8_t *new_buffer = realloc(video->nv12_buffer, needed_size);
         if (!new_buffer) {
+            pthread_mutex_unlock(&video->lock);
             return NULL;
         }
         video->nv12_buffer = new_buffer;
         video->nv12_buffer_size = needed_size;
     }
 
-    if (!video->nv12_buffer) return NULL;
+    if (!video->nv12_buffer) {
+        pthread_mutex_unlock(&video->lock);
+        return NULL;
+    }
 
     uint8_t *dst = video->nv12_buffer;
     uint8_t *y_data = src->data[0];
     int y_stride = src->linesize[0];
-    if (!y_data) return NULL;
+    if (!y_data) {
+        pthread_mutex_unlock(&video->lock);
+        return NULL;
+    }
 
     // Copy Y plane (full resolution)
     for (int row = 0; row < height; row++) {
@@ -1558,6 +1588,7 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
         uint8_t *uv_src = src->data[1];
         int uv_stride_bytes = src->linesize[1];
         if (!uv_src) {
+            pthread_mutex_unlock(&video->lock);
             return NULL;
         }
 
@@ -1573,6 +1604,7 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
         int v_stride = src->linesize[2];
 
         if (!u_data || !v_data) {
+            pthread_mutex_unlock(&video->lock);
             return NULL;
         }
 
@@ -1588,6 +1620,7 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
         }
     }
 
+    pthread_mutex_unlock(&video->lock);
     return video->nv12_buffer;
 }
 
@@ -1799,6 +1832,17 @@ void video_cleanup(video_context_t *video) {
         video->cached_v_size = 0;
     }
 
+    // PRODUCTION: Ensure mutex is unlocked before destroy (prevent EBUSY deadlock)
+    // Try to lock and unlock to verify state, then destroy
+    int lock_result = pthread_mutex_trylock(&video->lock);
+    if (lock_result == 0) {
+        // We acquired the lock, unlock it before destroying
+        pthread_mutex_unlock(&video->lock);
+    } else if (lock_result == EBUSY) {
+        // Mutex is locked (shouldn't happen, but handle it)
+        fprintf(stderr, "[CLEANUP] Warning: Mutex still locked during cleanup\n");
+    }
+    
     // Safe pthread cleanup with error checking
     int mutex_result = pthread_mutex_destroy(&video->lock);
     if (mutex_result != 0 && mutex_result != EINVAL) {

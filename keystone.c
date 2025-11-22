@@ -194,7 +194,7 @@ int keystone_init(keystone_context_t *keystone) {
     keystone->corners[CORNER_BOTTOM_LEFT]  = (point_t){-1.0f, -1.0f};  // Corner 1 (visual)
     
     keystone->selected_corner = CORNER_TOP_LEFT; // Start with top-left corner selected
-    keystone->move_step = 0.005f; // Default movement per key press (0.5% - fine control)
+    keystone->move_step = 0.0005f; // Default movement per key press (0.05% - ultra-fine control)
     keystone->matrix_dirty = true;
     keystone->corners_dirty = true;  // Initial corners need VBO upload
     keystone->show_corners = true;  // Show corners by default
@@ -329,19 +329,19 @@ bool keystone_help_visible(keystone_context_t *keystone) {
 }
 
 void keystone_increase_step_size(keystone_context_t *keystone) {
-    // PRODUCTION: Smaller increments for finer control
-    keystone->move_step += 0.001f;  // 0.1% increment (was 1%)
-    if (keystone->move_step > 0.1f) {
-        keystone->move_step = 0.1f; // Max step size (reduced from 0.2)
+    // PRODUCTION: Ultra-fine increments for pixel-perfect control
+    keystone->move_step += 0.0001f;  // 0.01% increment
+    if (keystone->move_step > 0.01f) {
+        keystone->move_step = 0.01f; // Max step size
     }
     printf("Keystone step size: %.4f\n", keystone->move_step);
 }
 
 void keystone_decrease_step_size(keystone_context_t *keystone) {
-    // PRODUCTION: Smaller decrements for finer control
-    keystone->move_step -= 0.001f;  // 0.1% decrement (was 1%)
-    if (keystone->move_step < 0.001f) {
-        keystone->move_step = 0.001f; // Min step size (reduced from 0.005)
+    // PRODUCTION: Ultra-fine decrements for pixel-perfect control
+    keystone->move_step -= 0.0001f;  // 0.01% decrement
+    if (keystone->move_step < 0.0001f) {
+        keystone->move_step = 0.0001f; // Min step size
     }
     printf("Keystone step size: %.4f\n", keystone->move_step);
 }
