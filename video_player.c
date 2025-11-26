@@ -1217,8 +1217,8 @@ void app_run(app_context_t *app) {
         } // End of main decode/render block
 
         // Decode second video if available
-        // OPTIMIZED: Pre-decode pattern - use pre-decoded frame, then decode next during render
-        // This hides decode latency by overlapping decode with GPU work
+        // OPTIMIZED: Pre-decode pattern - use pre-decoded frame, decode next AFTER render
+        // This hides decode latency by overlapping decode with vsync wait
         if (app->video2) {
             // If we have a pre-decoded frame ready, use it (zero decode time this iteration!)
             if (next_frame_ready2 && first_frame_decoded2) {
@@ -1231,22 +1231,9 @@ void app_run(app_context_t *app) {
                     new_secondary_frame_ready = true;
                 }
                 
-                // Decode NEXT frame (will be ready for next iteration)
-                // This decode happens during render of current frame
-                int decode_result = video_decode_frame(app->video2);
-                if (decode_result == 0) {
-                    next_frame_ready2 = true;
-                } else if (video_is_eof(app->video2)) {
-                    if (app->loop_playback) {
-                        video_seek(app->video2, 0);
-                        first_frame_decoded2 = false;
-                        next_frame_ready2 = false;
-                        frame_count2 = 0;
-                    }
-                } else {
-                    // Decode failed but not EOF - keep showing last frame
-                    next_frame_ready2 = false;
-                }
+                // Mark that we need to decode next frame AFTER render (see below)
+                // Don't decode here - it blocks before render starts!
+                next_frame_ready2 = false;  // Will be set true after decode below
             } else {
                 // First frame or no pre-decoded frame - decode synchronously
                 int decode_result = video_decode_frame(app->video2);
@@ -1614,8 +1601,24 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
         }
         
-        // Note: Video 2 pre-decode is now handled by async decoder thread
-        // No need for manual pre-decode here
+        // OPTIMIZATION: Pre-decode Video 2's next frame AFTER swap (during vsync wait)
+        // This overlaps decode with display, hiding latency
+        if (app->video2 && first_frame_decoded2 && !next_frame_ready2) {
+            int decode_result = video_decode_frame(app->video2);
+            if (decode_result == 0) {
+                next_frame_ready2 = true;
+            } else if (video_is_eof(app->video2)) {
+                if (app->loop_playback) {
+                    video_seek(app->video2, 0);
+                    first_frame_decoded2 = false;
+                    next_frame_ready2 = false;
+                    frame_count2 = 0;
+                }
+            } else {
+                // Decode failed but not EOF - will retry next frame
+                next_frame_ready2 = false;
+            }
+        }
 
         // Update render_time from actual local timestamps
         render_time = (render_end.tv_sec - render_start.tv_sec) +
