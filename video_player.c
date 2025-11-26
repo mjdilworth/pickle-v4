@@ -1385,30 +1385,23 @@ void app_run(app_context_t *app) {
             }
         }
 
-        // FALLBACK: HW decode without DMA support - use CPU transfer path
+        // FALLBACK: HW decode without DMA support - use direct YUV420P upload
+        // The sw_frame is already in YUV420P format, no need for NV12 conversion
         if (!rendered && use_hw_decode && new_primary_frame_ready) {
             static bool fallback_logged = false;
             if (!fallback_logged) {
-                LOG_INFO("Render", "Using CPU fallback path (HW decode, no EGL/DMA)");
+                LOG_INFO("Render", "Using direct YUV420P path (HW decode, CPU upload)");
                 fallback_logged = true;
             }
 
-            if (app->show_timing) {
-                clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_start);
-            }
-            uint8_t *nv12_data = video_get_nv12_data(app->video);
-            if (app->show_timing) {
-                clock_gettime(CLOCK_MONOTONIC, &nv12_cpu_end);
-                nv12_frame_time[0] = timespec_diff_seconds(&nv12_cpu_start, &nv12_cpu_end);
-            }
-
-            if (nv12_data) {
-                int nv12_stride = video_get_nv12_stride(app->video);
+            // Get YUV data directly - no NV12 conversion needed!
+            video_get_yuv_data(app->video, &y_data, &u_data, &v_data, &y_stride, &u_stride, &v_stride);
+            if (y_data && u_data && v_data) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
                 }
-                gl_render_nv12(app->gl, nv12_data, video_width, video_height, nv12_stride,
-                               app->drm, app->keystone, true, 0);
+                gl_render_frame(app->gl, y_data, u_data, v_data, video_width, video_height,
+                              y_stride, u_stride, v_stride, app->drm, app->keystone, true, 0);
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
                     upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
@@ -1427,14 +1420,7 @@ void app_run(app_context_t *app) {
             primary_async_request_pending = false;
         }
 
-        // Render second video with second keystone (don't clear screen)
-        if (app->video2 && app->keystone2) {
-            // Get dimensions (safe to call anytime)
-            int video_width2 = app->video2->width;
-            int video_height2 = app->video2->height;
-            bool video2_rendered = false;
-            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
-
+        // Aggregate timing for both videos (Video 1 timing already set, Video 2 set below)
         if (app->show_timing) {
             for (int i = 0; i < 2; ++i) {
                 if (nv12_frame_time[i] >= 0.0) {
@@ -1460,6 +1446,14 @@ void app_run(app_context_t *app) {
                 }
             }
         }
+
+        // Render second video with second keystone (don't clear screen)
+        if (app->video2 && app->keystone2) {
+            // Get dimensions (safe to call anytime)
+            int video_width2 = app->video2->width;
+            int video_height2 = app->video2->height;
+            bool video2_rendered = false;
+            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
 
             // SYNC DECODE: Video 2 always has fresh data when new_secondary_frame_ready is true
             if (new_secondary_frame_ready && y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
