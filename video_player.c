@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 199309L
 #define _DEFAULT_SOURCE
 #include "video_player.h"
+#include "logging.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,30 +40,30 @@ static void format_metric_ms(double seconds, char *buffer, size_t length) {
 // Validate video file before processing
 static int validate_video_file(const char *filename) {
     if (!filename) {
-        fprintf(stderr, "Error: No video file specified\n");
+        LOG_ERROR("VIDEO", "No video file specified");
         return -1;
     }
     
     // Check if file exists and get size
     struct stat st;
     if (stat(filename, &st) != 0) {
-        fprintf(stderr, "Error: Cannot access video file: %s\n", filename);
+        LOG_ERROR("VIDEO", "Cannot access video file: %s", filename);
         return -1;
     }
     
     // Check file size limits
     if ((unsigned long long)st.st_size > MAX_VIDEO_FILE_SIZE) {
-        fprintf(stderr, "Error: Video file too large (%lld bytes, limit: %lld bytes)\n",
+        LOG_ERROR("VIDEO", "Video file too large (%lld bytes, limit: %lld bytes)",
                 (long long)st.st_size, (long long)MAX_VIDEO_FILE_SIZE);
         return -1;
     }
     
     if (st.st_size < 1024) {  // Minimum 1KB for valid video
-        fprintf(stderr, "Error: Video file too small (%lld bytes)\n", (long long)st.st_size);
+        LOG_ERROR("VIDEO", "Video file too small (%lld bytes)", (long long)st.st_size);
         return -1;
     }
     
-    printf("Video file validation passed: %s (%lld bytes)\n", filename, (long long)st.st_size);
+    LOG_INFO("VIDEO", "Video file validation passed: %s (%lld bytes)", filename, (long long)st.st_size);
     return 0;
 }
 
@@ -191,7 +192,7 @@ static void* async_decode_thread(void *arg) {
 async_decode_t* async_decode_create(video_context_t *video) {
     async_decode_t *decoder = (async_decode_t *)malloc(sizeof(async_decode_t));
     if (!decoder) {
-        fprintf(stderr, "Failed to allocate async decoder\n");
+        LOG_ERROR("ASYNC", "Failed to allocate async decoder");
         return NULL;
     }
     
@@ -202,13 +203,13 @@ async_decode_t* async_decode_create(video_context_t *video) {
     decoder->running = false;
     
     if (pthread_mutex_init(&decoder->mutex, NULL) != 0) {
-        fprintf(stderr, "Failed to initialize decoder mutex\n");
+        LOG_ERROR("ASYNC", "Failed to initialize decoder mutex");
         free(decoder);
         return NULL;
     }
     
     if (pthread_cond_init(&decoder->cond, NULL) != 0) {
-        fprintf(stderr, "Failed to initialize decoder condition variable\n");
+        LOG_ERROR("ASYNC", "Failed to initialize decoder condition variable");
         pthread_mutex_destroy(&decoder->mutex);
         free(decoder);
         return NULL;
@@ -216,7 +217,7 @@ async_decode_t* async_decode_create(video_context_t *video) {
     
     // Start decode thread
     if (pthread_create(&decoder->thread, NULL, async_decode_thread, decoder) != 0) {
-        fprintf(stderr, "Failed to create async decode thread\n");
+        LOG_ERROR("ASYNC", "Failed to create async decode thread");
         pthread_cond_destroy(&decoder->cond);
         pthread_mutex_destroy(&decoder->mutex);
         free(decoder);
@@ -234,7 +235,7 @@ void async_decode_destroy(async_decode_t *decoder) {
     // Signal thread to exit
     int lock_result = pthread_mutex_lock(&decoder->mutex);
     if (lock_result != 0) {
-        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in destroy: %d\n", lock_result);
+        LOG_WARN("ASYNC", "mutex lock failed in destroy: %d", lock_result);
         // Try to proceed anyway for cleanup
     }
     decoder->should_exit = true;
@@ -255,12 +256,12 @@ void async_decode_destroy(async_decode_t *decoder) {
     if (decoder->running) {
         int result = pthread_timedjoin_np(decoder->thread, NULL, &timeout);
         if (result == ETIMEDOUT) {
-            fprintf(stderr, "[ASYNC] Warning: Thread join timeout, forcing cancellation\n");
+            LOG_WARN("ASYNC", "Thread join timeout, forcing cancellation");
             pthread_cancel(decoder->thread);
             // Final join without timeout after cancel
             pthread_join(decoder->thread, NULL);
         } else if (result != 0) {
-            fprintf(stderr, "[ASYNC] Warning: pthread_timedjoin_np failed: %d\n", result);
+            LOG_WARN("ASYNC", "pthread_timedjoin_np failed: %d", result);
         }
         decoder->running = false;
     }
@@ -270,18 +271,18 @@ void async_decode_destroy(async_decode_t *decoder) {
     if (trylock_result == 0) {
         pthread_mutex_unlock(&decoder->mutex);
     } else if (trylock_result == EBUSY) {
-        fprintf(stderr, "[ASYNC] Warning: Mutex still locked during cleanup\n");
+        LOG_WARN("ASYNC", "Mutex still locked during cleanup");
     }
     
     // Safe cleanup of synchronization primitives
     int mutex_result = pthread_mutex_destroy(&decoder->mutex);
     if (mutex_result != 0 && mutex_result != EINVAL) {
-        fprintf(stderr, "[ASYNC] Warning: pthread_mutex_destroy failed: %d\n", mutex_result);
+        LOG_WARN("ASYNC", "pthread_mutex_destroy failed: %d", mutex_result);
     }
     
     int cond_result = pthread_cond_destroy(&decoder->cond);
     if (cond_result != 0 && cond_result != EINVAL) {
-        fprintf(stderr, "[ASYNC] Warning: pthread_cond_destroy failed: %d\n", cond_result);
+        LOG_WARN("ASYNC", "pthread_cond_destroy failed: %d", cond_result);
     }
 
     free(decoder);
@@ -293,7 +294,7 @@ void async_decode_request_frame(async_decode_t *decoder) {
     
     int lock_result = pthread_mutex_lock(&decoder->mutex);
     if (lock_result != 0) {
-        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in request: %d\n", lock_result);
+        LOG_WARN("ASYNC", "mutex lock failed in request: %d", lock_result);
         return;
     }
     
@@ -309,7 +310,7 @@ bool async_decode_frame_ready(async_decode_t *decoder) {
     
     int lock_result = pthread_mutex_lock(&decoder->mutex);
     if (lock_result != 0) {
-        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in frame_ready: %d\n", lock_result);
+        LOG_WARN("ASYNC", "mutex lock failed in frame_ready: %d", lock_result);
         return false;
     }
     
@@ -325,7 +326,7 @@ bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
     
     int lock_result = pthread_mutex_lock(&decoder->mutex);
     if (lock_result != 0) {
-        fprintf(stderr, "[ASYNC] Warning: mutex lock failed in wait_frame: %d\n", lock_result);
+        LOG_WARN("ASYNC", "mutex lock failed in wait_frame: %d", lock_result);
         return false;
     }
     
@@ -359,18 +360,18 @@ bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
 
 int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback,
             bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode) {
-    printf("app_init: Starting initialization...\n");
+    LOG_INFO("APP", "Starting initialization...");
     fflush(stdout);
     
     // Validate video file before proceeding
     if (validate_video_file(video_file) != 0) {
-        fprintf(stderr, "Failed to validate video file\n");
+        LOG_ERROR("APP", "Failed to validate video file");
         return -1;
     }
     
     // Validate second video file if provided
     if (video_file2 && validate_video_file(video_file2) != 0) {
-        fprintf(stderr, "Failed to validate second video file\n");
+        LOG_ERROR("APP", "Failed to validate second video file");
         return -1;
     }
     
@@ -399,45 +400,45 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         app->video2 = calloc(1, sizeof(video_context_t));
         app->keystone2 = calloc(1, sizeof(keystone_context_t));
         if (!app->video2 || !app->keystone2) {
-            fprintf(stderr, "Failed to allocate second video/keystone contexts\n");
+            LOG_ERROR("APP", "Failed to allocate second video/keystone contexts");
             app_cleanup(app);
             return -1;
         }
     }
 
     if (!app->drm || !app->gl || !app->video || !app->keystone || !app->input) {
-        fprintf(stderr, "Failed to allocate contexts\n");
+        LOG_ERROR("APP", "Failed to allocate contexts");
         app_cleanup(app);
         return -1;
     }
 
-    printf("app_init: Initializing DRM display...\n");
+    LOG_INFO("APP", "Initializing DRM display...");
     fflush(stdout);
     
     // Initialize DRM display
     if (drm_init(app->drm) != 0) {
-        fprintf(stderr, "Failed to initialize DRM display\n");
+        LOG_ERROR("APP", "Failed to initialize DRM display");
         app_cleanup(app);
         return -1;
     }
     
     // Initialize KMS video overlay plane (optional, for hardware zero-copy)
     if (drm_init_video_plane(app->drm) == 0) {
-        printf("[KMS] Video overlay plane initialized successfully\n");
+        LOG_INFO("KMS", "Video overlay plane initialized successfully");
     } else {
-        printf("[KMS] Video overlay plane not available (will use OpenGL fallback)\n");
+        LOG_INFO("KMS", "Video overlay plane not available (will use OpenGL fallback)");
     }
 
     // Initialize OpenGL context
     if (gl_init(app->gl, app->drm) != 0) {
-        fprintf(stderr, "Failed to initialize OpenGL context\n");
+        LOG_ERROR("APP", "Failed to initialize OpenGL context");
         app_cleanup(app);
         return -1;
     }
 
     // Initialize video decoder
     if (video_init(app->video, video_file, app->advanced_diagnostics, enable_hardware_decode) != 0) {
-        fprintf(stderr, "Failed to initialize video decoder\n");
+        LOG_ERROR("APP", "Failed to initialize video decoder");
         app_cleanup(app);
         return -1;
     }
@@ -446,21 +447,21 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     // This uses GL_OES_EGL_image_external for true zero-copy rendering
     if (app->video->use_hardware_decode && app->gl->supports_external_texture) {
         app->video->skip_sw_transfer = true;
-        printf("[ZERO-COPY] Pure hardware path enabled (external texture)\n");
+        LOG_INFO("ZERO-COPY", "Pure hardware path enabled (external texture)");
     } else if (app->video->use_hardware_decode) {
         app->video->skip_sw_transfer = false;  // Fallback to CPU transfer
-        printf("[HW_DECODE] Using hardware decode with CPU transfer (V4L2 M2M)\n");
+        LOG_INFO("HW_DECODE", "Using hardware decode with CPU transfer (V4L2 M2M)");
     }
 
     // Validate video dimensions after decoder opens file
     if (app->video->width > MAX_VIDEO_WIDTH || app->video->height > MAX_VIDEO_HEIGHT) {
-        fprintf(stderr, "Error: Video dimensions %dx%d exceed limits (%dx%d max)\n",
+        LOG_ERROR("APP", "Video dimensions %dx%d exceed limits (%dx%d max)",
                 app->video->width, app->video->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
         app_cleanup(app);
         return -1;
     }
     
-    printf("Video 1 dimensions: %dx%d (within limits)\n", app->video->width, app->video->height);
+    LOG_INFO("APP", "Video 1 dimensions: %dx%d (within limits)", app->video->width, app->video->height);
     
     // Set loop playback if requested
     video_set_loop(app->video, loop_playback);
@@ -477,17 +478,17 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     bool allow_async_primary = true;
     if (app->video->use_hardware_decode && force_sync_hw) {
         allow_async_primary = false;
-        printf("PICKLE_FORCE_SYNC_HW=1 -> forcing hardware decode on main thread\n");
+        LOG_INFO("APP", "PICKLE_FORCE_SYNC_HW=1 -> forcing hardware decode on main thread");
     }
 
     if (allow_async_primary) {
         app->async_decoder_primary = async_decode_create(app->video);
         if (!app->async_decoder_primary) {
-            fprintf(stderr, "Failed to create async decoder for video 1\n");
+            LOG_ERROR("APP", "Failed to create async decoder for video 1");
             app_cleanup(app);
             return -1;
         }
-        printf("Async decoder created for video 1 (%s path)\n",
+        LOG_INFO("APP", "Async decoder created for video 1 (%s path)",
                app->video->use_hardware_decode ? "hardware" : "software");
     }
 
@@ -498,43 +499,43 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     if (video_file2) {
         bool video2_hw_decode = false;  // Always software decode for video 2
         if (enable_hardware_decode) {
-            printf("[HYBRID] Video 2 forced to software decode (V4L2 M2M is single-stream)\n");
+            LOG_INFO("HYBRID", "Video 2 forced to software decode (V4L2 M2M is single-stream)");
         }
 
         if (video_init(app->video2, video_file2, app->advanced_diagnostics, video2_hw_decode) != 0) {
-            fprintf(stderr, "Failed to initialize second video decoder\n");
+            LOG_ERROR("APP", "Failed to initialize second video decoder");
             app_cleanup(app);
             return -1;
         }
 
         if (app->video2->width > MAX_VIDEO_WIDTH || app->video2->height > MAX_VIDEO_HEIGHT) {
-            fprintf(stderr, "Error: Video 2 dimensions %dx%d exceed limits (%dx%d max)\n",
+            LOG_ERROR("APP", "Video 2 dimensions %dx%d exceed limits (%dx%d max)",
                     app->video2->width, app->video2->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
             app_cleanup(app);
             return -1;
         }
 
-        printf("Video 2 dimensions: %dx%d (within limits)\n", app->video2->width, app->video2->height);
+        LOG_INFO("APP", "Video 2 dimensions: %dx%d (within limits)", app->video2->width, app->video2->height);
         video_set_loop(app->video2, loop_playback);
 
         // Video 2 uses SYNCHRONOUS software decode for stability
         // Async decode caused flickering due to timing/buffer issues
         app->async_decoder_secondary = NULL;
-        printf("Video 2 using synchronous software decode\n");
+        LOG_INFO("APP", "Video 2 using synchronous software decode");
     }
 
     // Initialize keystone correction
     if (keystone_init(app->keystone) != 0) {
-        fprintf(stderr, "Failed to initialize keystone correction\n");
+        LOG_ERROR("APP", "Failed to initialize keystone correction");
         app_cleanup(app);
         return -1;
     }
     
     // Load saved keystone settings if available
     if (keystone_load_settings(app->keystone) == 0) {
-        printf("Loaded saved keystone settings from pickle_keystone.conf\n");
+        LOG_INFO("APP", "Loaded saved keystone settings from pickle_keystone.conf");
     } else {
-        printf("No saved keystone settings found, using defaults\n");
+        LOG_INFO("APP", "No saved keystone settings found, using defaults");
     }
     
     // Force show_corners and show_border to OFF at startup (user toggles with gamepad)
@@ -547,38 +548,38 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     float tl_y = app->keystone->corners[CORNER_TOP_LEFT].y;
     float br_y = app->keystone->corners[CORNER_BOTTOM_RIGHT].y;
     if (tl_y < br_y) {  // TOP_LEFT Y should be > BOTTOM_RIGHT Y (1.0 > -1.0)
-        printf("WARNING: Keystone 1 corners are inverted/scrambled! Resetting to defaults.\n");
-        printf("  TL Y=%.2f, BR Y=%.2f (expected TL > BR)\n", tl_y, br_y);
+        LOG_WARN("KEYSTONE", "Keystone 1 corners are inverted/scrambled! Resetting to defaults");
+        LOG_DEBUG("KEYSTONE", "TL Y=%.2f, BR Y=%.2f (expected TL > BR)", tl_y, br_y);
         keystone_reset_corners(app->keystone);
-        printf("Keystone 1 reset to correct defaults\n");
+        LOG_INFO("KEYSTONE", "Keystone 1 reset to correct defaults");
     }
     
     // Initialize second keystone if second video provided
     if (video_file2) {
         if (keystone_init(app->keystone2) != 0) {
-            fprintf(stderr, "Failed to initialize second keystone correction\n");
+            LOG_ERROR("APP", "Failed to initialize second keystone correction");
             app_cleanup(app);
             return -1;
         }
 
         // Try to load saved keystone2 settings
         if (keystone_load_from_file(app->keystone2, "pickle_keystone2.conf") == 0) {
-            printf("Loaded saved keystone2 settings from pickle_keystone2.conf\n");
+            LOG_INFO("APP", "Loaded saved keystone2 settings from pickle_keystone2.conf");
             // Use saved settings as-is (borders off by default)
             app->keystone2->show_corners = false;
             app->keystone2->show_border = false;
         } else {
             // No keystone2 config found - create default dual-video setup
-            printf("No pickle_keystone2.conf found - creating default dual-video setup\n");
+            LOG_INFO("APP", "No pickle_keystone2.conf found - creating default dual-video setup");
 
             // Reset keystone 1 to full screen defaults
             keystone_reset_corners(app->keystone);
-            printf("  Keystone 1 reset to full screen\n");
+            LOG_INFO("APP", "Keystone 1 reset to full screen");
 
             // Set keystone 2 to be inset inside keystone 1 with margin
             float margin = 0.3f;  // 30% margin on each side
             keystone_set_inset_corners(app->keystone2, margin);
-            printf("  Keystone 2 positioned inside keystone 1 with %.0f%% margin\n", margin * 100);
+            LOG_INFO("APP", "Keystone 2 positioned inside keystone 1 with %.0f%% margin", margin * 100);
 
             // Enable borders on BOTH keystones so user can see them
             app->keystone->show_border = true;
@@ -590,21 +591,21 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
             app->keystone2->show_corners = false;
             app->keystone2->show_help = false;
 
-            printf("  Borders enabled on both keystones for visibility\n");
+            LOG_INFO("APP", "Borders enabled on both keystones for visibility");
 
             // Save both configs
             if (keystone_save_to_file(app->keystone, "pickle_keystone.conf") == 0) {
-                printf("  Saved default keystone 1 to pickle_keystone.conf\n");
+                LOG_INFO("APP", "Saved default keystone 1 to pickle_keystone.conf");
             }
             if (keystone_save_to_file(app->keystone2, "pickle_keystone2.conf") == 0) {
-                printf("  Created pickle_keystone2.conf with default inset position\n");
+                LOG_INFO("APP", "Created pickle_keystone2.conf with default inset position");
             }
         }
     }
 
     // Initialize input handler
     if (input_init(app->input) != 0) {
-        fprintf(stderr, "Failed to initialize input handler\n");
+        LOG_ERROR("APP", "Failed to initialize input handler");
         app_cleanup(app);
         return -1;
     }
@@ -623,7 +624,7 @@ void app_run(app_context_t *app) {
     clock_gettime(CLOCK_MONOTONIC, &last_time);
 
     // Print app configuration to verify settings
-    printf("App configuration - Loop: %d, Show timing: %d, Debug gamepad: %d\n",
+    LOG_INFO("APP", "App configuration - Loop: %d, Show timing: %d, Debug gamepad: %d",
            app->loop_playback ? 1 : 0, 
            app->show_timing ? 1 : 0, 
            app->debug_gamepad ? 1 : 0);
@@ -635,17 +636,15 @@ void app_run(app_context_t *app) {
                           strcmp(env_timing, "yes") == 0 || 
                           strcmp(env_timing, "true") == 0)) {
             app->show_timing = true;
-            printf("[FORCE] Timing display enabled via PICKLE_SHOW_TIMING environment variable\n");
+            LOG_INFO("APP", "Timing display enabled via PICKLE_SHOW_TIMING environment variable");
         }
     }
-    fflush(stdout);
 
     double target_frame_time = 1.0 / 60.0; // 60 FPS target
     if (app->video && app->video->fps > 0) {
         target_frame_time = 1.0 / app->video->fps;
-        printf("Video FPS: %.2f, Target frame time: %.3fms\n", 
+        LOG_INFO("APP", "Video FPS: %.2f, Target frame time: %.3fms", 
                app->video->fps, target_frame_time * 1000);
-        fflush(stdout);
     }
     
     // FIXED: VSync handles frame timing - no manual budgets needed
@@ -672,7 +671,7 @@ void app_run(app_context_t *app) {
     
     // Critical: Check malloc success before using
     if (!decode_times || !render_times) {
-        fprintf(stderr, "Failed to allocate timing buffers\n");
+        LOG_ERROR("APP", "Failed to allocate timing buffers");
         free(decode_times);
         free(render_times);
         decode_times = NULL;
@@ -688,16 +687,16 @@ void app_run(app_context_t *app) {
     
     // Initialize timing metrics display
     if (app->show_timing) {
-        printf("\n[TIMING] Timing display is enabled. Will show metrics every 30 frames.\n");
-        printf("[TIMING] Video FPS: %.2f, Target frame time: %.3fms\n", 
+        LOG_INFO("TIMING", "Timing display is enabled. Will show metrics every 30 frames");
+        LOG_INFO("TIMING", "Video FPS: %.2f, Target frame time: %.3fms", 
                app->video->fps, target_frame_time * 1000);
-        printf("[TIMING] Hardware decode: %s, Resolution: %dx%d\n", 
+        LOG_INFO("TIMING", "Hardware decode: %s, Resolution: %dx%d", 
                video_is_hardware_decoded(app->video) ? "YES" : "NO",
                app->video->width, app->video->height);
                
         // Start a background timer to ensure timing info is displayed
         // regardless of frame decode success
-        printf("[TIMING] Starting timing display timer\n");
+        LOG_DEBUG("TIMING", "Starting timing display timer");
         
         // Write directly to a file as a backup method for timing data
         FILE *timing_log = fopen("timing_log.txt", "w");
@@ -710,7 +709,6 @@ void app_run(app_context_t *app) {
                    app->video->width, app->video->height);
             fclose(timing_log);
         }
-        fflush(stdout);
     }
 
     // Main loop starting
@@ -738,8 +736,7 @@ void app_run(app_context_t *app) {
         
         // Check for quit
         if (input_should_quit(app->input)) {
-            printf("Quit requested by user\n");
-            fflush(stdout);
+            LOG_INFO("APP", "Quit requested by user");
             app->running = false;
             break;
         }
@@ -783,7 +780,7 @@ void app_run(app_context_t *app) {
         if (input_is_key_just_pressed(app->input, KEY_R)) {
             // Reset keystone 1 to full screen
             keystone_reset_corners(app->keystone);
-            printf("Keystone 1 reset to defaults\n");
+            LOG_INFO("KEYSTONE", "Keystone 1 reset to defaults");
             
             // If second video exists, reset keystone 2 to a smaller inset area
             if (app->keystone2) {
@@ -802,7 +799,7 @@ void app_run(app_context_t *app) {
                 app->keystone2->corners[CORNER_BOTTOM_LEFT].y = -1.0f + inset;   // BL Y
                 
                 keystone_calculate_matrix(app->keystone2);
-                printf("Keystone 2 reset to inset defaults (visible inside keystone 1)\n");
+                LOG_INFO("KEYSTONE", "Keystone 2 reset to inset defaults (visible inside keystone 1)");
             }
         }
         
@@ -812,24 +809,24 @@ void app_run(app_context_t *app) {
             bool saved1 = false, saved2 = false;
 
             if (keystone_save_settings(app->keystone) == 0) {
-                printf("Keystone 1 settings saved to pickle_keystone.conf\n");
+                LOG_INFO("KEYSTONE", "Keystone 1 settings saved to pickle_keystone.conf");
                 saved1 = true;
             } else {
-                printf("Failed to save keystone 1 settings\n");
+                LOG_ERROR("KEYSTONE", "Failed to save keystone 1 settings");
             }
 
             if (app->keystone2) {
                 if (keystone_save_to_file(app->keystone2, "pickle_keystone2.conf") == 0) {
-                    printf("Keystone 2 settings saved to pickle_keystone2.conf\n");
+                    LOG_INFO("KEYSTONE", "Keystone 2 settings saved to pickle_keystone2.conf");
                     saved2 = true;
                 } else {
-                    printf("Failed to save keystone 2 settings\n");
+                    LOG_ERROR("KEYSTONE", "Failed to save keystone 2 settings");
                 }
             }
 
             // Show notification overlay
             if (saved1 && saved2) {
-                printf("Both keystone configurations saved successfully\n");
+                LOG_INFO("KEYSTONE", "Both keystone configurations saved successfully");
                 show_notification(app, "Settings Saved!", 3.0);
             } else if (saved1) {
                 show_notification(app, "Keystone 1 Saved!", 3.0);
@@ -848,12 +845,12 @@ void app_run(app_context_t *app) {
                 // Two videos: toggle BOTH keystones
                 app->keystone->show_corners = !app->keystone->show_corners;
                 app->keystone2->show_corners = !app->keystone2->show_corners;
-                printf("[TOGGLE] Corners: %s (both keystone 1 & 2)\n", 
+                LOG_INFO("TOGGLE", "Corners: %s (both keystone 1 & 2)", 
                        app->keystone->show_corners ? "ON" : "OFF");
             } else {
                 // Single video: toggle only keystone 1
                 app->keystone->show_corners = !app->keystone->show_corners;
-                printf("[TOGGLE] Corners: %s (keystone 1 only)\n", 
+                LOG_INFO("TOGGLE", "Corners: %s (keystone 1 only)", 
                        app->keystone->show_corners ? "ON" : "OFF");
             }
             app->input->toggle_corners = false;
@@ -913,15 +910,7 @@ void app_run(app_context_t *app) {
                         target_video = 2;
                         app->active_keystone = 1;
                     }
-                    
-                    // DEBUG logging BEFORE change
-                    static int cycle_debug_count = 0;
-                    if (cycle_debug_count < 10) {  // Only log first 10 cycles
-                        printf("[X-CYCLE] Index=%d → Video %d corner %s (enum=%d)\n",
-                               next_index, target_video, corner_names[target_corner], target_corner);
-                        cycle_debug_count++;
-                    }
-                    
+
                     // Select the corner
                     keystone_select_corner(target_keystone, target_corner);
                     target_keystone->show_corners = true;
@@ -955,12 +944,12 @@ void app_run(app_context_t *app) {
             // L1/R1: Decrease/increase step size
             if (app->input->gamepad_decrease_step) {
                 keystone_decrease_step_size(active_ks);
-                printf("[GAMEPAD] R1 - Step size decreased to %.6f (keystone %d)\n", active_ks->move_step, app->active_keystone + 1);
+                LOG_INFO("GAMEPAD", "R1 - Step size decreased to %.6f (keystone %d)", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_decrease_step = false;
             }
             if (app->input->gamepad_increase_step) {
                 keystone_increase_step_size(active_ks);
-                printf("[GAMEPAD] L1 - Step size increased to %.6f (keystone %d)\n", active_ks->move_step, app->active_keystone + 1);
+                LOG_INFO("GAMEPAD", "L1 - Step size increased to %.6f (keystone %d)", active_ks->move_step, app->active_keystone + 1);
                 app->input->gamepad_increase_step = false;
             }
             
@@ -968,7 +957,7 @@ void app_run(app_context_t *app) {
             if (app->input->gamepad_reset_keystone) {
                 // Reset keystone 1 to full screen
                 keystone_reset_corners(app->keystone);
-                printf("Keystone 1 reset to defaults (gamepad)\n");
+                LOG_INFO("KEYSTONE", "Keystone 1 reset to defaults (gamepad)");
                 
                 // If second video exists, reset keystone 2 to a smaller inset area
                 if (app->keystone2) {
@@ -987,7 +976,7 @@ void app_run(app_context_t *app) {
                     app->keystone2->corners[CORNER_BOTTOM_LEFT].y = -1.0f + inset;   // BL Y
                     
                     keystone_calculate_matrix(app->keystone2);
-                    printf("Keystone 2 reset to inset defaults (gamepad)\n");
+                    LOG_INFO("KEYSTONE", "Keystone 2 reset to inset defaults (gamepad)");
                 }
                 
                 app->input->gamepad_reset_keystone = false;
@@ -1049,8 +1038,7 @@ void app_run(app_context_t *app) {
             if (using_async_primary) {
                 decode_time = 0.0; // Decode work happens on background thread
                 if (frame_count == 0 && !first_decode_attempted) {
-                    printf("Attempting first frame decode (async)...\n");
-                    fflush(stdout);
+                    LOG_INFO("DECODE", "Attempting first frame decode (async)...");
                     first_decode_attempted = true;
                 }
 
@@ -1084,9 +1072,8 @@ void app_run(app_context_t *app) {
                         new_primary_frame_ready = true;
 
                         if (!first_frame_decoded) {
-                            printf("First frame decoded successfully (async)\n");
+                            LOG_INFO("DECODE", "First frame decoded successfully (async)");
                             first_frame_decoded = true;
-                            fflush(stdout);
                         }
 
                         diagnostic_frame_count++;
@@ -1098,7 +1085,7 @@ void app_run(app_context_t *app) {
 
                 if (video_is_eof(app->video)) {
                     if (app->loop_playback) {
-                        printf("End of video reached - restarting playback (loop mode)\n");
+                        LOG_INFO("APP", "End of video reached - restarting playback (loop mode)");
                         video_seek(app->video, 0);
                         next_frame_ready = false;
                         first_frame_decoded = false;
@@ -1109,34 +1096,31 @@ void app_run(app_context_t *app) {
                         clock_gettime(CLOCK_MONOTONIC, &current_time);
                         startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
                     } else {
-                        printf("Playback finished.\n");
+                        LOG_INFO("APP", "Playback finished");
                         app->running = false;
                         break;
                     }
                 }
             } else {
                 if (frame_count == 0 && !first_decode_attempted) {
-                    printf("Attempting first frame decode...\n");
-                    fflush(stdout);
+                    LOG_INFO("DECODE", "Attempting first frame decode...");
                     first_decode_attempted = true;
                     
                     // Hardware decode: Pre-buffer 2 frames to prime the decoder pipeline
                     // More buffering causes systematic lag (playback appears slower)
                     if (app->video && video_is_hardware_decoded(app->video)) {
-                        printf("[HW_DECODE] Priming decoder pipeline...\n");
+                        LOG_INFO("HW_DECODE", "Priming decoder pipeline...");
                         for (int prebuf = 0; prebuf < 2; prebuf++) {
                             int result = video_decode_frame(app->video);
                             if (result != 0) break;
                         }
-                        printf("[HW_DECODE] Decoder ready, starting playback\n");
-                        fflush(stdout);
+                        LOG_INFO("HW_DECODE", "Decoder ready, starting playback");
                     }
                 }
 
                 // Add timeout for first decode to prevent hanging
                 if (frame_count == 0 && (current_total_time - startup_time) > 5.0) {
-                    printf("Video decode timeout after 5 seconds, continuing without video...\n");
-                    fflush(stdout);
+                    LOG_WARN("DECODE", "Video decode timeout after 5 seconds, continuing without video...");
                     frame_count = 1; // Skip further decode attempts
                 } else {
                     // OPTIMIZATION: Use pre-decoded frame if available, then decode next
@@ -1179,9 +1163,8 @@ void app_run(app_context_t *app) {
                         
                         if (decode_result == 0) {
                             if (frame_count == 0) {
-                                printf("First frame decoded successfully\n");
+                                LOG_INFO("DECODE", "First frame decoded successfully");
                                 first_frame_decoded = true;
-                                fflush(stdout);
                             }
                             
                             uint8_t *y_data = NULL, *u_data = NULL, *v_data = NULL;
@@ -1206,7 +1189,7 @@ void app_run(app_context_t *app) {
                             }
                         } else if (video_is_eof(app->video)) {
                             if (app->loop_playback) {
-                                printf("End of video reached - restarting playback (loop mode)\n");
+                                LOG_INFO("APP", "End of video reached - restarting playback (loop mode)");
                                 video_seek(app->video, 0);
                                 next_frame_ready = false;
                                 first_frame_decoded = false;
@@ -1216,14 +1199,13 @@ void app_run(app_context_t *app) {
                                 clock_gettime(CLOCK_MONOTONIC, &current_time);
                                 startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
                             } else {
-                                printf("Playback finished.\n");
+                                LOG_INFO("APP", "Playback finished");
                                 app->running = false;
                                 break;
                             }
                         } else {
                             if (frame_count < 10) {
-                                printf("Video decode failed: %d\n", decode_result);
-                                fflush(stdout);
+                                LOG_WARN("DECODE", "Video decode failed: %d", decode_result);
                             }
                             video_data = last_video_data;
                             next_frame_ready = false;
@@ -1245,9 +1227,8 @@ void app_run(app_context_t *app) {
                 if (y_data2 != NULL) {
                     frame_count2++;
                     if (!first_frame_decoded2) {
-                        printf("First frame of video 2 decoded successfully (SW sync)\n");
+                        LOG_INFO("DECODE", "First frame of video 2 decoded successfully (SW sync)");
                         first_frame_decoded2 = true;
-                        fflush(stdout);
                     }
                     new_secondary_frame_ready = true;
                 }
@@ -1325,7 +1306,7 @@ void app_run(app_context_t *app) {
             if (dma_fd >= 0) {
                 static bool egl_dma_logged = false;
                 if (!egl_dma_logged) {
-                    printf("[Render] Using external texture zero-copy path (pure hardware)\n");
+                    LOG_INFO("Render", "Using external texture zero-copy path (pure hardware)");
                     egl_dma_logged = true;
                 }
 
@@ -1351,7 +1332,7 @@ void app_run(app_context_t *app) {
         if (!rendered && !use_hw_decode && new_primary_frame_ready) {
             static bool sw_path_logged = false;
             if (!sw_path_logged) {
-                printf("[Render] Using CPU upload path (software decode)\n");
+                LOG_INFO("Render", "Using CPU upload path (software decode)");
                 sw_path_logged = true;
             }
 
@@ -1374,7 +1355,7 @@ void app_run(app_context_t *app) {
         if (!rendered && use_hw_decode && new_primary_frame_ready) {
             static bool fallback_logged = false;
             if (!fallback_logged) {
-                printf("[Render] Using CPU fallback path (HW decode, no EGL/DMA)\n");
+                LOG_INFO("Render", "Using CPU fallback path (HW decode, no EGL/DMA)");
                 fallback_logged = true;
             }
 
@@ -1633,11 +1614,11 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                 frame_drop_count++;
                 // PRODUCTION: Only report first 5 drops, then summary every 100 frames
                 if (frame_drop_reports < 5) {
-                    printf("⚠ [FRAME DROP] Frame %d: %.1fms since last frame (expected ~16.7ms)\n",
+                    LOG_WARN("FRAME DROP", "Frame %d: %.1fms since last frame (expected ~16.7ms)",
                            render_frame_count, time_since_last * 1000);
                     frame_drop_reports++;
                     if (frame_drop_reports == 5) {
-                        printf("  (Further frame drops will be summarized periodically)\n");
+                        LOG_INFO("FRAME DROP", "Further frame drops will be summarized periodically");
                     }
                 }
             }
@@ -1657,7 +1638,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         
         // Per-frame output (every 6 frames to reduce spam, ~10 fps @ 60fps capture)
         if (app->show_timing && frame_count > 0 && frame_count % 6 == 0) {
-            printf("[PERF] Frame %d: decode0=%.2fms decode1=%.2fms upload=%.2fms warp+draw=%.2fms swap=%.2fms total=%.2fms\n",
+            LOG_DEBUG("PERF", "Frame %d: decode0=%.2fms decode1=%.2fms upload=%.2fms warp+draw=%.2fms swap=%.2fms total=%.2fms",
                    frame_count,
                    decode0_time * 1000,
                    decode1_time * 1000,
@@ -1673,10 +1654,9 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                  format_metric_ms(nv12_frame_time[1], nv12_ms[1], sizeof(nv12_ms[1]));
                  format_metric_ms(upload_frame_time[0], upload_ms[0], sizeof(upload_ms[0]));
                  format_metric_ms(upload_frame_time[1], upload_ms[1], sizeof(upload_ms[1]));
-                 printf("          nv12_cpu(ms)=%s/%s gl_upload(ms)=%s/%s\n",
+                 LOG_DEBUG("PERF", "         nv12_cpu(ms)=%s/%s gl_upload(ms)=%s/%s",
                      nv12_ms[0], nv12_ms[1], upload_ms[0], upload_ms[1]);
              }
-            fflush(stdout);
         }
         
         // Store timing samples for analysis (only if buffers allocated successfully)
@@ -1717,15 +1697,15 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                 avg_decode /= samples;
                 avg_render /= samples;
                 
-                printf("\n[TIMING ANALYSIS - Frame %d]\n", diagnostic_frame_count);
-                printf("  DECODE:  Avg: %.3fms, Min: %.3fms, Max: %.3fms (samples: %d)\n",
+                LOG_INFO("TIMING", "Analysis - Frame %d", diagnostic_frame_count);
+                LOG_INFO("TIMING", "  DECODE:  Avg: %.3fms, Min: %.3fms, Max: %.3fms (samples: %d)",
                        avg_decode * 1000, min_decode * 1000, max_decode * 1000, samples);
-                printf("  RENDER:  Avg: %.3fms, Min: %.3fms, Max: %.3fms\n",
+                LOG_INFO("TIMING", "  RENDER:  Avg: %.3fms, Min: %.3fms, Max: %.3fms",
                        avg_render * 1000, min_render * 1000, max_render * 1000);
-                printf("  Target frame time: %.2fms\n", target_frame_time * 1000);
-                printf("  Hardware decode: %s\n", video_is_hardware_decoded(app->video) ? "YES" : "NO");
-                printf("  Total time: %.3fms (decode + render)\n", (avg_decode + avg_render) * 1000);
-                printf("  Note: Low times indicate worker thread and pre-decode optimizations working\n");
+                LOG_INFO("TIMING", "  Target frame time: %.2fms", target_frame_time * 1000);
+                LOG_INFO("TIMING", "  Hardware decode: %s", video_is_hardware_decoded(app->video) ? "YES" : "NO");
+                LOG_INFO("TIMING", "  Total time: %.3fms (decode + render)", (avg_decode + avg_render) * 1000);
+                LOG_DEBUG("TIMING", "  Note: Low times indicate worker thread and pre-decode optimizations working");
 
                 // Only report NV12 stats when hardware decode is enabled
                 bool hw_v1 = video_is_hardware_decoded(app->video);
@@ -1741,7 +1721,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                         }
                     }
 
-                    printf("  NV12 CPU:  V1 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d) | V2 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d)\n",
+                    LOG_INFO("TIMING", "  NV12 CPU:  V1 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d) | V2 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d)",
                            nv12_interval_count[0] ? (nv12_interval_sum[0] / nv12_interval_count[0]) * 1000.0 : 0.0,
                            nv12_interval_min[0] * 1000.0,
                            nv12_interval_max[0] * 1000.0,
@@ -1751,7 +1731,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                            nv12_interval_max[1] * 1000.0,
                            nv12_interval_count[1]);
 
-                    printf("  GL Upload: V1 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d) | V2 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d)\n",
+                    LOG_INFO("TIMING", "  GL Upload: V1 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d) | V2 Avg: %.2fms (min: %.2fms, max: %.2fms, samples: %d)",
                            gl_upload_interval_count[0] ? (gl_upload_interval_sum[0] / gl_upload_interval_count[0]) * 1000.0 : 0.0,
                            gl_upload_interval_min[0] * 1000.0,
                            gl_upload_interval_max[0] * 1000.0,
@@ -1763,10 +1743,9 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                 }
                 
                 if (avg_decode + avg_render > target_frame_time * 1.1) {
-                    printf("  ⚠ WARNING: Frame taking %.0f%% of budget!\n", 
+                    LOG_WARN("TIMING", "Frame taking %.0f%% of budget!", 
                            ((avg_decode + avg_render) / target_frame_time) * 100);
                 }
-                fflush(stdout);
 
                 for (int vid = 0; vid < 2; ++vid) {
                     nv12_interval_sum[vid] = 0.0;
@@ -1819,7 +1798,7 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
                     remaining_time -= drift_correction;
                     
                     if (app->advanced_diagnostics && fabs(wall_drift) > 0.050) {
-                        fprintf(stderr, "[TIMING] Drift correction: %.1fms (total drift: %.1fms)\n",
+                        LOG_DEBUG("TIMING", "Drift correction: %.1fms (total drift: %.1fms)",
                                drift_correction * 1000, wall_drift * 1000);
                     }
                 }
@@ -1838,9 +1817,8 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
         }
 
         if (app->show_timing && total_frame_time > target_frame_time * 1.5) {
-            printf("⚠ Frame processing slow: %.1fms (target: %.1fms)\n",
+            LOG_WARN("TIMING", "Frame processing slow: %.1fms (target: %.1fms)",
                    total_frame_time * 1000, target_frame_time * 1000);
-            fflush(stdout);
         }
     }  // End while (app->running)
     
@@ -1904,5 +1882,5 @@ void app_cleanup(app_context_t *app) {
     }
 
     memset(app, 0, sizeof(*app));
-    printf("Application cleanup complete\n");
+    LOG_INFO("APP", "Application cleanup complete");
 }

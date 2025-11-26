@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "video_decoder.h"
 #include "v4l2_utils.h"
+#include "logging.h"
+#include "production_config.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -22,17 +24,42 @@
 #include <libavcodec/bsf.h>
 
 // Configuration Constants
+// Maximum packets to feed decoder per call - prevents blocking on large buffers
+// 50 packets ~= 2 seconds at 25fps, balances throughput vs responsiveness
 #define MAX_PACKETS_PER_DECODE_CALL 50
+
+// Number of retries when hardware decode fails to initialize
+// Single retry is sufficient - persistent failures indicate hardware unavailable
 #define MAX_HARDWARE_FALLBACK_RETRIES 1
+
+// 10ms delay allows V4L2 M2M driver to flush internal state after codec close
+// Prevents race conditions when reopening decoder or releasing resources
 #define V4L2_CLEANUP_DELAY_US 10000
+
+// 50ms post-cleanup delay ensures V4L2 driver fully releases kernel buffers
+// Required for stable re-initialization after codec failure/reset
 #define V4L2_POST_CLEANUP_DELAY_US 50000
+
+// Safety limit prevents infinite loops if decoder stalls during drain
+// 50 packets = ~2 seconds at 25fps, sufficient for any valid stream flush
 #define DECODER_DRAIN_SAFETY_LIMIT 50
+
+// Buffering progress intervals for user feedback during initialization
+// Show progress at 10, 20, 30, 40 packet milestones to indicate activity
 #define BUFFERING_PROGRESS_INTERVAL_1 10
 #define BUFFERING_PROGRESS_INTERVAL_2 20
 #define BUFFERING_PROGRESS_INTERVAL_3 30
 #define BUFFERING_PROGRESS_INTERVAL_4 40
+
+// Frame debug output interval - log every 100th frame to avoid spam
 #define FRAME_DEBUG_INTERVAL 100
+
+// Default framerate assumption when stream metadata unavailable
+// 30fps is common for H.264 streams, used for timing calculations
 #define DEFAULT_FPS_FALLBACK 30.0
+
+// Minimum avcC extradata size for H.264 SPS/PPS headers
+// 8 bytes = 4-byte size + 1-byte version + 3-byte profile/level
 #define AVCC_EXTRADATA_SIZE 8
 
 // ============================================================================
@@ -53,14 +80,14 @@ static int interrupt_callback(void* opaque) {
     // Check for quit signal
     extern volatile sig_atomic_t g_quit_requested;
     if (g_quit_requested) {
-        fprintf(stderr, "[IO] Interrupt: quit requested\n");
+        LOG_WARN("DECODER", "Interrupt: quit requested");
         return 1;
     }
-    
+
     // Check for timeout (5 seconds default)
     int64_t elapsed = av_gettime_relative() - video->last_io_activity;
     if (elapsed > video->io_timeout_us) {
-        fprintf(stderr, "[IO] Interrupt: timeout after %lld us\n", (long long)elapsed);
+        LOG_WARN("DECODER", "Interrupt: timeout after %lld us", (long long)elapsed);
         return 1;
     }
     
@@ -112,73 +139,73 @@ static enum AVPixelFormat get_format_callback(AVCodecContext *ctx, const enum AV
     }
     
     if (hw_debug_enabled) {
-        printf("\n");
-        printf("╔════════════════════════════════════════════════════════════╗\n");
-        printf("║ [HW_DECODE] FORMAT CALLBACK INVOKED (call #%d)            ║\n", call_num);
-        printf("╚════════════════════════════════════════════════════════════╝\n");
-        printf("[HW_DECODE] Available formats from decoder (ordered by preference):\n");
+        LOG_DEBUG("DECODER", "");
+        LOG_DEBUG("DECODER", "╔════════════════════════════════════════════════════════════╗");
+        LOG_DEBUG("DECODER", "║ [HW_DECODE] FORMAT CALLBACK INVOKED (call #%d)            ║", call_num);
+        LOG_DEBUG("DECODER", "╚════════════════════════════════════════════════════════════╝");
+        LOG_DEBUG("DECODER", "Available formats from decoder (ordered by preference):");
     }
     
     int format_count = 0;
     for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (hw_debug_enabled) {
             const char *name = av_get_pix_fmt_name(*p);
-            printf("[HW_DECODE]   [%d] %s (%d)\n", format_count++, name ? name : "unknown", *p);
+            LOG_DEBUG("DECODER", "  [%d] %s (%d)", format_count++, name ? name : "unknown", *p);
         } else {
             format_count++;
         }
     }
     if (hw_debug_enabled) {
-        printf("[HW_DECODE] Total formats available: %d\n", format_count);
+        LOG_DEBUG("DECODER", "Total formats available: %d", format_count);
     }
     
     // PRIORITY 1: DRM PRIME for zero-copy (if hardware context is enabled)
     for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_DRM_PRIME) {
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] ✓✓✓ Selected: DRM_PRIME (ZERO-COPY MODE ACTIVATED!)\n");
+                LOG_DEBUG("DECODER", "✓✓✓ Selected: DRM_PRIME (ZERO-COPY MODE ACTIVATED!)");
                 fflush(stdout);
             }
             return AV_PIX_FMT_DRM_PRIME;
         }
     }
     if (hw_debug_enabled) {
-        printf("[HW_DECODE] ⚠ DRM_PRIME not offered by decoder for this video\n");
+        LOG_DEBUG("DECODER", "⚠ DRM_PRIME not offered by decoder for this video");
     }
-    
+
     // PRIORITY 2: NV12 for better performance
     for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_NV12) {
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] ✓ Selected: NV12 (hardware mode, no DRM_PRIME available)\n");
+                LOG_DEBUG("DECODER", "✓ Selected: NV12 (hardware mode, no DRM_PRIME available)");
                 fflush(stdout);
             }
             return AV_PIX_FMT_NV12;
         }
     }
-    
+
     // PRIORITY 3: YUV420P
     for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_YUV420P) {
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] ✓ Selected: YUV420P (software fallback)\n");
+                LOG_DEBUG("DECODER", "✓ Selected: YUV420P (software fallback)");
                 fflush(stdout);
             }
             return *p;
         }
     }
-    
+
     // Last resort: first available format
     if (pix_fmts[0] != AV_PIX_FMT_NONE) {
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] ⚠ Selected: %s (first available)\n", 
+            LOG_DEBUG("DECODER", "⚠ Selected: %s (first available)",
                    av_get_pix_fmt_name(pix_fmts[0]));
             fflush(stdout);
         }
         return pix_fmts[0];
     }
-    
-    fprintf(stderr, "[HW_DECODE] ✗ ERROR: No suitable format found!\n");
+
+    LOG_ERROR("DECODER", "No suitable format found!");
     return AV_PIX_FMT_NONE;
 }
 
@@ -216,68 +243,68 @@ static int init_hw_accel_context(video_context_t *video) {
     int ret;
     
     if (hw_debug_enabled) {
-        printf("[HWACCEL] Initializing DRM hardware acceleration...\n");
-        printf("[HWACCEL] This will force V4L2 M2M to use DMABUF mode for GEM-backed buffers\n");
+        LOG_DEBUG("DECODER", "Initializing DRM hardware acceleration...");
+        LOG_DEBUG("DECODER", "This will force V4L2 M2M to use DMABUF mode for GEM-backed buffers");
     }
     
     // Create DRM hardware device context - use same device as display
     const char *drm_device = "/dev/dri/card1";
     if (hw_debug_enabled) {
-        printf("[HWACCEL] Attempting DRM device: %s\n", drm_device);
+        LOG_DEBUG("DECODER", "Attempting DRM device: %s", drm_device);
     }
-    ret = av_hwdevice_ctx_create(&video->hw_device_ctx, AV_HWDEVICE_TYPE_DRM, 
+    ret = av_hwdevice_ctx_create(&video->hw_device_ctx, AV_HWDEVICE_TYPE_DRM,
                                   drm_device, NULL, 0);
     if (ret < 0) {
         if (hw_debug_enabled) {
-            printf("[HWACCEL] card1 failed (%s), trying card0\n", av_err2str(ret));
+            LOG_DEBUG("DECODER", "card1 failed (%s), trying card0", av_err2str(ret));
         }
         drm_device = "/dev/dri/card0";
-        ret = av_hwdevice_ctx_create(&video->hw_device_ctx, AV_HWDEVICE_TYPE_DRM, 
+        ret = av_hwdevice_ctx_create(&video->hw_device_ctx, AV_HWDEVICE_TYPE_DRM,
                                       drm_device, NULL, 0);
         if (ret < 0) {
-            fprintf(stderr, "[HWACCEL] Failed to create DRM device context: %s\n", av_err2str(ret));
-            fprintf(stderr, "[HWACCEL] Without DRM context, V4L2 M2M will use system RAM (no DMABUF)\n");
+            LOG_ERROR("DECODER", "Failed to create DRM device context: %s", av_err2str(ret));
+            LOG_ERROR("DECODER", "Without DRM context, V4L2 M2M will use system RAM (no DMABUF)");
             return -1;
         }
     }
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ DRM device context created using %s\n", drm_device);
+        LOG_DEBUG("DECODER", "✓ DRM device context created using %s", drm_device);
     }
     
     // Diagnostic: Check device context internals (access through AVHWDeviceContext)
     AVHWDeviceContext *hw_dev_ctx = (AVHWDeviceContext *)video->hw_device_ctx->data;
     if (hw_dev_ctx && hw_dev_ctx->hwctx && hw_debug_enabled) {
         AVDRMDeviceContext *drm_ctx = (AVDRMDeviceContext *)hw_dev_ctx->hwctx;
-        printf("[HWACCEL] DRM context fd=%d\n", drm_ctx->fd);
+        LOG_DEBUG("DECODER", "DRM context fd=%d", drm_ctx->fd);
     }
-    
+
     // Assign device context to codec
     // CRITICAL: This assignment triggers FFmpeg to configure V4L2 M2M with DMABUF internally
     video->codec_ctx->hw_device_ctx = av_buffer_ref(video->hw_device_ctx);
     if (!video->codec_ctx->hw_device_ctx) {
-        fprintf(stderr, "[HWACCEL] Failed to reference device context\n");
+        LOG_ERROR("DECODER", "Failed to reference device context");
         av_buffer_unref(&video->hw_device_ctx);
         return -1;
     }
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ Device context assigned to codec\n");
-        printf("[HWACCEL] ✓ V4L2 M2M will use V4L2_MEMORY_DMABUF mode internally in avcodec_open2()\n");
+        LOG_DEBUG("DECODER", "✓ Device context assigned to codec");
+        LOG_DEBUG("DECODER", "✓ V4L2 M2M will use V4L2_MEMORY_DMABUF mode internally in avcodec_open2()");
     }
     
     // For V4L2 M2M with DRM PRIME: Create frames context but DO NOT initialize it
     // V4L2 M2M kernel driver will initialize its own buffer pool during avcodec_open2()
     // We just need to create and configure the context so FFmpeg knows to request drm_prime
     if (hw_debug_enabled) {
-        printf("[HWACCEL] Creating hardware frames context (will NOT initialize)...\n");
+        LOG_DEBUG("DECODER", "Creating hardware frames context (will NOT initialize)...");
     }
-    
+
     video->hw_frames_ctx = av_hwframe_ctx_alloc(video->hw_device_ctx);
     if (!video->hw_frames_ctx) {
-        fprintf(stderr, "[HWACCEL] Failed to allocate HW frames context.\n");
+        LOG_ERROR("DECODER", "Failed to allocate HW frames context.");
         return -1;
     }
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ HW frames context allocated\n");
+        LOG_DEBUG("DECODER", "✓ HW frames context allocated");
     }
     
     // Configure frames context parameters
@@ -301,18 +328,18 @@ static int init_hw_accel_context(video_context_t *video) {
                 frame_width = stream->codecpar->width;
                 frame_height = stream->codecpar->height;
                 if (hw_debug_enabled) {
-                    printf("[HWACCEL] Using stream dimensions: %dx%d\n", frame_width, frame_height);
+                    LOG_DEBUG("DECODER", "Using stream dimensions: %dx%d", frame_width, frame_height);
                 }
             }
         }
     }
-    
+
     // Validate dimensions
     if (frame_width <= 0 || frame_height <= 0) {
-        fprintf(stderr, "[HWACCEL] ⚠ ERROR: Could not determine video dimensions from codec or stream!\n");
-        fprintf(stderr, "[HWACCEL] Codec dimensions: %dx%d, Stream dimensions: unknown\n",
+        LOG_ERROR("DECODER", "Could not determine video dimensions from codec or stream!");
+        LOG_ERROR("DECODER", "Codec dimensions: %dx%d, Stream dimensions: unknown",
                 video->codec_ctx->width, video->codec_ctx->height);
-        fprintf(stderr, "[HWACCEL] Using safe fallback: 1920x1080 (video may not display correctly)\n");
+        LOG_ERROR("DECODER", "Using safe fallback: 1920x1080 (video may not display correctly)");
         frame_width = 1920;
         frame_height = 1080;
     }
@@ -320,50 +347,50 @@ static int init_hw_accel_context(video_context_t *video) {
     frames_ctx->width = frame_width;
     frames_ctx->height = frame_height;
     frames_ctx->initial_pool_size = 0;  // Let V4L2 M2M manage its own pool
-    
+
     if (hw_debug_enabled) {
-        printf("[HWACCEL] Frames context config:\n");
-        printf("[HWACCEL]   format (GPU):  %s (%d)\n", av_get_pix_fmt_name(frames_ctx->format), frames_ctx->format);
-        printf("[HWACCEL]   sw_format:    %s (%d) - bcm2835-codec YU12 output\n", av_get_pix_fmt_name(frames_ctx->sw_format), frames_ctx->sw_format);
-        printf("[HWACCEL]   dimensions:   %dx%d\n", frames_ctx->width, frames_ctx->height);
-        printf("[HWACCEL]   pool size:    %d (V4L2 M2M manages own pool)\n", frames_ctx->initial_pool_size);
+        LOG_DEBUG("DECODER", "Frames context config:");
+        LOG_DEBUG("DECODER", "  format (GPU):  %s (%d)", av_get_pix_fmt_name(frames_ctx->format), frames_ctx->format);
+        LOG_DEBUG("DECODER", "  sw_format:    %s (%d) - bcm2835-codec YU12 output", av_get_pix_fmt_name(frames_ctx->sw_format), frames_ctx->sw_format);
+        LOG_DEBUG("DECODER", "  dimensions:   %dx%d", frames_ctx->width, frames_ctx->height);
+        LOG_DEBUG("DECODER", "  pool size:    %d (V4L2 M2M manages own pool)", frames_ctx->initial_pool_size);
     }
-    
+
     // CRITICAL: Do NOT call av_hwframe_ctx_init() for V4L2 M2M
     // Just assign the uninitialized context to the codec
     // FFmpeg's V4L2 wrapper will see this and request drm_prime capture format
     if (hw_debug_enabled) {
-        printf("[HWACCEL] Skipping av_hwframe_ctx_init() - V4L2 M2M initializes during avcodec_open2()\n");
+        LOG_DEBUG("DECODER", "Skipping av_hwframe_ctx_init() - V4L2 M2M initializes during avcodec_open2()");
     }
-    
+
     video->codec_ctx->hw_frames_ctx = av_buffer_ref(video->hw_frames_ctx);
     if (!video->codec_ctx->hw_frames_ctx) {
-        fprintf(stderr, "[HWACCEL] Failed to assign frames context to codec\n");
+        LOG_ERROR("DECODER", "Failed to assign frames context to codec");
         return -1;
     }
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ Uninitialized frames context assigned to codec\n");
-        printf("[HWACCEL] ✓ This signals V4L2 wrapper to request drm_prime capture format\n");
+        LOG_DEBUG("DECODER", "✓ Uninitialized frames context assigned to codec");
+        LOG_DEBUG("DECODER", "✓ This signals V4L2 wrapper to request drm_prime capture format");
     }
-    
+
     // Critical: Set pixel format hint for DRM_PRIME output
     // This must be done BEFORE codec opening
     video->codec_ctx->pix_fmt = AV_PIX_FMT_DRM_PRIME;
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ Set codec pix_fmt = DRM_PRIME (request DRM PRIME output)\n");
+        LOG_DEBUG("DECODER", "✓ Set codec pix_fmt = DRM_PRIME (request DRM PRIME output)");
     }
-    
+
     // Set format callback (may help if frames context was not assigned)
     video->codec_ctx->get_format = get_format_callback;
     video->codec_ctx->opaque = video;  // Pass context to callback
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ Format negotiation callback registered\n");
+        LOG_DEBUG("DECODER", "✓ Format negotiation callback registered");
     }
-    
+
     video->hw_pix_fmt = AV_PIX_FMT_DRM_PRIME;
     if (hw_debug_enabled) {
-        printf("[HWACCEL] ✓ DRM PRIME hardware acceleration configured\n");
-        printf("[HWACCEL] Ready for zero-copy GPU rendering\n");
+        LOG_DEBUG("DECODER", "✓ DRM PRIME hardware acceleration configured");
+        LOG_DEBUG("DECODER", "Ready for zero-copy GPU rendering");
     }
     
     return 0;
@@ -373,7 +400,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     memset(video, 0, sizeof(*video));
     // Initialize mutex for thread safety
     if (pthread_mutex_init(&video->lock, NULL) != 0) {
-        fprintf(stderr, "Failed to initialize mutex\n");
+        LOG_ERROR("DECODER", "Failed to initialize mutex");
         return -1;
     }
 
@@ -399,15 +426,15 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
 
     // Print decode mode
     if (enable_hardware_decode) {
-        printf("[CONFIG] Hardware decode enabled via --hw flag\n");
+        LOG_INFO("DECODER", "Hardware decode enabled via --hw flag");
     } else {
-        printf("[CONFIG] Software decode (default, use --hw for hardware acceleration)\n");
+        LOG_INFO("DECODER", "Software decode (default, use --hw for hardware acceleration)");
     }
 
     // Allocate packet
     video->packet = av_packet_alloc();
     if (!video->packet) {
-        fprintf(stderr, "Failed to allocate packet\n");
+        LOG_ERROR("DECODER", "Failed to allocate packet");
         return -1;
     }
 
@@ -419,9 +446,9 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     
     // Update activity timestamp before I/O
     video->last_io_activity = av_gettime_relative();
-    
+
     if (avformat_open_input(&video->format_ctx, filename, NULL, &options) < 0) {
-        fprintf(stderr, "Failed to open input file: %s\n", filename);
+        LOG_ERROR("DECODER", "Failed to open input file: %s", filename);
         av_dict_free(&options);
         av_packet_free(&video->packet);
         return -1;
@@ -436,9 +463,9 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     AVDictionary *stream_options = NULL;
     av_dict_set(&stream_options, "analyzeduration", "1000000", 0);  // 1 second max analysis
     av_dict_set(&stream_options, "probesize", "1000000", 0);        // 1MB max probe size
-    
+
     if (avformat_find_stream_info(video->format_ctx, &stream_options) < 0) {
-        fprintf(stderr, "Failed to find stream information\n");
+        LOG_ERROR("DECODER", "Failed to find stream information");
         av_dict_free(&stream_options);
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
@@ -456,7 +483,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     }
 
     if (video->video_stream_index == -1) {
-        fprintf(stderr, "No video stream found\n");
+        LOG_ERROR("DECODER", "No video stream found");
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
         return -1;
@@ -477,92 +504,92 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
 
     if (enable_hardware_decode) {
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] Attempting hardware decoder detection...\n");
-            printf("[HW_DECODE] Codec ID: %d\n", codecpar->codec_id);
-            printf("[HW_DECODE] AV_CODEC_ID_H264 = %d, AV_CODEC_ID_HEVC = %d\n", AV_CODEC_ID_H264, AV_CODEC_ID_HEVC);
+            LOG_DEBUG("DECODER", "Attempting hardware decoder detection...");
+            LOG_DEBUG("DECODER", "Codec ID: %d", codecpar->codec_id);
+            LOG_DEBUG("DECODER", "AV_CODEC_ID_H264 = %d, AV_CODEC_ID_HEVC = %d", AV_CODEC_ID_H264, AV_CODEC_ID_HEVC);
         }
-        
+
         // Try hardware decoder for H.264
         if (codecpar->codec_id == AV_CODEC_ID_H264) {
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] H.264 detected, searching for h264_v4l2m2m decoder...\n");
+                LOG_DEBUG("DECODER", "H.264 detected, searching for h264_v4l2m2m decoder...");
             }
             video->codec = (AVCodec*)avcodec_find_decoder_by_name("h264_v4l2m2m");
             if (video->codec) {
                 video->use_hardware_decode = true;
                 video->hw_decode_type = HW_DECODE_V4L2M2M;
                 if (hw_debug_enabled) {
-                    printf("[HW_DECODE] ✓ Found h264_v4l2m2m hardware decoder\n");
-                    printf("[HW_DECODE] H.264 profile: %d (%s)\n", codecpar->profile, 
+                    LOG_DEBUG("DECODER", "✓ Found h264_v4l2m2m hardware decoder");
+                    LOG_DEBUG("DECODER", "H.264 profile: %d (%s)", codecpar->profile,
                            codecpar->profile == 66 ? "Baseline" :
                            codecpar->profile == 77 ? "Main" :
                            codecpar->profile == 100 ? "High" : "Other");
-                    printf("[HW_DECODE] H.264 level: %d\n", codecpar->level);
-                    printf("[HW_DECODE] Resolution: %dx%d\n", codecpar->width, codecpar->height);
-                    printf("[HW_DECODE] Bitrate: %"PRId64" bps\n", codecpar->bit_rate);
-                    
+                    LOG_DEBUG("DECODER", "H.264 level: %d", codecpar->level);
+                    LOG_DEBUG("DECODER", "Resolution: %dx%d", codecpar->width, codecpar->height);
+                    LOG_DEBUG("DECODER", "Bitrate: %"PRId64" bps", codecpar->bit_rate);
+
                     // Check V4L2 capabilities
                     check_v4l2_decoder_capabilities();
                 }
             } else {
                 if (hw_debug_enabled) {
-                    printf("[HW_DECODE] ✗ h264_v4l2m2m not available\n");
+                    LOG_DEBUG("DECODER", "✗ h264_v4l2m2m not available");
                 }
             }
         } else if (codecpar->codec_id == AV_CODEC_ID_HEVC) {
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] HEVC/H.265 detected, searching for hevc_v4l2m2m decoder...\n");
+                LOG_DEBUG("DECODER", "HEVC/H.265 detected, searching for hevc_v4l2m2m decoder...");
             }
             video->codec = (AVCodec*)avcodec_find_decoder_by_name("hevc_v4l2m2m");
             if (video->codec) {
                 video->use_hardware_decode = true;
                 video->hw_decode_type = HW_DECODE_V4L2M2M;
                 if (hw_debug_enabled) {
-                    printf("[HW_DECODE] ✓ Found hevc_v4l2m2m hardware decoder\n");
-                    printf("[HW_DECODE] HEVC profile: %d\n", codecpar->profile);
-                    printf("[HW_DECODE] HEVC level: %d\n", codecpar->level);
-                    printf("[HW_DECODE] Resolution: %dx%d\n", codecpar->width, codecpar->height);
-                    printf("[HW_DECODE] Bitrate: %"PRId64" bps\n", codecpar->bit_rate);
-                    
+                    LOG_DEBUG("DECODER", "✓ Found hevc_v4l2m2m hardware decoder");
+                    LOG_DEBUG("DECODER", "HEVC profile: %d", codecpar->profile);
+                    LOG_DEBUG("DECODER", "HEVC level: %d", codecpar->level);
+                    LOG_DEBUG("DECODER", "Resolution: %dx%d", codecpar->width, codecpar->height);
+                    LOG_DEBUG("DECODER", "Bitrate: %"PRId64" bps", codecpar->bit_rate);
+
                     // Check V4L2 capabilities
                     check_v4l2_decoder_capabilities();
                 }
             } else {
-                printf("[HW_DECODE] ✗ hevc_v4l2m2m not available\n");
+                LOG_INFO("DECODER", "hevc_v4l2m2m not available");
             }
         } else {
-            printf("[HW_DECODE] Codec ID %d is not H.264 or HEVC, skipping hardware decode\n", codecpar->codec_id);
+            LOG_INFO("DECODER", "Codec ID %d is not H.264 or HEVC, skipping hardware decode", codecpar->codec_id);
         }
-        
+
         // Fall back to software decoder if hardware not available
         if (!video->codec) {
-            printf("[HW_DECODE] Hardware decoder not available, falling back to software\n");
+            LOG_INFO("DECODER", "Hardware decoder not available, falling back to software");
             video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
             if (!video->codec) {
-                fprintf(stderr, "[HW_DECODE] ✗ Failed to find software decoder for codec ID %d\n", codecpar->codec_id);
+                LOG_ERROR("DECODER", "Failed to find software decoder for codec ID %d", codecpar->codec_id);
                 avformat_close_input(&video->format_ctx);
                 av_packet_free(&video->packet);
                 return -1;
             }
-            printf("[HW_DECODE] ✓ Using software decoder: %s\n", video->codec->name);
+            LOG_INFO("DECODER", "✓ Using software decoder: %s", video->codec->name);
         }
     } else {
         // Software decode (default) - reliable and compatible
-        printf("[HW_DECODE] Using software decoder (use --hw flag for hardware acceleration)\n");
+        LOG_INFO("DECODER", "Using software decoder (use --hw flag for hardware acceleration)");
         video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
         if (!video->codec) {
-            fprintf(stderr, "[HW_DECODE] ✗ Failed to find software decoder for codec ID %d\n", codecpar->codec_id);
+            LOG_ERROR("DECODER", "Failed to find software decoder for codec ID %d", codecpar->codec_id);
             avformat_close_input(&video->format_ctx);
             av_packet_free(&video->packet);
             return -1;
         }
-        printf("[HW_DECODE] ✓ Using software decoder: %s\n", video->codec->name);
+        LOG_INFO("DECODER", "✓ Using software decoder: %s", video->codec->name);
     }
 
     // Allocate codec context
     video->codec_ctx = avcodec_alloc_context3(video->codec);
     if (!video->codec_ctx) {
-        fprintf(stderr, "Failed to allocate codec context\n");
+        LOG_ERROR("DECODER", "Failed to allocate codec context");
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
         return -1;
@@ -570,7 +597,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
 
     // Copy codec parameters to context
     if (avcodec_parameters_to_context(video->codec_ctx, codecpar) < 0) {
-        fprintf(stderr, "Failed to copy codec parameters\n");
+        LOG_ERROR("DECODER", "Failed to copy codec parameters");
         avcodec_free_context(&video->codec_ctx);
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
@@ -587,38 +614,43 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         codecpar->extradata && codecpar->extradata_size > 0 && codecpar->extradata[0] == 1) {
         
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: Analyzing stream format...\n");
-            printf("[HW_DECODE] BSF: First 8 bytes of extradata: ");
+            LOG_DEBUG("HW_DECODE", "BSF: Analyzing stream format...");
+            // Log first 8 bytes of extradata as hex string
+            char hex_str[32];
             for (int i = 0; i < 8 && i < codecpar->extradata_size; i++) {
-                printf("%02x ", codecpar->extradata[i]);
+                snprintf(hex_str + i*3, sizeof(hex_str) - i*3, "%02x ", codecpar->extradata[i]);
             }
-            printf("\n");
-            printf("[HW_DECODE] BSF: Detected avcC format (byte 0 = 0x01)\n");
-            printf("[HW_DECODE] BSF: Will convert avcC → Annex-B for V4L2 M2M\n");
+            LOG_TRACE("HW_DECODE", "BSF: First 8 bytes of extradata: %s", hex_str);
+            LOG_DEBUG("HW_DECODE", "BSF: Detected avcC format (byte 0 = 0x01)");
+            LOG_DEBUG("HW_DECODE", "BSF: Will convert avcC → Annex-B for V4L2 M2M");
         }
         
         video->avcc_length_size = get_avcc_length_size(codecpar->extradata, codecpar->extradata_size);
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: avcC NAL length size: %d bytes\n", video->avcc_length_size);
+            LOG_DEBUG("HW_DECODE", "BSF: avcC NAL length size: %d bytes", video->avcc_length_size);
         }
         
+        // Select appropriate BSF based on codec type
+        const char *bsf_name = (codecpar->codec_id == AV_CODEC_ID_HEVC) ?
+                               "hevc_mp4toannexb" : "h264_mp4toannexb";
+
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: Initializing h264_mp4toannexb bitstream filter...\n");
+            LOG_DEBUG("HW_DECODE", "BSF: Initializing %s bitstream filter...", bsf_name);
         }
-        
-        // h264_mp4toannexb (avcC → Annex-B conversion)
-        const AVBitStreamFilter *bsf_annexb = av_bsf_get_by_name("h264_mp4toannexb");
+
+        // mp4toannexb (avcC/hvcC → Annex-B conversion)
+        const AVBitStreamFilter *bsf_annexb = av_bsf_get_by_name(bsf_name);
         if (!bsf_annexb) {
-            fprintf(stderr, "[HW_DECODE] BSF: ✗ Failed to find h264_mp4toannexb BSF\n");
+            LOG_ERROR("HW_DECODE", "BSF: ✗ Failed to find %s BSF", bsf_name);
             video_cleanup(video);
             return -1;
         }
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: ✓ Found h264_mp4toannexb filter\n");
+            LOG_DEBUG("HW_DECODE", "BSF: ✓ Found %s filter", bsf_name);
         }
         
         if (av_bsf_alloc(bsf_annexb, &video->bsf_annexb_ctx) < 0) {
-            fprintf(stderr, "[HW_DECODE] BSF: ✗ Failed to allocate BSF context\n");
+            LOG_ERROR("HW_DECODE", "BSF: ✗ Failed to allocate BSF context");
             // Cleanup already allocated resources before video_cleanup
             if (video->codec_ctx) {
                 avcodec_free_context(&video->codec_ctx);
@@ -627,16 +659,16 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             return -1;
         }
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: ✓ Allocated BSF context\n");
+            LOG_DEBUG("HW_DECODE", "BSF: ✓ Allocated BSF context");
         }
         
         avcodec_parameters_copy(video->bsf_annexb_ctx->par_in, codecpar);
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: ✓ Copied codec parameters to BSF\n");
+            LOG_DEBUG("HW_DECODE", "BSF: ✓ Copied codec parameters to BSF");
         }
         
         if (av_bsf_init(video->bsf_annexb_ctx) < 0) {
-            fprintf(stderr, "[HW_DECODE] BSF: ✗ Failed to initialize BSF\n");
+            LOG_ERROR("HW_DECODE", "BSF: ✗ Failed to initialize BSF");
             // BSF context will be freed in video_cleanup
             if (video->codec_ctx) {
                 avcodec_free_context(&video->codec_ctx);
@@ -645,13 +677,13 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             return -1;
         }
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: ✓ Initialized BSF successfully\n");
+            LOG_DEBUG("HW_DECODE", "BSF: ✓ Initialized BSF successfully");
         }
         
         // Copy the BSF output parameters (with converted Annex-B extradata) to codec context
         if (video->bsf_annexb_ctx->par_out->extradata && video->bsf_annexb_ctx->par_out->extradata_size > 0) {
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] BSF: Converting extradata to Annex-B format...\n");
+                LOG_DEBUG("HW_DECODE", "BSF: Converting extradata to Annex-B format...");
             }
             // Free existing extradata
             if (video->codec_ctx->extradata) {
@@ -662,158 +694,195 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             video->codec_ctx->extradata = av_mallocz(video->codec_ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
             memcpy(video->codec_ctx->extradata, video->bsf_annexb_ctx->par_out->extradata, video->codec_ctx->extradata_size);
             if (hw_debug_enabled) {
-                printf("[HW_DECODE] BSF: ✓ Converted extradata (%d bytes)\n", video->codec_ctx->extradata_size);
+                LOG_DEBUG("HW_DECODE", "BSF: ✓ Converted extradata (%d bytes)", video->codec_ctx->extradata_size);
             }
         }
         
         // Set codec_tag to 0 for Annex-B format
         video->codec_ctx->codec_tag = 0;
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] BSF: Set codec_tag=0 for Annex-B format\n");
-            printf("[HW_DECODE] BSF: ✓ avcC → Annex-B conversion ready\n");
+            LOG_DEBUG("HW_DECODE", "BSF: Set codec_tag=0 for Annex-B format");
+            LOG_DEBUG("HW_DECODE", "BSF: ✓ avcC → Annex-B conversion ready");
         }
     }
 
     // Configure hardware decoding for V4L2 M2M
     if (video->use_hardware_decode && video->hw_decode_type == HW_DECODE_V4L2M2M) {
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: Configuring V4L2 M2M decoder for Raspberry Pi...\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: Configuring V4L2 M2M decoder for Raspberry Pi...");
         }
-        
-        // NOTE: DRM device context, pix_fmt, and get_format already set in init_hw_accel_context()
-        // which is called later before avcodec_open2()
-        
+
         // CRITICAL: V4L2 M2M must be single-threaded
         video->codec_ctx->thread_count = 1;
         video->codec_ctx->thread_type = 0;  // Disable all threading
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: Set thread_count=1, thread_type=0 (V4L2 handles threading)\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: Set thread_count=1, thread_type=0 (V4L2 handles threading)");
         }
-        
+
         // Low-latency flags for better V4L2 M2M performance
         video->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
         video->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: ✓ LOW_DELAY and FAST flags enabled\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: ✓ LOW_DELAY and FAST flags enabled");
         }
-        
+
         // Enable CHUNKS mode for V4L2 M2M decoder (handles partial frames)
         video->codec_ctx->flags2 |= AV_CODEC_FLAG2_CHUNKS;
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: ✓ CHUNKS mode enabled (supports partial frames)\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: ✓ CHUNKS mode enabled (supports partial frames)");
         }
-        
+
         // Prepare V4L2-specific options
         AVDictionary *codec_opts = NULL;
-        
+
         // CRITICAL: Configure V4L2 buffer counts for stability
         av_dict_set(&codec_opts, "num_capture_buffers", "32", 0);
         av_dict_set(&codec_opts, "num_output_buffers", "16", 0);
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: Set num_capture_buffers=32, num_output_buffers=16\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: Set num_capture_buffers=32, num_output_buffers=16");
         }
-        
-        // CRITICAL: Do NOT force mmap mode - allow DMABUF/DRM PRIME mode for zero-copy
-        // Remove the mmap forcing to enable DRM PRIME buffers
+
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: Allowing DMABUF/DRM PRIME mode for zero-copy\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: Configuration complete");
+            LOG_DEBUG("HW_DECODE", "V4L2: Note - decoder may buffer 20-30 packets before first frame");
         }
-        
-        // Optional: Force specific device (uncomment if needed)
-        // av_dict_set(&codec_opts, "device", "/dev/video10", 0);
-        // printf("[HW_DECODE] V4L2: Set device=/dev/video10\n");
-        
+
+        // FFmpeg 7.x COMPATIBILITY: Try opening V4L2 M2M WITHOUT DRM hardware context first
+        // The DRM hw_device_ctx can cause format negotiation failures in FFmpeg 7.x
+        // If simple V4L2 M2M works, we get hardware decode with CPU-accessible YUV buffers
+        // (still faster than software decode, just not zero-copy to GPU)
+
         if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: Configuration complete\n");
-            printf("[HW_DECODE] V4L2: Note - decoder may buffer 20-30 packets before first frame\n");
+            LOG_DEBUG("HW_DECODE", "V4L2: Trying simple V4L2 M2M mode (no DRM PRIME)...");
         }
-        
-        // Initialize DRM PRIME hardware acceleration for zero-copy rendering
-        // This enables V4L2 M2M to output directly to GPU memory (DRM_PRIME format)
-        // Keystone correction will work via GPU shaders on DMA-imported textures
-        if (init_hw_accel_context(video) < 0) {
-            fprintf(stderr, "[HW_DECODE] Failed to initialize DRM PRIME context\n");
-            fprintf(stderr, "[HW_DECODE] Falling back to CPU-accessible YUV buffers (slower but compatible)\n");
-            // Continue without DRM PRIME - will use system RAM buffers
-        } else if (hw_debug_enabled) {
-            printf("[HW_DECODE] ✓ DRM PRIME hardware acceleration initialized\n");
-            printf("[HW_DECODE] Zero-copy rendering enabled - frames will be in GPU memory\n");
-        }
-        
+
         // Enable FFmpeg debug logging to see V4L2 M2M internals (only in debug mode)
         if (hw_debug_enabled) {
             av_log_set_level(AV_LOG_DEBUG);
-            printf("[DEBUG] FFmpeg log level set to DEBUG to trace V4L2 M2M format negotiation\n");
+            LOG_DEBUG("DEBUG", "FFmpeg log level set to DEBUG to trace V4L2 M2M format negotiation");
         } else {
             av_log_set_level(AV_LOG_QUIET);
         }
-        
-        // Open codec with V4L2 options
+
+        // First attempt: Simple V4L2 M2M without DRM context
         int ret = avcodec_open2(video->codec_ctx, video->codec, &codec_opts);
-        
+
         // Reset log level after codec open
         if (hw_debug_enabled) {
             av_log_set_level(AV_LOG_INFO);
         } else {
             av_log_set_level(AV_LOG_QUIET);
         }
-        
+
         av_dict_free(&codec_opts);
         
         if (ret < 0) {
-            fprintf(stderr, "Failed to open V4L2 M2M codec: %s\n", av_err2str(ret));
-            fprintf(stderr, "This might indicate:\n");
-            fprintf(stderr, "  - V4L2 M2M driver not compatible with this FFmpeg version\n");
-            fprintf(stderr, "  - Missing /dev/video* device\n");
-            fprintf(stderr, "  - Codec doesn't support this video profile/level\n");
+            LOG_ERROR("HW_DECODE", "Failed to open V4L2 M2M codec: %s", av_err2str(ret));
+            LOG_WARN("HW_DECODE", "This might indicate:");
+            LOG_WARN("HW_DECODE", "  - V4L2 M2M driver not compatible with this FFmpeg version");
+            LOG_WARN("HW_DECODE", "  - Missing /dev/video* device");
+            LOG_WARN("HW_DECODE", "  - Codec doesn't support this video profile/level");
+            LOG_INFO("HW_DECODE", "Falling back to software decoder...");
+
+            // Clean up hardware-specific resources before fallback
+            if (video->hw_frames_ctx) {
+                av_buffer_unref(&video->hw_frames_ctx);
+                video->hw_frames_ctx = NULL;
+            }
+            if (video->hw_device_ctx) {
+                av_buffer_unref(&video->hw_device_ctx);
+                video->hw_device_ctx = NULL;
+            }
+            if (video->bsf_annexb_ctx) {
+                av_bsf_free(&video->bsf_annexb_ctx);
+                video->bsf_annexb_ctx = NULL;
+            }
             avcodec_free_context(&video->codec_ctx);
-            avformat_close_input(&video->format_ctx);
-            av_packet_free(&video->packet);
-            return -1;
-        }
-        if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2: ✓ Codec opened successfully with V4L2 options\n");
-        }
-        
-        // Mark DMA buffer export as supported for V4L2 M2M decoder
-        video->supports_dma_export = true;
-        if (hw_debug_enabled) {
-            printf("[HW_DECODE] DMA zero-copy buffer export enabled (V4L2 M2M capable)\n");
-        }
-        
-        // Try to extract V4L2 device FD from codec context for later DMABUF export
-        // The V4L2 m2m decoder stores the device FD in priv_data
-        // This is needed to call VIDIOC_EXPBUF on decoded output buffers
-        // Note: This is internal FFmpeg implementation detail, may vary by version
-        if (hw_debug_enabled) {
-            printf("[HW_DECODE] V4L2 output buffers will be accessed via VIDIOC_EXPBUF for zero-copy GPU mapping\n");
+
+            // Find software decoder
+            video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
+            if (!video->codec) {
+                LOG_ERROR("HW_DECODE", "Failed to find software decoder for fallback");
+                avformat_close_input(&video->format_ctx);
+                av_packet_free(&video->packet);
+                return -1;
+            }
+
+            LOG_INFO("DECODE", "Found software decoder: %s", video->codec->name);
+
+            // Allocate new codec context for software decoding
+            video->codec_ctx = avcodec_alloc_context3(video->codec);
+            if (!video->codec_ctx) {
+                LOG_ERROR("HW_DECODE", "Failed to allocate software codec context");
+                avformat_close_input(&video->format_ctx);
+                av_packet_free(&video->packet);
+                return -1;
+            }
+
+            // Copy codec parameters
+            if (avcodec_parameters_to_context(video->codec_ctx, codecpar) < 0) {
+                LOG_ERROR("HW_DECODE", "Failed to copy codec parameters for software decoder");
+                avcodec_free_context(&video->codec_ctx);
+                avformat_close_input(&video->format_ctx);
+                av_packet_free(&video->packet);
+                return -1;
+            }
+
+            // Software decoding settings - optimized for parallel decode
+            video->codec_ctx->thread_count = 0; // 0 = auto-detect CPU cores
+            video->codec_ctx->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
+
+            // Open software codec
+            if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
+                LOG_ERROR("HW_DECODE", "Failed to open software codec during fallback");
+                avcodec_free_context(&video->codec_ctx);
+                avformat_close_input(&video->format_ctx);
+                av_packet_free(&video->packet);
+                return -1;
+            }
+
+            // Update state to reflect software decoding
+            video->use_hardware_decode = false;
+            video->hw_decode_type = HW_DECODE_NONE;
+            video->supports_dma_export = false;
+
+            LOG_INFO("SW_DECODE", "Software decoder initialized successfully (fallback from hardware)");
+            LOG_INFO("SW_DECODE", "Multi-threaded decode enabled (auto CPU cores, slice+frame threading)");
+        } else {
+            // Hardware codec opened successfully in simple V4L2 M2M mode
+            LOG_INFO("HW_DECODE", "V4L2: ✓ Codec opened successfully (simple V4L2 M2M mode)");
+            LOG_INFO("HW_DECODE", "V4L2: Hardware decode active with CPU-accessible YUV buffers");
+
+            // Simple V4L2 M2M mode does not use DRM PRIME / zero-copy
+            // Frames will be in system RAM, uploaded to GPU via texture upload
+            video->supports_dma_export = false;
         }
     } else {
         // Software decoding settings - optimized for parallel decode
         video->codec_ctx->thread_count = 0; // 0 = auto-detect CPU cores
         video->codec_ctx->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
-        printf("[SW_DECODE] Multi-threaded decode enabled (auto CPU cores, slice+frame threading)\n");
+        LOG_INFO("SW_DECODE", "Multi-threaded decode enabled (auto CPU cores, slice+frame threading)");
         
         // Open codec
         if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
-            fprintf(stderr, "Failed to open codec\n");
-            fprintf(stderr, "This might indicate:\n");
-            fprintf(stderr, "  - Missing codec support\n");
-            fprintf(stderr, "  - Incompatible video format\n");
+            LOG_ERROR("DECODE", "Failed to open codec");
+            LOG_ERROR("DECODE", "This might indicate:");
+            LOG_ERROR("DECODE", "  - Missing codec support");
+            LOG_ERROR("DECODE", "  - Incompatible video format");
             avcodec_free_context(&video->codec_ctx);
             avformat_close_input(&video->format_ctx);
             av_packet_free(&video->packet);
             return -1;
         }
     }
-    printf("Codec opened successfully\n");
+    LOG_INFO("DECODE", "Codec opened successfully");
 
     // Debug: Print the actual pixel format and color space being used
     const char *pix_fmt_name = av_get_pix_fmt_name(video->codec_ctx->pix_fmt);
-    printf("Decoder output format: %s (%d)\n", pix_fmt_name ? pix_fmt_name : "unknown", video->codec_ctx->pix_fmt);
+    LOG_INFO("DECODE", "Decoder output format: %s (%d)", pix_fmt_name ? pix_fmt_name : "unknown", video->codec_ctx->pix_fmt);
     
     // Print color space information for debugging
-    printf("Color space: %s, Color range: %s\n",
+    LOG_INFO("DECODE", "Color space: %s, Color range: %s",
            av_color_space_name(video->codec_ctx->colorspace),
            av_color_range_name(video->codec_ctx->color_range));
 
@@ -821,20 +890,43 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     video->width = video->codec_ctx->width;
     video->height = video->codec_ctx->height;
     
+    // PRODUCTION: Validate video dimensions against memory limits (critical for 2GB Pi 4)
+    // Each video at 1080p uses ~15-25MB for decode buffers
+    // 4K uses ~60-100MB - allow but warn
+    // 8K would use ~240-400MB - reject to prevent OOM
+    if (video->width > MAX_VIDEO_WIDTH || video->height > MAX_VIDEO_HEIGHT) {
+        LOG_ERROR("DECODE", "Video resolution %dx%d exceeds maximum allowed %dx%d",
+                  video->width, video->height, MAX_VIDEO_WIDTH, MAX_VIDEO_HEIGHT);
+        LOG_ERROR("DECODE", "This limit prevents out-of-memory conditions on 2GB systems");
+        avcodec_free_context(&video->codec_ctx);
+        avformat_close_input(&video->format_ctx);
+        av_packet_free(&video->packet);
+        return -1;
+    }
+    
+    // Estimate memory usage for this video and warn if approaching limits
+    size_t estimated_decode_mem = (size_t)video->width * video->height * 3; // ~3 bytes per pixel for decode buffers
+    size_t memory_limit_bytes = (size_t)MEMORY_LIMIT_MB * 1024 * 1024;
+    if (estimated_decode_mem > memory_limit_bytes / 2) {
+        LOG_WARN("DECODE", "Video %dx%d estimated to use ~%zu MB - approaching memory limit",
+                 video->width, video->height, estimated_decode_mem / (1024 * 1024));
+        LOG_WARN("DECODE", "Consider using lower resolution content for 2GB Raspberry Pi 4");
+    }
+    
     AVStream *stream = video->format_ctx->streams[video->video_stream_index];
     // Safely calculate FPS, guarding against invalid frame rates
     if (stream->r_frame_rate.den > 0) {
         video->fps = (double)stream->r_frame_rate.num / stream->r_frame_rate.den;
     } else {
         video->fps = 30.0; // Default fallback
-        fprintf(stderr, "Warning: Invalid frame rate denominator, defaulting to 30 FPS\n");
+        LOG_WARN("DECODE", "Invalid frame rate denominator, defaulting to 30 FPS");
     }
     video->duration = stream->duration;
 
     // Allocate frame for YUV data (decoded frame from decoder)
     video->frame = av_frame_alloc();
     if (!video->frame) {
-        fprintf(stderr, "Failed to allocate frame\n");
+        LOG_ERROR("DECODE", "Failed to allocate frame");
         video_cleanup(video);
         return -1;
     }
@@ -844,9 +936,61 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     // so existing rendering paths can treat hardware and software decode uniformly.
     video->sw_frame = av_frame_alloc();
     if (!video->sw_frame) {
-        fprintf(stderr, "Failed to allocate software frame for hardware decode\n");
+        LOG_ERROR("DECODE", "Failed to allocate software frame for hardware decode");
         video_cleanup(video);
         return -1;
+    }
+    
+    // PRODUCTION: Pre-allocate YUV cache buffers at startup
+    // This avoids malloc/realloc calls in the hot decode path which can cause
+    // frame drops or stuttering. We allocate based on video dimensions with
+    // 20% headroom to handle slight resolution changes without reallocation.
+    if (video->width > 0 && video->height > 0) {
+        // Calculate buffer sizes with 20% headroom
+        size_t headroom_width = video->width + (video->width / 5);
+        size_t headroom_height = video->height + (video->height / 5);
+        
+        // Y plane: full resolution
+        size_t y_size = headroom_width * headroom_height;
+        
+        // U and V planes: quarter resolution (YUV420)
+        size_t uv_width = headroom_width / 2;
+        size_t uv_height = headroom_height / 2;
+        size_t uv_size = uv_width * uv_height;
+        
+        // Allocate Y buffer
+        video->cached_y_buffer = malloc(y_size);
+        if (video->cached_y_buffer) {
+            video->cached_y_size = y_size;
+            LOG_INFO("DECODE", "Pre-allocated Y cache buffer: %zu KB", y_size / 1024);
+        } else {
+            LOG_WARN("DECODE", "Failed to pre-allocate Y cache buffer, will allocate on-demand");
+        }
+        
+        // Allocate U buffer
+        video->cached_u_buffer = malloc(uv_size);
+        if (video->cached_u_buffer) {
+            video->cached_u_size = uv_size;
+        }
+        
+        // Allocate V buffer
+        video->cached_v_buffer = malloc(uv_size);
+        if (video->cached_v_buffer) {
+            video->cached_v_size = uv_size;
+        }
+        
+        // Allocate NV12 buffer (Y + interleaved UV = 1.5x Y size)
+        size_t nv12_size = y_size + (y_size / 2);
+        video->nv12_buffer = malloc(nv12_size);
+        if (video->nv12_buffer) {
+            video->nv12_buffer_size = nv12_size;
+            LOG_DEBUG("DECODE", "Pre-allocated NV12 buffer: %zu KB", nv12_size / 1024);
+        }
+        
+        // Initialize tracking pointers to NULL (no frame cached yet)
+        video->last_y_source = NULL;
+        video->last_u_source = NULL;
+        video->last_v_source = NULL;
     }
     
     // Mark as initialized
@@ -854,9 +998,9 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
 
     // Skip RGB conversion - we'll do YUV→RGB on GPU
     if (!video->use_hardware_decode) {
-        printf("Note: Using software YUV decode, GPU will handle YUV→RGB conversion\n");
+        LOG_INFO("DECODE", "Using software YUV decode, GPU will handle YUV→RGB conversion");
     } else {
-        printf("Hardware decoding to YUV420P enabled, GPU will handle YUV→RGB conversion\n");
+        LOG_INFO("DECODE", "Hardware decoding to YUV420P enabled, GPU will handle YUV→RGB conversion");
     }
 
     video->eof_reached = false;
@@ -870,8 +1014,7 @@ int video_decode_frame(video_context_t *video) {
     video->decode_call_count++;
     
     if (video->decode_call_count == 1) {
-        printf("video_decode_frame() starting...\n");
-        fflush(stdout);
+        LOG_DEBUG("DECODE", "video_decode_frame() starting...");
     }
     
     if (!video->initialized || video->eof_reached) {
@@ -887,8 +1030,8 @@ int video_decode_frame(video_context_t *video) {
     // Hardware decoders that are broken/incompatible will hang immediately
     if (video->decode_call_count == 1 && video->use_hardware_decode) {
     // Some videos (especially high bitrate) may need 40-50 packets
-        printf("[HW_DECODE] First decode: will send up to %d packets before software fallback\n", MAX_PACKETS_PER_DECODE_CALL);
-        printf("[HW_DECODE] Note: V4L2 M2M may buffer 20-50 packets depending on video\n");
+        LOG_DEBUG("HW_DECODE", "First decode: will send up to %d packets before software fallback", MAX_PACKETS_PER_DECODE_CALL);
+        LOG_DEBUG("HW_DECODE", "Note: V4L2 M2M may buffer 20-50 packets depending on video");
     }
     
     while (packets_sent_this_call < MAX_PACKETS_PER_DECODE_CALL) {
@@ -904,16 +1047,13 @@ int video_decode_frame(video_context_t *video) {
             
             if (frame_count == 1) {
                 const char *fmt_name = av_get_pix_fmt_name(video->frame->format);
-                printf("\n✓✓✓ SUCCESS! First frame decoded after %d packets ✓✓✓\n", packets_sent_this_call);
-                printf("* Decoder: %s\n", video->use_hardware_decode ? "Hardware (V4L2 M2M)" : "Software");
-                printf("* Frame format: %s (%d)\n", fmt_name ? fmt_name : "unknown", video->frame->format);
-                printf("* Frame size: %dx%d\n", video->frame->width, video->frame->height);
-                printf("* Picture type: %c\n", av_get_picture_type_char(video->frame->pict_type));
-                printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
-                fflush(stdout);
+                LOG_INFO("DECODE", "SUCCESS! First frame decoded after %d packets", packets_sent_this_call);
+                LOG_INFO("DECODE", "Decoder: %s", video->use_hardware_decode ? "Hardware (V4L2 M2M)" : "Software");
+                LOG_INFO("DECODE", "Frame format: %s (%d)", fmt_name ? fmt_name : "unknown", video->frame->format);
+                LOG_INFO("DECODE", "Frame size: %dx%d", video->frame->width, video->frame->height);
+                LOG_DEBUG("DECODE", "Picture type: %c", av_get_picture_type_char(video->frame->pict_type));
             } else if (video->advanced_diagnostics && (frame_count % 100) == 0) {
-                printf("Frame #%d decoded successfully\n", frame_count);
-                fflush(stdout);
+                LOG_DEBUG("DECODE", "Frame #%d decoded successfully", frame_count);
             }
             
             // Check for hardware buffer availability (zero-copy indicator)
@@ -921,14 +1061,14 @@ int video_decode_frame(video_context_t *video) {
                 // Check for direct DMABUF export support
                 AVFrameSideData *dma_side_data = av_frame_get_side_data(video->frame, AV_FRAME_DATA_DMABUF_EXPORT);
                 if (dma_side_data) {
-                    printf("[ZERO-COPY] DMA export available\n");
+                    LOG_DEBUG("ZERO-COPY", "DMA export available");
                     video->supports_dma_export = true;
                 } else {
                     // Enable anyway for testing - your patch might use a different mechanism
                     video->supports_dma_export = true;
                 }
                 
-                printf("[ZERO-COPY] Format: %s\n", av_get_pix_fmt_name(video->frame->format));
+                LOG_DEBUG("ZERO-COPY", "Format: %s", av_get_pix_fmt_name(video->frame->format));
             }
             
             // For each decoded frame, try to extract the DMA FD from DRM PRIME hardware frames
@@ -962,18 +1102,18 @@ int video_decode_frame(video_context_t *video) {
                         }
 
                         if (frame_count == 1) {
-                            printf("[ZERO-COPY] ✓✓✓ DRM PRIME frame detected!\n");
-                            printf("[ZERO-COPY] DMA Buffer FD=%d, Size=%zu bytes\n", new_dma_fd, drm_size);
-                            printf("[ZERO-COPY] Layers: %d, Objects: %d\n", drm_desc->nb_layers, drm_desc->nb_objects);
+                            LOG_DEBUG("ZERO-COPY", "DRM PRIME frame detected!");
+                            LOG_DEBUG("ZERO-COPY", "DMA Buffer FD=%d, Size=%zu bytes", new_dma_fd, drm_size);
+                            LOG_DEBUG("ZERO-COPY", "Layers: %d, Objects: %d", drm_desc->nb_layers, drm_desc->nb_objects);
 
                             // Show layer information (Y/UV planes)
                             for (int layer = 0; layer < drm_desc->nb_layers; layer++) {
                                 AVDRMLayerDescriptor *layer_desc = &drm_desc->layers[layer];
-                                printf("[ZERO-COPY]   Layer %d: format=0x%08x, %d planes\n",
+                                LOG_TRACE("ZERO-COPY", "  Layer %d: format=0x%08x, %d planes",
                                        layer, layer_desc->format, layer_desc->nb_planes);
                                 for (int p = 0; p < layer_desc->nb_planes && p < 3; p++) {
                                     AVDRMPlaneDescriptor *plane = &layer_desc->planes[p];
-                                    printf("[ZERO-COPY]     Plane %d: offset=%ld, pitch=%ld\n",
+                                    LOG_TRACE("ZERO-COPY", "    Plane %d: offset=%ld, pitch=%ld",
                                            p, (long)plane->offset, (long)plane->pitch);
                                 }
                             }
@@ -981,7 +1121,7 @@ int video_decode_frame(video_context_t *video) {
 
                         video->supports_dma_export = true;
                     } else if (frame_count == 1) {
-                        printf("[ZERO-COPY] ⚠ DRM PRIME format but no descriptor objects!\n");
+                        LOG_WARN("ZERO-COPY", "DRM PRIME format but no descriptor objects!");
                     }
                 }
                 
@@ -996,7 +1136,7 @@ int video_decode_frame(video_context_t *video) {
                     // This FD can be passed directly to EGL for DMA-BUF import
                     int dup_fd = dup(new_dma_fd);
                     if (dup_fd < 0) {
-                        fprintf(stderr, "[ZERO-COPY] Failed to dup DMA FD %d: %s\n", new_dma_fd, strerror(errno));
+                        LOG_ERROR("ZERO-COPY", "Failed to dup DMA FD %d: %s", new_dma_fd, strerror(errno));
                         av_frame_unref(video->frame);
                         return -1;
                     }
@@ -1004,13 +1144,13 @@ int video_decode_frame(video_context_t *video) {
                     video->dma_size = drm_size;
                     
                     if (frame_count == 1) {
-                        printf("[ZERO-COPY] ✓ DMA FD duplicated: %d (ready for EGL import)\n", video->dma_fd);
-                        printf("[DECODE_TRACE] Frame 1: video->dma_fd=%d, video->use_hardware_decode=%d\n", 
+                        LOG_DEBUG("ZERO-COPY", "DMA FD duplicated: %d (ready for EGL import)", video->dma_fd);
+                        LOG_TRACE("DECODE_TRACE", "Frame 1: video->dma_fd=%d, video->use_hardware_decode=%d", 
                                video->dma_fd, video->use_hardware_decode);
                     }
                 } else if (video->use_hardware_decode && frame_count == 1 && video->frame->format != AV_PIX_FMT_DRM_PRIME) {
                     // Not a DRM PRIME frame - still using system memory
-                    printf("[ZERO-COPY] ⚠ Frame is %s, not DRM_PRIME (system RAM fallback)\n",
+                    LOG_DEBUG("ZERO-COPY", "Frame is %s, not DRM_PRIME (system RAM fallback)",
                            av_get_pix_fmt_name(video->frame->format));
                 }
             }
@@ -1031,12 +1171,12 @@ int video_decode_frame(video_context_t *video) {
                     int tr_ret = av_hwframe_transfer_data(video->sw_frame, video->frame, 0);
                     pthread_mutex_unlock(&video->lock);
                     if (tr_ret < 0) {
-                        fprintf(stderr, "[HW_DECODE] Failed to transfer DRM_PRIME frame to software: %s\n", av_err2str(tr_ret));
+                        LOG_ERROR("HW_DECODE", "Failed to transfer DRM_PRIME frame to software: %s", av_err2str(tr_ret));
                     } else {
                         // Log sw_frame format on first successful transfer
                         static bool sw_format_logged = false;
                         if (!sw_format_logged) {
-                            printf("[HW_DECODE] sw_frame format after transfer: %s (%d)\n",
+                            LOG_DEBUG("HW_DECODE", "sw_frame format after transfer: %s (%d)",
                                    av_get_pix_fmt_name(video->sw_frame->format), video->sw_frame->format);
                             sw_format_logged = true;
                         }
@@ -1051,14 +1191,14 @@ int video_decode_frame(video_context_t *video) {
             // End of stream reached
             video->eof_reached = true;
             if (video->decode_call_count == 1 && video->advanced_diagnostics) {
-                printf("End of video stream reached\n");
+                LOG_DEBUG("DECODE", "End of video stream reached");
             }
             return -1;
         }
         
         if (receive_result != AVERROR(EAGAIN)) {
             // Unexpected error
-            printf("Error receiving frame from decoder: %s\n", av_err2str(receive_result));
+            LOG_ERROR("DECODE", "Error receiving frame from decoder: %s", av_err2str(receive_result));
             return -1;
         }
         
@@ -1075,7 +1215,7 @@ int video_decode_frame(video_context_t *video) {
                 // No more packets in file
                 static int eof_count = 0;
                 if (eof_count++ < 3) {
-                    printf("[DEBUG] av_read_frame returned EOF (packets_sent=%d)\n", packets_sent_this_call);
+                    LOG_DEBUG("DEBUG", "av_read_frame returned EOF (packets_sent=%d)", packets_sent_this_call);
                 }
                 
                 // Flush decoder to get any remaining buffered frames
@@ -1093,7 +1233,7 @@ int video_decode_frame(video_context_t *video) {
                 return -1;
             } else {
                 // PRODUCTION: On read error, attempt keyframe recovery instead of stopping
-                fprintf(stderr, "[RECOVERY] Read error: %s, seeking to next keyframe\n", av_err2str(read_result));
+                LOG_WARN("RECOVERY", "Read error: %s, seeking to next keyframe", av_err2str(read_result));
                 
                 if (video->format_ctx && video->video_stream_index >= 0) {
                     AVStream *stream = video->format_ctx->streams[video->video_stream_index];
@@ -1108,13 +1248,13 @@ int video_decode_frame(video_context_t *video) {
                     if (seek_result >= 0) {
                         // Flush decoder after seek to clear any corrupted state
                         avcodec_flush_buffers(video->codec_ctx);
-                        fprintf(stderr, "[RECOVERY] Successfully seeked to keyframe\n");
+                        LOG_INFO("RECOVERY", "Successfully seeked to keyframe");
                         return -1;  // Retry decode on next call
                     }
                 }
                 
                 // If seek failed or unavailable, stop playback
-                fprintf(stderr, "[RECOVERY] Seek failed or unavailable, stopping playback\n");
+                LOG_ERROR("RECOVERY", "Seek failed or unavailable, stopping playback");
                 return -1;
             }
         }
@@ -1162,20 +1302,20 @@ int video_decode_frame(video_context_t *video) {
         av_packet_unref(video->packet);
         
         if (send_result < 0) {
-            fprintf(stderr, "[HW_DECODE] ✗ Error sending packet to decoder: %s\n", av_err2str(send_result));
+            LOG_ERROR("HW_DECODE", "Error sending packet to decoder: %s", av_err2str(send_result));
             return -1;
         }
         
         // Show buffering progress for V4L2 M2M on first decode
         if (video->use_hardware_decode && video->decode_call_count == 1) {
             if (packets_sent_this_call == 10) {
-                printf("[HW_DECODE] Buffering: sent %d packets, waiting for first frame...\n", packets_sent_this_call);
+                LOG_INFO("HW_DECODE", "Buffering: sent %d packets, waiting for first frame...", packets_sent_this_call);
             } else if (packets_sent_this_call == 20) {
-                printf("[HW_DECODE] Buffering: sent %d packets (normal for V4L2 M2M)...\n", packets_sent_this_call);
+                LOG_INFO("HW_DECODE", "Buffering: sent %d packets (normal for V4L2 M2M)...", packets_sent_this_call);
             } else if (packets_sent_this_call == 30) {
-                printf("[HW_DECODE] Buffering: sent %d packets...\n", packets_sent_this_call);
+                LOG_INFO("HW_DECODE", "Buffering: sent %d packets...", packets_sent_this_call);
             } else if (packets_sent_this_call == 40) {
-                printf("[HW_DECODE] Buffering: sent %d packets (large buffer needed)...\n", packets_sent_this_call);
+                LOG_INFO("HW_DECODE", "Buffering: sent %d packets (large buffer needed)...", packets_sent_this_call);
             }
         }
         
@@ -1185,11 +1325,10 @@ int video_decode_frame(video_context_t *video) {
     
     // If we hit the safety limit without getting a frame, fallback to software
     if (video->use_hardware_decode) {
-        printf("\n[HW_DECODE] ========== HARDWARE DECODER TIMEOUT ==========\n");
-        printf("[HW_DECODE] Sent %d packets but decoder returned no frames\n", packets_sent_this_call);
-        printf("[HW_DECODE] This indicates the V4L2 M2M decoder is not working\n");
-        printf("[HW_DECODE] Falling back to software decoding...\n");
-        printf("[HW_DECODE] ===============================================\n\n");
+        LOG_WARN("HW_DECODE", "HARDWARE DECODER TIMEOUT");
+        LOG_WARN("HW_DECODE", "Sent %d packets but decoder returned no frames", packets_sent_this_call);
+        LOG_WARN("HW_DECODE", "This indicates the V4L2 M2M decoder is not working");
+        LOG_INFO("HW_DECODE", "Falling back to software decoding...");
         
         // Clean up BSF chain from hardware decoding
         if (video->bsf_annexb_ctx) {
@@ -1212,22 +1351,22 @@ int video_decode_frame(video_context_t *video) {
         AVCodecParameters *codecpar = video->format_ctx->streams[video->video_stream_index]->codecpar;
         video->codec = (AVCodec*)avcodec_find_decoder(codecpar->codec_id);
         if (!video->codec) {
-            fprintf(stderr, "[HW_DECODE] ✗ No software decoder available\n");
+            LOG_ERROR("HW_DECODE", "No software decoder available");
             return -1;
         }
         
-        printf("[HW_DECODE] Found software decoder: %s\n", video->codec->name);
+        LOG_INFO("HW_DECODE", "Found software decoder: %s", video->codec->name);
         
         // Allocate new codec context for software decoding
         video->codec_ctx = avcodec_alloc_context3(video->codec);
         if (!video->codec_ctx) {
-            fprintf(stderr, "[HW_DECODE] ✗ Failed to allocate software codec context\n");
+            LOG_ERROR("HW_DECODE", "Failed to allocate software codec context");
             return -1;
         }
         
         // Copy codec parameters
         if (avcodec_parameters_to_context(video->codec_ctx, codecpar) < 0) {
-            fprintf(stderr, "[HW_DECODE] ✗ Failed to copy codec parameters\n");
+            LOG_ERROR("HW_DECODE", "Failed to copy codec parameters");
             avcodec_free_context(&video->codec_ctx);
             return -1;
         }
@@ -1238,13 +1377,13 @@ int video_decode_frame(video_context_t *video) {
         
         // Open software codec
         if (avcodec_open2(video->codec_ctx, video->codec, NULL) < 0) {
-            fprintf(stderr, "[HW_DECODE] ✗ Failed to open software codec\n");
+            LOG_ERROR("HW_DECODE", "Failed to open software codec");
             avcodec_free_context(&video->codec_ctx);
             return -1;
         }
         
-        printf("[HW_DECODE] ✓ Software decoder initialized successfully\n");
-        printf("[HW_DECODE] Continuing playback with software decoding...\n\n");
+        LOG_INFO("HW_DECODE", "Software decoder initialized successfully");
+        LOG_INFO("HW_DECODE", "Continuing playback with software decoding...");
         video->use_hardware_decode = false;
         
         // Try decoding again with software decoder
@@ -1285,7 +1424,7 @@ uint8_t* video_get_y_data(video_context_t *video) {
                 pthread_mutex_unlock(&video->lock);
                 return video->frame->data[0]; // Fallback
             }
-            printf("[PERF] Allocated %zu KB cached Y buffer for hardware decode\n", y_size / 1024);
+            LOG_DEBUG("PERF", "Allocated %zu KB cached Y buffer for hardware decode", y_size / 1024);
         }
 
         // Copy to cached memory (fast memcpy, then fast GL upload)
@@ -1386,7 +1525,7 @@ int video_restart_playback(video_context_t *video) {
     // Reset EOF flag LAST (after everything is flushed)
     video->eof_reached = false;
 
-    printf("[RESTART] Video playback restarted successfully\n");
+    LOG_INFO("RESTART", "Video playback restarted successfully");
     return 0;
 }
 
@@ -1420,7 +1559,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
         uint8_t u_val = src->data[1] ? src->data[1][0] : 0;
         uint8_t v_val = src->data[2] ? src->data[2][0] : 0;
         if (abs(u_val - 128) > 50 || abs(v_val - 128) > 50) {
-            printf("DEBUG: Unusual YUV values - U:%02x V:%02x (expected ~80)\n", u_val, v_val);
+            LOG_DEBUG("DEBUG", "Unusual YUV values - U:%02x V:%02x (expected ~80)", u_val, v_val);
         }
         video->debug_printed = true;
     }
@@ -1494,7 +1633,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
         }
 
         if (hw_copy_logs < 3) {
-            printf("[HW_COPY] Copied DRM_PRIME frame into cached buffers (Y:%zu bytes)\n", y_bytes);
+            LOG_DEBUG("HW_COPY", "Copied DRM_PRIME frame into cached buffers (Y:%zu bytes)", y_bytes);
             hw_copy_logs++;
         }
         pthread_mutex_unlock(&video->lock);
@@ -1668,7 +1807,7 @@ void video_seek(video_context_t *video, int64_t timestamp) {
         return;
     }
     
-    printf("[SEEK] Seeking to timestamp %ld...\n", timestamp);
+    LOG_DEBUG("SEEK", "Seeking to timestamp %ld...", timestamp);
     
     // Reset EOF flag BEFORE seeking
     video->eof_reached = false;
@@ -1679,13 +1818,13 @@ void video_seek(video_context_t *video, int64_t timestamp) {
     
     if (seek_result < 0) {
         // Fallback to timestamp-based seek
-        printf("[SEEK] Frame seek failed, trying timestamp seek\n");
+        LOG_DEBUG("SEEK", "Frame seek failed, trying timestamp seek");
         seek_result = avformat_seek_file(video->format_ctx, video->video_stream_index, 
                                         INT64_MIN, timestamp, timestamp, 0);
     }
     
     if (seek_result < 0) {
-        printf("[SEEK] Error: Seek failed: %s\n", av_err2str(seek_result));
+        LOG_ERROR("SEEK", "Seek failed: %s", av_err2str(seek_result));
         return;
     }
     
@@ -1703,7 +1842,7 @@ void video_seek(video_context_t *video, int64_t timestamp) {
     // Unref any existing packet data
     av_packet_unref(video->packet);
     
-    printf("[SEEK] Seek completed successfully\n");
+    LOG_DEBUG("SEEK", "Seek completed successfully");
 }
 
 void video_cleanup(video_context_t *video) {
@@ -1765,7 +1904,7 @@ void video_cleanup(video_context_t *video) {
             // Send EOF to decoder
             int ret = avcodec_send_packet(video->codec_ctx, NULL);
             if (ret < 0 && ret != AVERROR_EOF) {
-                fprintf(stderr, "[CLEANUP] Warning: V4L2 M2M EOF send failed: %s\n", av_err2str(ret));
+                LOG_WARN("CLEANUP", "V4L2 M2M EOF send failed: %s", av_err2str(ret));
             }
             
             // Drain all remaining frames
@@ -1786,7 +1925,7 @@ void video_cleanup(video_context_t *video) {
                 av_frame_free(&dummy);
                 
                 if (drain_count > 0) {
-                    printf("[CLEANUP] Drained %d frames from V4L2 M2M decoder\n", drain_count);
+                    LOG_DEBUG("CLEANUP", "Drained %d frames from V4L2 M2M decoder", drain_count);
                 }
             }
             
@@ -1840,13 +1979,13 @@ void video_cleanup(video_context_t *video) {
         pthread_mutex_unlock(&video->lock);
     } else if (lock_result == EBUSY) {
         // Mutex is locked (shouldn't happen, but handle it)
-        fprintf(stderr, "[CLEANUP] Warning: Mutex still locked during cleanup\n");
+        LOG_WARN("CLEANUP", "Mutex still locked during cleanup");
     }
     
     // Safe pthread cleanup with error checking
     int mutex_result = pthread_mutex_destroy(&video->lock);
     if (mutex_result != 0 && mutex_result != EINVAL) {
-        fprintf(stderr, "[CLEANUP] Warning: pthread_mutex_destroy failed: %d\n", mutex_result);
+        LOG_WARN("CLEANUP", "pthread_mutex_destroy failed: %d", mutex_result);
     }
     
     memset(video, 0, sizeof(*video));
