@@ -810,8 +810,12 @@ void gl_setup_buffers(gl_context_t *gl) {
     // Setup corner highlight VBO - will be updated with actual corner positions
     glGenBuffers(1, &gl->corner_vbo);
     
-    // Setup border VBO - will be updated with actual border positions
+    // Setup border VBO - OPTIMIZED: pre-allocate buffer for 8 vertices * 6 floats
+    // This avoids glBufferData reallocation every frame when border is visible
     glGenBuffers(1, &gl->border_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
+    glBufferData(GL_ARRAY_BUFFER, 48 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     
     // Setup help overlay VBO - will be updated with help overlay geometry
     glGenBuffers(1, &gl->help_vbo);
@@ -1435,9 +1439,9 @@ void gl_render_border(gl_context_t *gl, keystone_context_t *keystone) {
     border_vertices[43] = corners[CORNER_TOP_LEFT].y;
     border_vertices[44] = r; border_vertices[45] = g; border_vertices[46] = b; border_vertices[47] = a;
     
-    // Update border VBO with new positions
+    // Update border VBO with new positions - OPTIMIZED: use glBufferSubData
     glBindBuffer(GL_ARRAY_BUFFER, gl->border_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(border_vertices), border_vertices, GL_DYNAMIC_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(border_vertices), border_vertices);
     
     // Use corner shader program (same as corners, just different geometry)
     glUseProgram(gl->corner_program);

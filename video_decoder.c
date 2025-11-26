@@ -23,6 +23,14 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 
+// ARM NEON SIMD support for optimized memory operations
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define HAS_NEON 1
+#else
+#define HAS_NEON 0
+#endif
+
 // Configuration Constants
 // Maximum packets to feed decoder per call - prevents blocking on large buffers
 // 50 packets ~= 2 seconds at 25fps, balances throughput vs responsiveness
@@ -1610,25 +1618,39 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
             video->cached_v_size = v_bytes;
         }
 
-        // Copy Y plane (respecting stride)
+        // Copy Y plane - OPTIMIZED: single memcpy when stride matches width
         uint8_t *dst_y = video->cached_y_buffer;
-        for (int row = 0; row < height; row++) {
-            memcpy(dst_y + row * width, src->data[0] + row * src->linesize[0], width);
-        }
-
-        // Copy U plane
-        if (src->data[1]) {
-            uint8_t *dst_u = video->cached_u_buffer;
-            for (int row = 0; row < uv_height; row++) {
-                memcpy(dst_u + row * uv_width, src->data[1] + row * src->linesize[1], uv_width);
+        if (src->linesize[0] == width) {
+            // Fast path: stride matches width, single copy
+            memcpy(dst_y, src->data[0], y_bytes);
+        } else {
+            // Slow path: stride differs, row-by-row copy
+            for (int row = 0; row < height; row++) {
+                memcpy(dst_y + row * width, src->data[0] + row * src->linesize[0], width);
             }
         }
 
-        // Copy V plane
+        // Copy U plane - OPTIMIZED: single memcpy when stride matches
+        if (src->data[1]) {
+            uint8_t *dst_u = video->cached_u_buffer;
+            if (src->linesize[1] == uv_width) {
+                memcpy(dst_u, src->data[1], u_bytes);
+            } else {
+                for (int row = 0; row < uv_height; row++) {
+                    memcpy(dst_u + row * uv_width, src->data[1] + row * src->linesize[1], uv_width);
+                }
+            }
+        }
+
+        // Copy V plane - OPTIMIZED: single memcpy when stride matches
         if (src->data[2]) {
             uint8_t *dst_v = video->cached_v_buffer;
-            for (int row = 0; row < uv_height; row++) {
-                memcpy(dst_v + row * uv_width, src->data[2] + row * src->linesize[2], uv_width);
+            if (src->linesize[2] == uv_width) {
+                memcpy(dst_v, src->data[2], v_bytes);
+            } else {
+                for (int row = 0; row < uv_height; row++) {
+                    memcpy(dst_v + row * uv_width, src->data[2] + row * src->linesize[2], uv_width);
+                }
             }
         }
 
@@ -1714,10 +1736,15 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
         return NULL;
     }
 
-    // Copy Y plane (full resolution)
-    for (int row = 0; row < height; row++) {
-        memcpy(dst, y_data + (row * y_stride), width);
-        dst += width;
+    // Copy Y plane (full resolution) - OPTIMIZED: single memcpy when stride matches
+    if (y_stride == width) {
+        memcpy(dst, y_data, (size_t)width * height);
+        dst += width * height;
+    } else {
+        for (int row = 0; row < height; row++) {
+            memcpy(dst, y_data + (row * y_stride), width);
+            dst += width;
+        }
     }
 
     // Copy UV data depending on source format
@@ -1752,10 +1779,30 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
             uint8_t *u_row = u_data + (row * u_stride);
             uint8_t *v_row = v_data + (row * v_stride);
 
+#if HAS_NEON
+            // NEON-optimized UV interleaving - process 16 bytes at a time
+            int col = 0;
+            for (; col + 16 <= uv_width; col += 16) {
+                uint8x16_t u_chunk = vld1q_u8(u_row + col);
+                uint8x16_t v_chunk = vld1q_u8(v_row + col);
+                // Interleave U and V: U0V0U1V1U2V2...
+                uint8x16x2_t interleaved = vzipq_u8(u_chunk, v_chunk);
+                vst1q_u8(dst, interleaved.val[0]);
+                vst1q_u8(dst + 16, interleaved.val[1]);
+                dst += 32;
+            }
+            // Handle remaining bytes
+            for (; col < uv_width; col++) {
+                *dst++ = u_row[col];
+                *dst++ = v_row[col];
+            }
+#else
+            // Scalar fallback
             for (int col = 0; col < uv_width; col++) {
                 *dst++ = u_row[col];
                 *dst++ = v_row[col];
             }
+#endif
         }
     }
 
