@@ -1013,6 +1013,7 @@ void app_run(app_context_t *app) {
         // OPTIMIZATION: Pre-decode next frame while rendering current frame
         // This hides decode latency by overlapping decode with render/swap
         static bool next_frame_ready = false;
+        static bool next_frame_ready2 = false;  // Pre-decode flag for Video 2
         static bool first_frame_decoded = false;
         static bool first_frame_decoded2 = false;
         const bool using_async_primary = (app->async_decoder_primary != NULL);
@@ -1216,27 +1217,60 @@ void app_run(app_context_t *app) {
         } // End of main decode/render block
 
         // Decode second video if available
-        // SYNCHRONOUS software decode for stability (async caused flickering)
+        // OPTIMIZED: Pre-decode pattern - use pre-decoded frame, then decode next during render
+        // This hides decode latency by overlapping decode with GPU work
         if (app->video2) {
-            int decode_result = video_decode_frame(app->video2);
-
-            if (decode_result == 0) {
+            // If we have a pre-decoded frame ready, use it (zero decode time this iteration!)
+            if (next_frame_ready2 && first_frame_decoded2) {
+                // Use the frame that was already decoded last iteration
                 video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
                                    &y_stride2, &u_stride2, &v_stride2);
 
                 if (y_data2 != NULL) {
                     frame_count2++;
-                    if (!first_frame_decoded2) {
-                        LOG_INFO("DECODE", "First frame of video 2 decoded successfully (SW sync)");
-                        first_frame_decoded2 = true;
-                    }
                     new_secondary_frame_ready = true;
                 }
-            } else if (video_is_eof(app->video2)) {
-                if (app->loop_playback) {
-                    video_seek(app->video2, 0);
-                    first_frame_decoded2 = false;
-                    frame_count2 = 0;
+                
+                // Decode NEXT frame (will be ready for next iteration)
+                // This decode happens during render of current frame
+                int decode_result = video_decode_frame(app->video2);
+                if (decode_result == 0) {
+                    next_frame_ready2 = true;
+                } else if (video_is_eof(app->video2)) {
+                    if (app->loop_playback) {
+                        video_seek(app->video2, 0);
+                        first_frame_decoded2 = false;
+                        next_frame_ready2 = false;
+                        frame_count2 = 0;
+                    }
+                } else {
+                    // Decode failed but not EOF - keep showing last frame
+                    next_frame_ready2 = false;
+                }
+            } else {
+                // First frame or no pre-decoded frame - decode synchronously
+                int decode_result = video_decode_frame(app->video2);
+
+                if (decode_result == 0) {
+                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                       &y_stride2, &u_stride2, &v_stride2);
+
+                    if (y_data2 != NULL) {
+                        frame_count2++;
+                        if (!first_frame_decoded2) {
+                            LOG_INFO("DECODE", "First frame of video 2 decoded successfully (SW pre-decode)");
+                            first_frame_decoded2 = true;
+                        }
+                        new_secondary_frame_ready = true;
+                        next_frame_ready2 = true;  // Mark that we have a frame ready for next iteration
+                    }
+                } else if (video_is_eof(app->video2)) {
+                    if (app->loop_playback) {
+                        video_seek(app->video2, 0);
+                        first_frame_decoded2 = false;
+                        next_frame_ready2 = false;
+                        frame_count2 = 0;
+                    }
                 }
             }
         }
