@@ -755,13 +755,22 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             LOG_DEBUG("HW_DECODE", "V4L2: Note - decoder may buffer 20-30 packets before first frame");
         }
 
-        // FFmpeg 7.x COMPATIBILITY: Try opening V4L2 M2M WITHOUT DRM hardware context first
-        // The DRM hw_device_ctx can cause format negotiation failures in FFmpeg 7.x
-        // If simple V4L2 M2M works, we get hardware decode with CPU-accessible YUV buffers
-        // (still faster than software decode, just not zero-copy to GPU)
-
+        // ZERO-COPY OPTIMIZATION: Initialize DRM hardware acceleration context
+        // This enables V4L2 M2M to output DRM_PRIME frames for GPU zero-copy rendering
+        // If this fails, we'll fall back to V4L2 M2M without DRM (still faster than SW)
         if (hw_debug_enabled) {
-            LOG_DEBUG("HW_DECODE", "V4L2: Trying simple V4L2 M2M mode (no DRM PRIME)...");
+            LOG_DEBUG("HW_DECODE", "V4L2: Attempting DRM PRIME zero-copy mode...");
+        }
+
+        int drm_init_result = init_hw_accel_context(video);
+        if (drm_init_result < 0) {
+            LOG_WARN("HW_DECODE", "DRM context initialization failed - falling back to non-zero-copy mode");
+            LOG_INFO("HW_DECODE", "Hardware decode will still work, but with CPU texture upload instead of zero-copy");
+            // Continue without DRM context - V4L2 M2M will output YUV420P to system RAM
+        } else {
+            if (hw_debug_enabled) {
+                LOG_DEBUG("HW_DECODE", "✓ DRM context initialized - zero-copy enabled");
+            }
         }
 
         // Enable FFmpeg debug logging to see V4L2 M2M internals (only in debug mode)
@@ -772,7 +781,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             av_log_set_level(AV_LOG_QUIET);
         }
 
-        // First attempt: Simple V4L2 M2M without DRM context
+        // Open V4L2 M2M codec (with or without DRM context depending on init result)
         int ret = avcodec_open2(video->codec_ctx, video->codec, &codec_opts);
 
         // Reset log level after codec open

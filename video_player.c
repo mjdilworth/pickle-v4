@@ -518,10 +518,14 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
         LOG_INFO("APP", "Video 2 dimensions: %dx%d (within limits)", app->video2->width, app->video2->height);
         video_set_loop(app->video2, loop_playback);
 
-        // Video 2 uses SYNCHRONOUS software decode for stability
-        // Async decode caused flickering due to timing/buffer issues
-        app->async_decoder_secondary = NULL;
-        LOG_INFO("APP", "Video 2 using synchronous software decode");
+        // OPTIMIZATION: Enable async decode for Video 2 to overlap decode with rendering
+        // This hides the ~7-9ms software decode time, improving performance
+        app->async_decoder_secondary = async_decode_create(app->video2);
+        if (!app->async_decoder_secondary) {
+            LOG_WARN("APP", "Failed to create async decoder for Video 2, using sync decode");
+        } else {
+            LOG_INFO("APP", "Async decoder created for video 2 (software decode)");
+        }
     }
 
     // Initialize keystone correction
@@ -716,6 +720,7 @@ void app_run(app_context_t *app) {
     bool first_decode_attempted = false;
     bool primary_async_requested = false;
     bool primary_async_request_pending = false;
+    bool secondary_async_requested = false;  // Track async decode requests for Video 2
     
     while (app->running && !g_quit_requested) {
         clock_gettime(CLOCK_MONOTONIC, &current_time);
@@ -1217,46 +1222,69 @@ void app_run(app_context_t *app) {
         } // End of main decode/render block
 
         // Decode second video if available
-        // OPTIMIZED: Pre-decode pattern - use pre-decoded frame, decode next AFTER render
-        // This hides decode latency by overlapping decode with vsync wait
+        // ASYNC OPTIMIZATION: Use async decoder to overlap decode with rendering
         if (app->video2) {
-            // If we have a pre-decoded frame ready, use it (zero decode time this iteration!)
-            if (next_frame_ready2 && first_frame_decoded2) {
-                // Use the frame that was already decoded last iteration
-                video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
-                                   &y_stride2, &u_stride2, &v_stride2);
+            if (app->async_decoder_secondary) {
+                // ASYNC PATH: Check if frame is ready from background thread
+                int wait_timeout_ms = first_frame_decoded2 ? 0 : 100;  // Wait for first frame, poll after
 
-                if (y_data2 != NULL) {
-                    frame_count2++;
-                    new_secondary_frame_ready = true;
+                if (!secondary_async_requested) {
+                    async_decode_request_frame(app->async_decoder_secondary);
+                    secondary_async_requested = true;
                 }
-                
-                // Mark that we need to decode next frame AFTER render (see below)
-                // Don't decode here - it blocks before render starts!
-                next_frame_ready2 = false;  // Will be set true after decode below
-            } else {
-                // First frame or no pre-decoded frame - decode synchronously
-                int decode_result = video_decode_frame(app->video2);
 
-                if (decode_result == 0) {
+                if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms)) {
                     video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
                                        &y_stride2, &u_stride2, &v_stride2);
 
                     if (y_data2 != NULL) {
                         frame_count2++;
                         if (!first_frame_decoded2) {
-                            LOG_INFO("DECODE", "First frame of video 2 decoded successfully (SW pre-decode)");
+                            LOG_INFO("DECODE", "First frame of video 2 decoded successfully (async)");
                             first_frame_decoded2 = true;
                         }
                         new_secondary_frame_ready = true;
-                        next_frame_ready2 = true;  // Mark that we have a frame ready for next iteration
+                        secondary_async_requested = false;  // Ready for next request
                     }
                 } else if (video_is_eof(app->video2)) {
                     if (app->loop_playback) {
                         video_seek(app->video2, 0);
                         first_frame_decoded2 = false;
-                        next_frame_ready2 = false;
                         frame_count2 = 0;
+                        secondary_async_requested = false;
+                    }
+                }
+            } else {
+                // SYNC FALLBACK: If async decoder creation failed, use synchronous decode
+                if (next_frame_ready2 && first_frame_decoded2) {
+                    video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                       &y_stride2, &u_stride2, &v_stride2);
+                    if (y_data2 != NULL) {
+                        frame_count2++;
+                        new_secondary_frame_ready = true;
+                    }
+                    next_frame_ready2 = false;
+                } else {
+                    int decode_result = video_decode_frame(app->video2);
+                    if (decode_result == 0) {
+                        video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,
+                                           &y_stride2, &u_stride2, &v_stride2);
+                        if (y_data2 != NULL) {
+                            frame_count2++;
+                            if (!first_frame_decoded2) {
+                                LOG_INFO("DECODE", "First frame of video 2 decoded successfully (sync fallback)");
+                                first_frame_decoded2 = true;
+                            }
+                            new_secondary_frame_ready = true;
+                            next_frame_ready2 = true;
+                        }
+                    } else if (video_is_eof(app->video2)) {
+                        if (app->loop_playback) {
+                            video_seek(app->video2, 0);
+                            first_frame_decoded2 = false;
+                            next_frame_ready2 = false;
+                            frame_count2 = 0;
+                        }
                     }
                 }
             }
@@ -1442,13 +1470,29 @@ void app_run(app_context_t *app) {
             bool video2_rendered = false;
             struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
 
-            // SYNC DECODE: Video 2 always has fresh data when new_secondary_frame_ready is true
+            // ANTI-FLICKER: Keep static frame data to prevent async race conditions
+            static uint8_t *last_y_data2 = NULL;
+            static uint8_t *last_u_data2 = NULL;
+            static uint8_t *last_v_data2 = NULL;
+            static int last_y_stride2 = 0, last_u_stride2 = 0, last_v_stride2 = 0;
+
+            // Update static buffers only when new frame is ready
             if (new_secondary_frame_ready && y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
+                last_y_data2 = y_data2;
+                last_u_data2 = u_data2;
+                last_v_data2 = v_data2;
+                last_y_stride2 = y_stride2;
+                last_u_stride2 = u_stride2;
+                last_v_stride2 = v_stride2;
+            }
+
+            // Always render using last known good frame (prevents flickering)
+            if (last_y_data2 && last_u_data2 && last_v_data2 && last_y_stride2 > 0) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
                 }
-                gl_render_frame(app->gl, y_data2, u_data2, v_data2, video_width2, video_height2,
-                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                gl_render_frame(app->gl, last_y_data2, last_u_data2, last_v_data2, video_width2, video_height2,
+                              last_y_stride2, last_u_stride2, last_v_stride2, app->drm, app->keystone2, false, 1);
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
                     upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
@@ -1601,24 +1645,8 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             }
         }
         
-        // OPTIMIZATION: Pre-decode Video 2's next frame AFTER swap (during vsync wait)
-        // This overlaps decode with display, hiding latency
-        if (app->video2 && first_frame_decoded2 && !next_frame_ready2) {
-            int decode_result = video_decode_frame(app->video2);
-            if (decode_result == 0) {
-                next_frame_ready2 = true;
-            } else if (video_is_eof(app->video2)) {
-                if (app->loop_playback) {
-                    video_seek(app->video2, 0);
-                    first_frame_decoded2 = false;
-                    next_frame_ready2 = false;
-                    frame_count2 = 0;
-                }
-            } else {
-                // Decode failed but not EOF - will retry next frame
-                next_frame_ready2 = false;
-            }
-        }
+        // NOTE: Video 2 pre-decode removed - now handled by async decoder thread
+        // The async decoder continuously decodes in background, no need for explicit pre-decode
 
         // Update render_time from actual local timestamps
         render_time = (render_end.tv_sec - render_start.tv_sec) +
