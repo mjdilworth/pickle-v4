@@ -71,6 +71,7 @@ int main(int argc, char *argv[]) {
     bool debug_gamepad = false;
     bool advanced_diagnostics = false;
     bool enable_hardware_decode = false;  // Changed: now defaults to software
+    bool dual_hw_decode = false;  // Both videos use HW decode (experimental)
     char *video_file = NULL;
     char *video_file2 = NULL;
 
@@ -88,6 +89,10 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--hw") == 0) {
             enable_hardware_decode = true;
             LOG_INFO("MAIN", "Hardware decode enabled (--hw flag set)");
+        } else if (strcmp(argv[i], "--dual-hw") == 0) {
+            enable_hardware_decode = true;
+            dual_hw_decode = true;
+            LOG_INFO("MAIN", "Dual hardware decode enabled (both videos use V4L2 M2M)");
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             LOG_INFO("MAIN", "%s", VERSION_FULL);
             LOG_INFO("MAIN", "Semantic versioning: %d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
@@ -106,6 +111,7 @@ int main(int argc, char *argv[]) {
             LOG_INFO("MAIN", "  --debug-gamepad  Log gamepad button presses");
             LOG_INFO("MAIN", "  --hw-debug       Enable detailed hardware decoder diagnostics");
             LOG_INFO("MAIN", "  --hw             Enable hardware decode (default: software)");
+            LOG_INFO("MAIN", "  --dual-hw        Enable HW decode for both videos (experimental)");
             LOG_INFO("MAIN", "  -v, --version    Show version information");
             LOG_INFO("MAIN", "  -h, --help       Show this help message");
             LOG_INFO("MAIN", "\nKeyboard Controls:");
@@ -162,7 +168,7 @@ int main(int argc, char *argv[]) {
     setup_signal_handlers();
     
     // Initialize and run the video player
-    if (app_init(&app, video_file, video_file2, loop_playback, show_timing, debug_gamepad, advanced_diagnostics, enable_hardware_decode) != 0) {
+    if (app_init(&app, video_file, video_file2, loop_playback, show_timing, debug_gamepad, advanced_diagnostics, enable_hardware_decode, dual_hw_decode) != 0) {
         LOG_ERROR("MAIN", "Failed to initialize application");
         g_app = NULL;  // Clear global reference
         return 1;

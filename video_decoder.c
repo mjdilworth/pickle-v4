@@ -485,11 +485,26 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         return -1;
     }
 
+    // PRODUCTION: Pre-allocate format context so we can set interrupt callback BEFORE open
+    // This protects against infinite hangs on network stream opens
+    video->format_ctx = avformat_alloc_context();
+    if (!video->format_ctx) {
+        LOG_ERROR("DECODER", "Failed to allocate format context");
+        av_packet_free(&video->packet);
+        return -1;
+    }
+    
+    // Set interrupt callback BEFORE opening - protects against network hangs
+    video->format_ctx->interrupt_callback.callback = interrupt_callback;
+    video->format_ctx->interrupt_callback.opaque = video;
+
     // Modern libavformat: Open input file with optimized I/O options
     AVDictionary *options = NULL;
     av_dict_set(&options, "buffer_size", "32768", 0);        // 32KB buffer for better I/O
     av_dict_set(&options, "multiple_requests", "1", 0);      // Enable HTTP keep-alive
     av_dict_set(&options, "reconnect", "1", 0);              // Auto-reconnect on network issues
+    av_dict_set(&options, "timeout", "5000000", 0);          // 5 second connection timeout (microseconds)
+    av_dict_set(&options, "rw_timeout", "5000000", 0);       // 5 second read/write timeout
     
     // Update activity timestamp before I/O
     video->last_io_activity = av_gettime_relative();
@@ -497,14 +512,12 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     if (avformat_open_input(&video->format_ctx, filename, NULL, &options) < 0) {
         LOG_ERROR("DECODER", "Failed to open input file: %s", filename);
         av_dict_free(&options);
+        avformat_free_context(video->format_ctx);
+        video->format_ctx = NULL;
         av_packet_free(&video->packet);
         return -1;
     }
     av_dict_free(&options);
-    
-    // PRODUCTION: Set interrupt callback AFTER format_ctx is opened
-    video->format_ctx->interrupt_callback.callback = interrupt_callback;
-    video->format_ctx->interrupt_callback.opaque = video;
 
     // Modern libavformat: Efficient stream information retrieval
     AVDictionary *stream_options = NULL;
@@ -1190,26 +1203,29 @@ int video_decode_frame(video_context_t *video) {
                 
                 // If we found a valid FD from actual GEM-backed buffer, use it for zero-copy
                 if (new_dma_fd >= 0 && new_dma_fd < 1024) {
-                    // Close previous DMA FD if open
-                    if (video->dma_fd >= 0) {
-                        close(video->dma_fd);
-                    }
-                    
                     // Duplicate the FD so we own it (FFmpeg may close the original)
                     // This FD can be passed directly to EGL for DMA-BUF import
                     int dup_fd = dup(new_dma_fd);
                     if (dup_fd < 0) {
-                        LOG_ERROR("ZERO-COPY", "Failed to dup DMA FD %d: %s", new_dma_fd, strerror(errno));
-                        av_frame_unref(video->frame);
-                        return -1;
-                    }
-                    video->dma_fd = dup_fd;
-                    video->dma_size = drm_size;
+                        // PRODUCTION FIX: Don't fail decode on dup error - fall back to non-zero-copy
+                        // This keeps decoder state consistent and allows playback to continue
+                        LOG_WARN("ZERO-COPY", "Failed to dup DMA FD %d: %s (falling back to CPU path)",
+                                 new_dma_fd, strerror(errno));
+                        video->supports_dma_export = false;
+                        // Continue with decode - frame is still valid, just not zero-copy
+                    } else {
+                        // Success - close old FD and update with new one
+                        if (video->dma_fd >= 0) {
+                            close(video->dma_fd);
+                        }
+                        video->dma_fd = dup_fd;
+                        video->dma_size = drm_size;
                     
-                    if (frame_count == 1) {
-                        LOG_DEBUG("ZERO-COPY", "DMA FD duplicated: %d (ready for EGL import)", video->dma_fd);
-                        LOG_TRACE("DECODE_TRACE", "Frame 1: video->dma_fd=%d, video->use_hardware_decode=%d", 
-                               video->dma_fd, video->use_hardware_decode);
+                        if (frame_count == 1) {
+                            LOG_DEBUG("ZERO-COPY", "DMA FD duplicated: %d (ready for EGL import)", video->dma_fd);
+                            LOG_TRACE("DECODE_TRACE", "Frame 1: video->dma_fd=%d, video->use_hardware_decode=%d", 
+                                   video->dma_fd, video->use_hardware_decode);
+                        }
                     }
                 } else if (video->use_hardware_decode && frame_count == 1 && video->frame->format != AV_PIX_FMT_DRM_PRIME) {
                     // Not a DRM PRIME frame - still using system memory

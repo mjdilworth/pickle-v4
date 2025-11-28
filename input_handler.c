@@ -21,8 +21,8 @@
 #define test_bit(bit, array) ((array[LONG(bit)] >> OFF(bit)) & 1)
 
 // Global terminal state for emergency restoration
-static struct termios g_orig_termios;
-static struct termios g_original_term;  // Alternative name for compatibility
+// PRODUCTION: Consolidated to single global (was duplicated as g_orig_termios and g_original_term)
+static struct termios g_original_term;
 static bool g_terminal_modified = false;
 static int g_stdin_fd = -1;
 
@@ -170,8 +170,7 @@ static int setup_terminal_input(input_context_t *input) {
     }
     
     // Save global copy for emergency restoration
-    g_orig_termios = input->orig_termios;
-    g_original_term = input->orig_termios;  // Save for comprehensive restore function
+    g_original_term = input->orig_termios;
     g_stdin_fd = input->stdin_fd;
     g_terminal_modified = true;
     
@@ -202,8 +201,19 @@ void input_restore_terminal_global(void) {
     LOG_INFO("INPUT", "Terminal restored");
     fflush(stdout);
     
-    // Force terminal to reset to a known good state
-    system("stty sane 2>/dev/null || true");
+    // PRODUCTION FIX: Use direct termios API instead of system() for security
+    // system() is a security risk if running with elevated privileges
+    // Just restore the original terminal settings we saved at startup
+    if (g_terminal_modified) {
+        struct termios sane_term = g_original_term;
+        // Ensure canonical and echo modes are re-enabled
+        sane_term.c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN);
+        sane_term.c_iflag |= (ICRNL | IXON);
+        sane_term.c_oflag |= (OPOST | ONLCR);
+        sane_term.c_cc[VMIN] = 1;
+        sane_term.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &sane_term);
+    }
 }
 
 static void restore_terminal(input_context_t *input) {

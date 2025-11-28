@@ -154,22 +154,28 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
     return true;
 }
 
+// PRODUCTION FIX: Protect next_cpu_core with mutex to prevent race on multi-thread startup
+static pthread_mutex_t cpu_core_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int next_cpu_core = 2;  // Start from core 2
+
 // Async decode thread function for video 2
 static void* async_decode_thread(void *arg) {
     async_decode_t *decoder = (async_decode_t *)arg;
 
     // OPTIMIZATION: Pin decode threads to specific CPU cores for better cache utilization
     // RPi4 has 4 cores (0-3). Pin background decode threads to cores 2-3
-    static int next_cpu_core = 2;  // Start from core 2
+    pthread_mutex_lock(&cpu_core_mutex);
+    int assigned_core = next_cpu_core;
+    next_cpu_core = (next_cpu_core == 2) ? 3 : 2;  // Alternate between cores 2 and 3
+    pthread_mutex_unlock(&cpu_core_mutex);
+    
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(next_cpu_core, &cpuset);
+    CPU_SET(assigned_core, &cpuset);
 
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
-        LOG_DEBUG("ASYNC", "Decode thread pinned to CPU core %d", next_cpu_core);
+        LOG_DEBUG("ASYNC", "Decode thread pinned to CPU core %d", assigned_core);
     }
-
-    next_cpu_core = (next_cpu_core == 2) ? 3 : 2;  // Alternate between cores 2 and 3
 
     while (!decoder->should_exit) {
         pthread_mutex_lock(&decoder->mutex);
@@ -350,9 +356,9 @@ bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
         return true;
     }
     
-    // Wait with timeout
+    // Wait with timeout using CLOCK_MONOTONIC (not affected by NTP adjustments)
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (timeout_ms % 1000) * 1000000;
     if (ts.tv_nsec >= 1000000000) {
@@ -373,7 +379,7 @@ bool async_decode_wait_frame(async_decode_t *decoder, int timeout_ms) {
 }
 
 int app_init(app_context_t *app, const char *video_file, const char *video_file2, bool loop_playback,
-            bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode) {
+            bool show_timing, bool debug_gamepad, bool advanced_diagnostics, bool enable_hardware_decode, bool dual_hw_decode) {
     LOG_INFO("APP", "Starting initialization...");
     fflush(stdout);
     
@@ -507,13 +513,15 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
     }
 
     // Initialize second video decoder if provided
-    // HYBRID MODE: Video 2 always uses SOFTWARE decode to avoid V4L2 M2M contention
+    // HYBRID MODE: Video 2 uses SOFTWARE decode by default to avoid V4L2 M2M contention
     // Dual HW decode tested: works but Video 1 slows down (5ms vs 1ms) due to resource sharing
-    // Video 1 gets HW decode (if --hw), Video 2 uses SW decode (parallel on CPU)
+    // Use --dual-hw to enable dual hardware decode (experimental)
     if (video_file2) {
-        bool video2_hw_decode = false;  // Always software decode for video 2
-        if (enable_hardware_decode) {
-            LOG_INFO("HYBRID", "Video 2 using software decode (optimal for performance)");
+        bool video2_hw_decode = dual_hw_decode;  // Use HW only with --dual-hw flag
+        if (dual_hw_decode) {
+            LOG_INFO("HYBRID", "Video 2 using HARDWARE decode (--dual-hw experimental mode)");
+        } else if (enable_hardware_decode) {
+            LOG_INFO("HYBRID", "Video 2 using software decode (default hybrid mode)");
         }
 
         if (video_init(app->video2, video_file2, app->advanced_diagnostics, video2_hw_decode) != 0) {
@@ -693,16 +701,18 @@ void app_run(app_context_t *app) {
     int gl_upload_interval_count[2] = {0, 0};
     
     // Frame timing analysis buffers
-    double *decode_times = malloc(300 * sizeof(double));  // Last 300 frames
-    double *render_times = malloc(300 * sizeof(double));  // Last 300 frames
+    // PRODUCTION: Define buffer size as constant for maintainability
+    #define TIMING_BUFFER_FRAMES 300
+    double *decode_times = malloc(TIMING_BUFFER_FRAMES * sizeof(double));
+    double *render_times = malloc(TIMING_BUFFER_FRAMES * sizeof(double));
     
-    // Critical: Check malloc success before using
+    // PRODUCTION FIX: Handle partial allocation properly - if one succeeds and other fails,
+    // we must free the successful one before setting both to NULL
     if (!decode_times || !render_times) {
-        LOG_ERROR("APP", "Failed to allocate timing buffers");
-        free(decode_times);
-        free(render_times);
-        decode_times = NULL;
-        render_times = NULL;
+        LOG_ERROR("APP", "Failed to allocate timing buffers (decode=%p, render=%p)",
+                  (void*)decode_times, (void*)render_times);
+        if (decode_times) { free(decode_times); decode_times = NULL; }
+        if (render_times) { free(render_times); render_times = NULL; }
     }
     
     int timing_buffer_idx = 0;
@@ -1110,6 +1120,19 @@ void app_run(app_context_t *app) {
 
                     primary_async_requested = false;
                     primary_async_request_pending = !video_is_eof(app->video);
+
+                    // OPTIMIZATION: Request V2 decode immediately after V1 consume
+                    // This gives V2 thread maximum decode window while V1 renders
+                    // V2 decode will overlap with V1 rendering (better parallelism)
+                    if (app->async_decoder_secondary && !secondary_async_requested) {
+                        async_decode_request_frame(app->async_decoder_secondary);
+                        secondary_async_requested = true;
+                    }
+                } else if (first_frame_decoded) {
+                    // V1 frame not ready - yield briefly to allow V2 decode thread to run
+                    // This prevents main thread from monopolizing CPU during render
+                    // 0.5ms is negligible for V1 (VSync controls timing anyway), but helps V2 scheduler
+                    usleep(500);
                 }
 
                 if (video_is_eof(app->video)) {
@@ -1249,12 +1272,11 @@ void app_run(app_context_t *app) {
         if (app->video2) {
             if (app->async_decoder_secondary) {
                 // ASYNC PATH: Check if frame is ready from background thread
-                int wait_timeout_ms = first_frame_decoded2 ? 0 : 100;  // Wait for first frame, poll after
+                // Use 2ms timeout after first frame - prevents frame skips while staying responsive
+                // 0ms causes ~50% frame misses, 2ms catches 95%+ while keeping latency low
+                int wait_timeout_ms = first_frame_decoded2 ? 2 : 100;  // Short wait for steady state
 
-                if (!secondary_async_requested) {
-                    async_decode_request_frame(app->async_decoder_secondary);
-                    secondary_async_requested = true;
-                }
+                // NOTE: V2 decode is now requested earlier (after V1 frame consume) for better parallelism
 
                 if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms)) {
                     video_get_yuv_data(app->video2, &y_data2, &u_data2, &v_data2,

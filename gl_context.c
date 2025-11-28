@@ -1112,23 +1112,60 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         
         // ULTRA-OPTIMIZED: Use glTexStorage2D once, then glTexSubImage2D for updates
         // This is faster on some GPUs because storage is immutable
+        // PRODUCTION FIX: glTexStorage2D creates immutable storage - must delete and recreate
+        // textures on resolution change to avoid undefined behavior
         static bool storage_initialized[2] = {false, false};
+        static int stored_width[2] = {0, 0};
+        static int stored_height[2] = {0, 0};
         
         if (!storage_initialized[video_index] || size_changed) {
+            // If storage was already initialized and size changed, we MUST recreate textures
+            // because glTexStorage2D creates immutable storage
+            if (storage_initialized[video_index] && size_changed) {
+                LOG_DEBUG("GL", "Resolution changed from %dx%d to %dx%d - recreating textures",
+                         stored_width[video_index], stored_height[video_index], width, height);
+                // Delete old textures
+                glDeleteTextures(1, &tex_y);
+                glDeleteTextures(1, &tex_u);
+                glDeleteTextures(1, &tex_v);
+                // Regenerate texture names
+                glGenTextures(1, &tex_y);
+                glGenTextures(1, &tex_u);
+                glGenTextures(1, &tex_v);
+                // Update gl_context texture references
+                if (video_index == 0) {
+                    gl->texture_y = tex_y;
+                    gl->texture_u = tex_u;
+                    gl->texture_v = tex_v;
+                } else {
+                    gl->texture_y2 = tex_y;
+                    gl->texture_u2 = tex_u;
+                    gl->texture_v2 = tex_v;
+                }
+            }
+            
             // First time or resolution changed - allocate storage
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, tex_y);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
             
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, tex_u);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, uv_width, uv_height);
             
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(GL_TEXTURE_2D, tex_v);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, uv_width, uv_height);
             
             storage_initialized[video_index] = true;
+            stored_width[video_index] = width;
+            stored_height[video_index] = height;
         }
         
         // Direct texture upload (PBO code removed for stability)
@@ -1142,44 +1179,23 @@ void gl_render_frame(gl_context_t *gl, uint8_t *y_data, uint8_t *u_data, uint8_t
         // Y texture upload - Use GL_UNPACK_ROW_LENGTH to let GPU handle stride (eliminates CPU memcpy)
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex_y);
-
-        if (y_direct) {
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);  // Standard upload
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
-        } else {
-            // GPU handles stride directly - eliminates 2MB CPU memcpy!
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, y_stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);  // Reset for next upload
-        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, y_direct ? 0 : y_stride);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, y_data);
 
         // U texture upload - Use GL_UNPACK_ROW_LENGTH to let GPU handle stride
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, tex_u);
-
-        if (u_direct) {
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);  // Standard upload
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
-        } else {
-            // GPU handles stride directly
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, u_stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);  // Reset for next upload
-        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, u_direct ? 0 : u_stride);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, u_data);
 
         // V texture upload - Use GL_UNPACK_ROW_LENGTH to let GPU handle stride
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, tex_v);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, v_direct ? 0 : v_stride);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
 
-        if (v_direct) {
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);  // Standard upload
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
-        } else {
-            // GPU handles stride directly
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, v_stride);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RED, GL_UNSIGNED_BYTE, v_data);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);  // Reset for next upload
-        }
+        // Reset GL_UNPACK_ROW_LENGTH once at end (reduces GL state changes from 6 to 4 calls)
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
         if (frame_rendered[video_index] == 0) {
             LOG_INFO("GL", "GPU YUV→RGB rendering started (%dx%d)", width, height);
