@@ -187,6 +187,9 @@ int drm_init(display_ctx_t *drm) {
     drm->width = drm->mode.hdisplay;
     drm->height = drm->mode.vdisplay;
     drm->refresh_rate = drm->mode.vrefresh;
+    
+    LOG_INFO("DRM", "Display mode: %dx%d @ %dHz", 
+             drm->width, drm->height, drm->refresh_rate);
 
     // Find encoder
     drm->encoder = find_encoder(drm);

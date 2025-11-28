@@ -28,6 +28,29 @@ static void signal_handler(int sig) {
     // Let main loop handle graceful shutdown
 }
 
+// PRODUCTION FIX: Crash signal handler - minimal recovery, immediate exit
+// For SIGSEGV/SIGBUS/SIGABRT, memory may be corrupted - don't attempt full cleanup
+static void crash_signal_handler(int sig) {
+    // Restore terminal first (critical for SSH sessions)
+    input_restore_terminal_global();
+    
+    // Write directly to stderr (write() is async-signal-safe)
+    const char *msg = "\nCRASH: ";
+    (void)write(STDERR_FILENO, msg, 8);
+    
+    const char *signame;
+    switch(sig) {
+        case SIGSEGV: signame = "SIGSEGV\n"; break;
+        case SIGBUS:  signame = "SIGBUS\n"; break;
+        case SIGABRT: signame = "SIGABRT\n"; break;
+        default:      signame = "UNKNOWN\n"; break;
+    }
+    (void)write(STDERR_FILENO, signame, strlen(signame));
+    
+    // Use _exit() - does NOT run atexit handlers (which could corrupt further)
+    _exit(128 + sig);
+}
+
 static void cleanup_on_exit(void) {
     LOG_INFO("MAIN", "Restoring terminal state...");
     fflush(stdout);
@@ -51,12 +74,13 @@ static void setup_signal_handlers(void) {
     signal(SIGTERM, signal_handler);  // Termination signal
     signal(SIGHUP, signal_handler);   // Hangup (SSH disconnect)
     
-    // Emergency handlers for crashes - restore terminal before dying
-    signal(SIGSEGV, signal_handler);  // Segmentation fault
-    signal(SIGBUS, signal_handler);   // Bus error
-    signal(SIGABRT, signal_handler);  // Abort signal
+    // PRODUCTION FIX: Crash handlers - minimal recovery, no full cleanup
+    // These indicate memory corruption, so atexit handlers could make things worse
+    signal(SIGSEGV, crash_signal_handler);  // Segmentation fault
+    signal(SIGBUS, crash_signal_handler);   // Bus error
+    signal(SIGABRT, crash_signal_handler);  // Abort signal
     
-    // Register atexit handler for safe cleanup
+    // Register atexit handler for safe cleanup (only runs on normal exit)
     atexit(cleanup_on_exit);
 }
 

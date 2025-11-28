@@ -482,6 +482,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     video->packet = av_packet_alloc();
     if (!video->packet) {
         LOG_ERROR("DECODER", "Failed to allocate packet");
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
 
@@ -491,6 +492,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
     if (!video->format_ctx) {
         LOG_ERROR("DECODER", "Failed to allocate format context");
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
     
@@ -515,6 +517,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         avformat_free_context(video->format_ctx);
         video->format_ctx = NULL;
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
     av_dict_free(&options);
@@ -529,6 +532,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         av_dict_free(&stream_options);
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
     av_dict_free(&stream_options);
@@ -546,6 +550,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         LOG_ERROR("DECODER", "No video stream found");
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
 
@@ -629,6 +634,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
                 LOG_ERROR("DECODER", "Failed to find software decoder for codec ID %d", codecpar->codec_id);
                 avformat_close_input(&video->format_ctx);
                 av_packet_free(&video->packet);
+                pthread_mutex_destroy(&video->lock);
                 return -1;
             }
             LOG_INFO("DECODER", "✓ Using software decoder: %s", video->codec->name);
@@ -641,6 +647,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             LOG_ERROR("DECODER", "Failed to find software decoder for codec ID %d", codecpar->codec_id);
             avformat_close_input(&video->format_ctx);
             av_packet_free(&video->packet);
+            pthread_mutex_destroy(&video->lock);
             return -1;
         }
         LOG_INFO("DECODER", "✓ Using software decoder: %s", video->codec->name);
@@ -652,6 +659,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         LOG_ERROR("DECODER", "Failed to allocate codec context");
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
 
@@ -661,6 +669,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         avcodec_free_context(&video->codec_ctx);
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
     
@@ -752,6 +761,18 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             // Allocate and copy converted extradata
             video->codec_ctx->extradata_size = video->bsf_annexb_ctx->par_out->extradata_size;
             video->codec_ctx->extradata = av_mallocz(video->codec_ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (!video->codec_ctx->extradata) {
+                LOG_ERROR("HW_DECODE", "Failed to allocate extradata buffer (%d bytes)", 
+                          video->codec_ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                video->codec_ctx->extradata_size = 0;
+                // Clean up and return error
+                av_bsf_free(&video->bsf_annexb_ctx);
+                avcodec_free_context(&video->codec_ctx);
+                avformat_close_input(&video->format_ctx);
+                av_packet_free(&video->packet);
+                pthread_mutex_destroy(&video->lock);
+                return -1;
+            }
             memcpy(video->codec_ctx->extradata, video->bsf_annexb_ctx->par_out->extradata, video->codec_ctx->extradata_size);
             if (hw_debug_enabled) {
                 LOG_DEBUG("HW_DECODE", "BSF: ✓ Converted extradata (%d bytes)", video->codec_ctx->extradata_size);
@@ -874,6 +895,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
                 LOG_ERROR("HW_DECODE", "Failed to find software decoder for fallback");
                 avformat_close_input(&video->format_ctx);
                 av_packet_free(&video->packet);
+                pthread_mutex_destroy(&video->lock);
                 return -1;
             }
 
@@ -885,6 +907,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
                 LOG_ERROR("HW_DECODE", "Failed to allocate software codec context");
                 avformat_close_input(&video->format_ctx);
                 av_packet_free(&video->packet);
+                pthread_mutex_destroy(&video->lock);
                 return -1;
             }
 
@@ -894,6 +917,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
                 avcodec_free_context(&video->codec_ctx);
                 avformat_close_input(&video->format_ctx);
                 av_packet_free(&video->packet);
+                pthread_mutex_destroy(&video->lock);
                 return -1;
             }
 
@@ -907,6 +931,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
                 avcodec_free_context(&video->codec_ctx);
                 avformat_close_input(&video->format_ctx);
                 av_packet_free(&video->packet);
+                pthread_mutex_destroy(&video->lock);
                 return -1;
             }
 
@@ -941,6 +966,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
             avcodec_free_context(&video->codec_ctx);
             avformat_close_input(&video->format_ctx);
             av_packet_free(&video->packet);
+            pthread_mutex_destroy(&video->lock);
             return -1;
         }
     }
@@ -970,6 +996,7 @@ int video_init(video_context_t *video, const char *filename, bool advanced_diagn
         avcodec_free_context(&video->codec_ctx);
         avformat_close_input(&video->format_ctx);
         av_packet_free(&video->packet);
+        pthread_mutex_destroy(&video->lock);
         return -1;
     }
     
@@ -1617,7 +1644,23 @@ void video_get_dimensions(video_context_t *video, int *width, int *height) {
 
 void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_t **v, 
                        int *y_stride, int *u_stride, int *v_stride) {
-    if (!video || !video->frame) {
+    // PRODUCTION FIX: Check video pointer before locking (video may be NULL)
+    if (!video) {
+        if (y) *y = NULL;
+        if (u) *u = NULL;
+        if (v) *v = NULL;
+        if (y_stride) *y_stride = 0;
+        if (u_stride) *u_stride = 0;
+        if (v_stride) *v_stride = 0;
+        return;
+    }
+
+    // PRODUCTION FIX: Lock mutex at start to prevent race with decoder thread
+    // The decoder may update frame/sw_frame between our check and memcpy
+    pthread_mutex_lock(&video->lock);
+    
+    if (!video->frame) {
+        pthread_mutex_unlock(&video->lock);
         if (y) *y = NULL;
         if (u) *u = NULL;
         if (v) *v = NULL;
@@ -1661,7 +1704,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
             hw_cache_logged = true;
         }
         
-        pthread_mutex_lock(&video->lock);
+        // Mutex already held from start of function
 
         size_t y_bytes = (size_t)width * height;
         size_t u_bytes = (size_t)uv_width * uv_height;
@@ -1670,7 +1713,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
         if (video->cached_y_size < y_bytes) {
             uint8_t *new_buf = realloc(video->cached_y_buffer, y_bytes);
             if (!new_buf) {
-                pthread_mutex_unlock(&video->lock);
+                // Keep mutex held, direct_ptrs will unlock
                 goto direct_ptrs;
             }
             video->cached_y_buffer = new_buf;
@@ -1680,7 +1723,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
         if (video->cached_u_size < u_bytes) {
             uint8_t *new_buf = realloc(video->cached_u_buffer, u_bytes);
             if (!new_buf) {
-                pthread_mutex_unlock(&video->lock);
+                // Keep mutex held, direct_ptrs will unlock
                 goto direct_ptrs;
             }
             video->cached_u_buffer = new_buf;
@@ -1690,7 +1733,7 @@ void video_get_yuv_data(video_context_t *video, uint8_t **y, uint8_t **u, uint8_
         if (video->cached_v_size < v_bytes) {
             uint8_t *new_buf = realloc(video->cached_v_buffer, v_bytes);
             if (!new_buf) {
-                pthread_mutex_unlock(&video->lock);
+                // Keep mutex held, direct_ptrs will unlock
                 goto direct_ptrs;
             }
             video->cached_v_buffer = new_buf;
@@ -1754,6 +1797,9 @@ direct_ptrs:
     if (y_stride) *y_stride = src->linesize[0];
     if (u_stride) *u_stride = src->linesize[1];
     if (v_stride) *v_stride = src->linesize[2];
+    
+    // PRODUCTION FIX: Unlock mutex before returning (held since start of function)
+    pthread_mutex_unlock(&video->lock);
 }
 
 // NV12: Y plane followed by interleaved U/V plane (UV is half resolution)
@@ -1789,16 +1835,19 @@ uint8_t* video_get_nv12_data(video_context_t *video) {
         return NULL;
     }
 
-    int needed_size = (width * height * 3) / 2;  // Y plane + packed UV plane
+    // PRODUCTION FIX: Use size_t for buffer size to prevent integer overflow
+    // For 4K video (3840x2160), this is ~12MB which fits in int32
+    // For 8K (7680x4320), this would be ~49MB - size_t handles both safely
+    size_t needed_size = ((size_t)width * height * 3) / 2;  // Y plane + packed UV plane
 
-    if (video->nv12_buffer_size < needed_size) {
+    if (video->nv12_buffer_size < (int)needed_size) {
         uint8_t *new_buffer = realloc(video->nv12_buffer, needed_size);
         if (!new_buffer) {
             pthread_mutex_unlock(&video->lock);
             return NULL;
         }
         video->nv12_buffer = new_buffer;
-        video->nv12_buffer_size = needed_size;
+        video->nv12_buffer_size = (int)needed_size;
     }
 
     if (!video->nv12_buffer) {
@@ -2096,15 +2145,33 @@ void video_cleanup(video_context_t *video) {
         video->cached_v_size = 0;
     }
 
-    // PRODUCTION: Ensure mutex is unlocked before destroy (prevent EBUSY deadlock)
-    // Try to lock and unlock to verify state, then destroy
-    int lock_result = pthread_mutex_trylock(&video->lock);
-    if (lock_result == 0) {
-        // We acquired the lock, unlock it before destroying
-        pthread_mutex_unlock(&video->lock);
-    } else if (lock_result == EBUSY) {
-        // Mutex is locked (shouldn't happen, but handle it)
-        LOG_WARN("CLEANUP", "Mutex still locked during cleanup");
+    // PRODUCTION FIX: Never destroy a locked mutex (POSIX undefined behavior)
+    // Wait for mutex to be released with timeout before destroying
+    int max_wait_attempts = 20;  // 20 * 10ms = 200ms max wait
+    int lock_result;
+    for (int attempt = 0; attempt < max_wait_attempts; attempt++) {
+        lock_result = pthread_mutex_trylock(&video->lock);
+        if (lock_result == 0) {
+            // Successfully acquired - unlock and we're ready to destroy
+            pthread_mutex_unlock(&video->lock);
+            break;
+        } else if (lock_result == EBUSY) {
+            // Mutex is locked by another thread - wait briefly
+            if (attempt == 0) {
+                LOG_DEBUG("CLEANUP", "Waiting for mutex release during cleanup...");
+            }
+            usleep(10000);  // 10ms wait
+        } else {
+            // Other error (EINVAL = already destroyed, etc)
+            LOG_WARN("CLEANUP", "Unexpected trylock result: %d", lock_result);
+            break;
+        }
+    }
+    if (lock_result == EBUSY) {
+        LOG_ERROR("CLEANUP", "Mutex still locked after 200ms - skipping mutex destroy");
+        // Don't destroy - would be undefined behavior. Accept potential leak.
+        memset(video, 0, sizeof(*video));
+        return;
     }
     
     // Safe pthread cleanup with error checking
