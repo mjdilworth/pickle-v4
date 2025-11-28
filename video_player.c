@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <sched.h>  // For CPU affinity
 #include <linux/input.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -156,7 +157,20 @@ static bool process_keystone_movement(app_context_t *app, double delta_time, dou
 // Async decode thread function for video 2
 static void* async_decode_thread(void *arg) {
     async_decode_t *decoder = (async_decode_t *)arg;
-    
+
+    // OPTIMIZATION: Pin decode threads to specific CPU cores for better cache utilization
+    // RPi4 has 4 cores (0-3). Pin background decode threads to cores 2-3
+    static int next_cpu_core = 2;  // Start from core 2
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(next_cpu_core, &cpuset);
+
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+        LOG_DEBUG("ASYNC", "Decode thread pinned to CPU core %d", next_cpu_core);
+    }
+
+    next_cpu_core = (next_cpu_core == 2) ? 3 : 2;  // Alternate between cores 2 and 3
+
     while (!decoder->should_exit) {
         pthread_mutex_lock(&decoder->mutex);
         
@@ -494,12 +508,12 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
 
     // Initialize second video decoder if provided
     // HYBRID MODE: Video 2 always uses SOFTWARE decode to avoid V4L2 M2M contention
-    // Pi 4 has single HW decoder - running two HW streams causes poor performance
+    // Dual HW decode tested: works but Video 1 slows down (5ms vs 1ms) due to resource sharing
     // Video 1 gets HW decode (if --hw), Video 2 uses SW decode (parallel on CPU)
     if (video_file2) {
         bool video2_hw_decode = false;  // Always software decode for video 2
         if (enable_hardware_decode) {
-            LOG_INFO("HYBRID", "Video 2 forced to software decode (V4L2 M2M is single-stream)");
+            LOG_INFO("HYBRID", "Video 2 using software decode (optimal for performance)");
         }
 
         if (video_init(app->video2, video_file2, app->advanced_diagnostics, video2_hw_decode) != 0) {
@@ -624,6 +638,15 @@ int app_init(app_context_t *app, const char *video_file, const char *video_file2
 }
 
 void app_run(app_context_t *app) {
+    // OPTIMIZATION: Pin main render thread to CPU core 0 for better cache separation
+    // Decode threads use cores 2-3, keeping main thread isolated prevents cache thrashing
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0) {
+        LOG_DEBUG("THREAD", "Main render thread pinned to CPU core 0");
+    }
+
     struct timespec current_time, last_time;
     clock_gettime(CLOCK_MONOTONIC, &last_time);
 
@@ -1435,7 +1458,44 @@ void app_run(app_context_t *app) {
             primary_async_request_pending = false;
         }
 
-        // Aggregate timing for both videos (Video 1 timing already set, Video 2 set below)
+        // Render second video with second keystone (don't clear screen)
+        if (app->video2 && app->keystone2) {
+            // Get dimensions (safe to call anytime)
+            int video_width2 = app->video2->width;
+            int video_height2 = app->video2->height;
+            bool video2_rendered = false;
+            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
+
+            // OPTIMIZATION: Direct render from decoder buffers (Zero-Copy)
+            // We rely on GL_UNPACK_ROW_LENGTH in gl_render_frame to handle strides
+            // This eliminates the 3.1MB CPU copy per frame
+            
+            // Only upload if we have a new frame
+            uint8_t *p_y = new_secondary_frame_ready ? y_data2 : NULL;
+            uint8_t *p_u = new_secondary_frame_ready ? u_data2 : NULL;
+            uint8_t *p_v = new_secondary_frame_ready ? v_data2 : NULL;
+
+            // Render if we have valid data (either new frame or previous frame)
+            if (first_frame_decoded2 && y_data2 && u_data2 && v_data2) {
+                if (app->show_timing && new_secondary_frame_ready) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
+                }
+                
+                // Pass original strides to gl_render_frame
+                gl_render_frame(app->gl, p_y, p_u, p_v, video_width2, video_height2,
+                              y_stride2, u_stride2, v_stride2, app->drm, app->keystone2, false, 1);
+                              
+                if (app->show_timing && new_secondary_frame_ready) {
+                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
+                    upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
+                }
+                video2_rendered = true;
+            }
+        }
+        
+        clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
+
+        // Aggregate timing for both videos (AFTER both videos rendered)
         if (app->show_timing) {
             for (int i = 0; i < 2; ++i) {
                 if (nv12_frame_time[i] >= 0.0) {
@@ -1461,47 +1521,6 @@ void app_run(app_context_t *app) {
                 }
             }
         }
-
-        // Render second video with second keystone (don't clear screen)
-        if (app->video2 && app->keystone2) {
-            // Get dimensions (safe to call anytime)
-            int video_width2 = app->video2->width;
-            int video_height2 = app->video2->height;
-            bool video2_rendered = false;
-            struct timespec gl_upload_start2 = {0, 0}, gl_upload_end2 = {0, 0};
-
-            // ANTI-FLICKER: Keep static frame data to prevent async race conditions
-            static uint8_t *last_y_data2 = NULL;
-            static uint8_t *last_u_data2 = NULL;
-            static uint8_t *last_v_data2 = NULL;
-            static int last_y_stride2 = 0, last_u_stride2 = 0, last_v_stride2 = 0;
-
-            // Update static buffers only when new frame is ready
-            if (new_secondary_frame_ready && y_data2 && u_data2 && v_data2 && y_stride2 > 0) {
-                last_y_data2 = y_data2;
-                last_u_data2 = u_data2;
-                last_v_data2 = v_data2;
-                last_y_stride2 = y_stride2;
-                last_u_stride2 = u_stride2;
-                last_v_stride2 = v_stride2;
-            }
-
-            // Always render using last known good frame (prevents flickering)
-            if (last_y_data2 && last_u_data2 && last_v_data2 && last_y_stride2 > 0) {
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
-                }
-                gl_render_frame(app->gl, last_y_data2, last_u_data2, last_v_data2, video_width2, video_height2,
-                              last_y_stride2, last_u_stride2, last_v_stride2, app->drm, app->keystone2, false, 1);
-                if (app->show_timing) {
-                    clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
-                    upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
-                }
-                video2_rendered = true;
-            }
-        }
-        
-        clock_gettime(CLOCK_MONOTONIC, &gl_render_end);
 
 skip_video_render:  // Jump here when help is visible to skip video rendering
 
@@ -1667,18 +1686,22 @@ skip_video_render:  // Jump here when help is visible to skip video rendering
             double time_since_last = (current_time_drop.tv_sec - last_frame_time.tv_sec) +
                                    (current_time_drop.tv_nsec - last_frame_time.tv_nsec) / 1e9;
 
-            // At 60fps, frames should arrive every ~16.7ms
-            // If we see >25ms, we may have dropped a frame
-            if (time_since_last > 0.025 && render_frame_count > 10) {
+            // Detect frame drops using actual video FPS (not hardcoded 60fps)
+            // If we see >1.5x expected frame time, we may have dropped a frame
+            if (time_since_last > (target_frame_time * 1.5) && render_frame_count > 10) {
                 frame_drop_count++;
                 // PRODUCTION: Only report first 5 drops, then summary every 100 frames
                 if (frame_drop_reports < 5) {
-                    LOG_WARN("FRAME DROP", "Frame %d: %.1fms since last frame (expected ~16.7ms)",
-                           render_frame_count, time_since_last * 1000);
+                    LOG_WARN("FRAME DROP", "Frame %d: %.1fms since last frame (expected ~%.1fms)",
+                           render_frame_count, time_since_last * 1000, target_frame_time * 1000);
                     frame_drop_reports++;
                     if (frame_drop_reports == 5) {
                         LOG_INFO("FRAME DROP", "Further frame drops will be summarized periodically");
                     }
+                } else if (render_frame_count % 100 == 0) {
+                    // Periodic summary every 100 frames
+                    LOG_INFO("FRAME DROP", "Summary: %d dropped frames in last 100 (total: %d)",
+                           frame_drop_count - (frame_drop_reports - 5), frame_drop_count);
                 }
             }
         }

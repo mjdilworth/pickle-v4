@@ -9,7 +9,7 @@
 #define MAX_FRAME_SIZE (MAX_VIDEO_WIDTH * MAX_VIDEO_HEIGHT * 3 / 2)
 #define MAX_DECODE_ATTEMPTS 3
 #define DECODE_TIMEOUT_MS 5000
-#define MEMORY_LIMIT_MB 1024    // i upped htis to 512 Conservative limit for 2GB Pi 4
+#define MEMORY_LIMIT_MB 512     // Conservative limit for 2GB Pi 4 (leaves headroom for GPU/system)
 
 // File size limits
 #define MAX_VIDEO_FILE_SIZE (4ULL * 1024 * 1024 * 1024) // 4GB
