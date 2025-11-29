@@ -1210,15 +1210,32 @@ void app_run(app_context_t *app) {
                 if (video_is_eof(app->video)) {
                     if (app->loop_playback) {
                         LOG_INFO("APP", "End of video reached - restarting playback (loop mode)");
+
+                        // CRITICAL: Wait for any pending async decode to complete before seeking
+                        // This prevents V4L2 M2M decoder from getting into a bad state
+                        if (primary_async_requested && app->async_decoder_primary) {
+                            async_decode_wait_frame(app->async_decoder_primary, 100);
+                        }
+
+                        // Reset async decoder state before seeking
+                        primary_async_requested = false;
+                        primary_async_request_pending = false;
+
+                        // Now safe to seek
+                        // video_seek() now resets frame_count to 0, ensuring MAX_PACKETS_INITIAL
+                        // is used for re-priming the V4L2 M2M decoder (50 packets vs 10)
                         video_seek(app->video, 0);
+
+                        // Reset frame state
                         next_frame_ready = false;
                         first_frame_decoded = false;
                         first_decode_attempted = false;
                         frame_count = 0;
-                        primary_async_requested = false;
-                        primary_async_request_pending = !video_is_eof(app->video);
+
+                        // Update timing
                         clock_gettime(CLOCK_MONOTONIC, &current_time);
                         startup_time = (double)current_time.tv_sec + current_time.tv_nsec / 1e9;
+                        last_frame_present_time = current_total_time;  // Reset timing for loop
                     } else {
                         LOG_INFO("APP", "Playback finished");
                         app->running = false;
@@ -1343,26 +1360,25 @@ void app_run(app_context_t *app) {
         // ASYNC OPTIMIZATION: Use async decoder to overlap decode with rendering
         if (app->video2) {
             // Video 2: Should we consume the next frame? (independent timing from V1)
-            // This ensures V2 plays at its own native FPS, preventing slow-motion playback
-            bool should_consume_v2 = (current_total_time - last_frame_present_time2 >= target_frame_time2);
+            // Use 90% threshold to compensate for GL upload overhead (12ms upload in 16.68ms budget)
+            // This runs V2 slightly faster to maintain sync despite CPU texture upload delays
+            bool should_consume_v2 = (current_total_time - last_frame_present_time2 >= target_frame_time2 * 0.90);
 
             if (app->async_decoder_secondary) {
-                // FIX: Request V2 decode independently of V1 state
-                // Request a new decode if we don't have one pending
+                // AGGRESSIVE PRE-DECODE: Always keep decode thread busy by requesting next frame
+                // This ensures frames are ready immediately when timing allows consumption
                 if (!secondary_async_requested) {
                     async_decode_request_frame(app->async_decoder_secondary);
                     secondary_async_requested = true;
                 }
 
                 // ASYNC PATH: Check if frame is ready from background thread
-                // V2 runs independently - no need to sync with V1
-                // V2 decode thread runs on cores 2-3, consumes frames at its own pace
-                int wait_timeout_ms = first_frame_decoded2 ? 10 : 100;
+                // Use minimal timeout since we want to keep decoder working ahead
+                int wait_timeout_ms = first_frame_decoded2 ? 0 : 100;
 
-                // Only try to consume if timing says we need a new frame
-                // This prevents consuming frames faster/slower than the video's native FPS
-                if (should_consume_v2 && async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms)) {
-                    // Check for new frame: either YUV data (SW/fallback) or DMA buffer (pure HW)
+                // Check if frame is available (non-blocking after first frame)
+                if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms)) {
+                    // Frame is ready - decide whether to consume based on timing
                     bool frame_available2 = false;
 
                     if (app->video2->skip_sw_transfer && video_has_dma_buffer(app->video2)) {
@@ -1378,30 +1394,53 @@ void app_run(app_context_t *app) {
                     }
 
                     if (frame_available2) {
-                        frame_count2++;
+                        // Frame is available - only consume if timing allows
+                        if (should_consume_v2) {
+                            frame_count2++;
 
-                        // Update last_frame_present_time2 when we consume a frame
-                        // This ensures correct timing at any display refresh rate
-                        last_frame_present_time2 = current_total_time;
+                            // Update last_frame_present_time2 when we consume a frame
+                            // This ensures correct timing at any display refresh rate
+                            last_frame_present_time2 = current_total_time;
 
-                        // Mark frame ready for render
-                        new_secondary_frame_ready = true;
+                            // Mark frame ready for render
+                            new_secondary_frame_ready = true;
 
-                        if (!first_frame_decoded2) {
-                            LOG_INFO("DECODE", "First frame of video 2 decoded successfully (async)");
-                            first_frame_decoded2 = true;
+                            if (!first_frame_decoded2) {
+                                LOG_INFO("DECODE", "First frame of video 2 decoded successfully (async)");
+                                first_frame_decoded2 = true;
+                            }
+
+                            // Request next frame immediately to keep decoder ahead
+                            secondary_async_requested = false;
                         }
+                        // else: Frame is ready but timing says don't consume yet - hold it for next loop
+                    } else {
+                        // No frame available, request one
+                        secondary_async_requested = false;
                     }
-
-                    secondary_async_requested = false;
                 }
 
                 if (video_is_eof(app->video2)) {
                     if (app->loop_playback) {
+                        LOG_INFO("APP", "End of video 2 reached - restarting playback (loop mode)");
+
+                        // CRITICAL: Wait for any pending async decode to complete before seeking
+                        if (secondary_async_requested && app->async_decoder_secondary) {
+                            async_decode_wait_frame(app->async_decoder_secondary, 100);
+                        }
+
+                        // Reset async decoder state before seeking
+                        secondary_async_requested = false;
+
+                        // Now safe to seek
                         video_seek(app->video2, 0);
+
+                        // Reset frame state
                         first_frame_decoded2 = false;
                         frame_count2 = 0;
-                        secondary_async_requested = false;
+
+                        // Reset timing for loop
+                        last_frame_present_time2 = current_total_time;
                     }
                 }
             } else {
@@ -1434,10 +1473,12 @@ void app_run(app_context_t *app) {
                             }
                         } else if (video_is_eof(app->video2)) {
                             if (app->loop_playback) {
+                                LOG_INFO("APP", "End of video 2 reached - restarting playback (loop mode, sync)");
                                 video_seek(app->video2, 0);
                                 first_frame_decoded2 = false;
                                 next_frame_ready2 = false;
                                 frame_count2 = 0;
+                                last_frame_present_time2 = current_total_time;  // Reset timing for loop
                             }
                         }
                     }

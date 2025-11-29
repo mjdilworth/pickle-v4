@@ -1983,11 +1983,13 @@ void video_seek(video_context_t *video, int64_t timestamp) {
     
     LOG_DEBUG("SEEK", "Seeking to timestamp %ld...", timestamp);
     
-    // Reset EOF flag BEFORE seeking
+    // Reset EOF flag and frame count BEFORE seeking
+    // frame_count reset ensures MAX_PACKETS_INITIAL is used for re-priming
     video->eof_reached = false;
-    
+    video->frame_count = 0;
+
     // Try frame-based seek first (more reliable for MP4)
-    int seek_result = av_seek_frame(video->format_ctx, video->video_stream_index, 
+    int seek_result = av_seek_frame(video->format_ctx, video->video_stream_index,
                                     timestamp, AVSEEK_FLAG_FRAME | AVSEEK_FLAG_BACKWARD);
     
     if (seek_result < 0) {
