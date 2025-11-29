@@ -2706,18 +2706,19 @@ cleanup_dma:
 
 // Multi-plane YUV EGLImage rendering with external texture (zero-copy)
 // Imports DRM_PRIME buffer as single multi-plane EGLImage and renders via samplerExternalOES
-void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
+// Returns true if render succeeded, false if EGLImage import failed (caller should use CPU fallback)
+bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
                               int plane_offsets[3], int plane_pitches[3],
                               struct display_ctx *drm, keystone_context_t *keystone,
                               bool clear_screen, int video_index) {
     // PRODUCTION: Validate EGL context before rendering
     if (!validate_egl_context()) {
         LOG_ERROR("GL", "Cannot render external - EGL context lost");
-        return;
+        return false;
     }
-    
+
     if (!gl || dma_fd < 0 || !gl->supports_external_texture || !gl->external_program) {
-        return;
+        return false;
     }
 
     // Select texture and texture unit based on video index
@@ -2781,16 +2782,59 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
         EGL_NONE
     };
 
+    // DEEP BUFFER EGLImages: Keep 12 frames in flight to avoid DMA buffer contention
+    // In dual-hw mode, both V4L2 decoders share the same hardware, causing contention
+    // when GPU tries to access a buffer that V4L2 hasn't fully released yet.
+    // 12 frames = 200ms at 60fps - by then the GPU is definitely done with the buffer.
+    // NO FENCE SYNC - just rely on deep buffering to avoid races.
+    #define EGLIMAGE_BUFFER_DEPTH 12
+    static EGLImage image_ring[2][EGLIMAGE_BUFFER_DEPTH] = {
+        {EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, 
+         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE,
+         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE},
+        {EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE,
+         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE,
+         EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE, EGL_NO_IMAGE}
+    };
+    static int ring_index[2] = {0, 0};  // Next slot to write to
+    static pthread_mutex_t ring_mutex = PTHREAD_MUTEX_INITIALIZER;
+
     EGLImage yuv_image = eglCreateImageKHR(gl->egl_display, EGL_NO_CONTEXT,
                                            EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
     EGLint egl_err = eglGetError();
+
+    // DUAL-HW FIX: If EGLImage creation fails, reuse the most recent valid image
+    // This prevents flickering when DMA buffer is temporarily unavailable
+    bool using_fallback = false;
     if (yuv_image == EGL_NO_IMAGE || egl_err != EGL_SUCCESS) {
-        static int err_count = 0;
-        if (err_count < 3) {
-            LOG_ERROR("EXT", "Multi-plane YUV EGLImage import failed: 0x%x", egl_err);
-            err_count++;
+        pthread_mutex_lock(&ring_mutex);
+        // Find the most recent valid image (search backwards from current position)
+        for (int i = EGLIMAGE_BUFFER_DEPTH - 1; i >= 0; i--) {
+            int check_idx = (ring_index[video_index] - 1 - i + EGLIMAGE_BUFFER_DEPTH) % EGLIMAGE_BUFFER_DEPTH;
+            if (image_ring[video_index][check_idx] != EGL_NO_IMAGE) {
+                yuv_image = image_ring[video_index][check_idx];
+                using_fallback = true;
+                static int fallback_count[2] = {0, 0};
+                if (fallback_count[video_index] < 5) {
+                    LOG_DEBUG("EXT", "V%d EGLImage import failed (0x%x), reusing previous frame",
+                             video_index + 1, egl_err);
+                    fallback_count[video_index]++;
+                }
+                break;
+            }
         }
-        return;
+        pthread_mutex_unlock(&ring_mutex);
+        
+        if (!using_fallback) {
+            // No previous image to fall back to - this is first frame failure
+            static int err_count[2] = {0, 0};
+            if (err_count[video_index] < 5) {
+                LOG_WARN("EXT", "V%d EGLImage import failed (0x%x), no fallback available",
+                         video_index + 1, egl_err);
+                err_count[video_index]++;
+            }
+            return false;  // Signal caller to use CPU fallback (if available)
+        }
     }
 
     // Bind to GL_TEXTURE_EXTERNAL_OES using video-specific texture unit
@@ -2814,21 +2858,25 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
     // Draw
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
-    // Store EGLImage for deferred destruction
-    // We keep track of the previous frame's EGLImage and destroy it when creating a new one
-    // This ensures the GPU has finished using the image before we destroy it
-    static EGLImage prev_image[2] = {EGL_NO_IMAGE, EGL_NO_IMAGE};
-    static pthread_mutex_t prev_image_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    // Thread-safe EGLImage destruction (protect against concurrent dual-video rendering)
-    pthread_mutex_lock(&prev_image_mutex);
-    // Destroy the PREVIOUS frame's image (GPU is done with it by now)
-    if (prev_image[video_index] != EGL_NO_IMAGE && eglDestroyImageKHR) {
-        (*eglDestroyImageKHR)(gl->egl_display, prev_image[video_index]);
+    // Deep-buffer EGLImage management - simple ring buffer, no fence sync
+    // Only update ring if we created a NEW image (not reusing fallback)
+    if (!using_fallback) {
+        pthread_mutex_lock(&ring_mutex);
+        
+        int oldest_idx = ring_index[video_index];
+        
+        // Destroy the oldest EGLImage (it's been 12 frames, GPU is done)
+        if (image_ring[video_index][oldest_idx] != EGL_NO_IMAGE && eglDestroyImageKHR) {
+            (*eglDestroyImageKHR)(gl->egl_display, image_ring[video_index][oldest_idx]);
+        }
+        
+        // Store new image in the ring and advance index
+        image_ring[video_index][oldest_idx] = yuv_image;
+        ring_index[video_index] = (oldest_idx + 1) % EGLIMAGE_BUFFER_DEPTH;
+        
+        pthread_mutex_unlock(&ring_mutex);
     }
-    // Store current image for destruction next frame
-    prev_image[video_index] = yuv_image;
-    pthread_mutex_unlock(&prev_image_mutex);
+    // else: Reusing previous image due to EGLImage creation failure - don't modify ring
 
     // Log first successful render
     static bool logged = false;
@@ -2836,6 +2884,8 @@ void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int heigh
         LOG_INFO("GL", "Zero-copy YUV420 render via external texture");
         logged = true;
     }
+
+    return true;  // Successfully rendered via zero-copy
 }
 
 void gl_cleanup(gl_context_t *gl) {

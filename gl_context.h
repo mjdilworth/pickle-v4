@@ -118,7 +118,8 @@ void gl_render_frame_dma(gl_context_t *gl, int dma_fd, int width, int height,
                         struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 
 // DMA buffer zero-copy rendering (multi-plane YUV EGLImage with external texture)
-void gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
+// Returns true if successful, false if EGLImage import failed (use CPU fallback)
+bool gl_render_frame_external(gl_context_t *gl, int dma_fd, int width, int height,
                               int plane_offsets[3], int plane_pitches[3],
                               struct display_ctx *drm, keystone_context_t *keystone, bool clear_screen, int video_index);
 

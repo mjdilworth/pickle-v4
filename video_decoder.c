@@ -294,25 +294,36 @@ static int init_hw_accel_context(video_context_t *video) {
         LOG_DEBUG("DECODER", "This will force V4L2 M2M to use DMABUF mode for GEM-backed buffers");
     }
     
-    // Create DRM hardware device context - use same device as display
-    const char *drm_device = "/dev/dri/card1";
-    if (hw_debug_enabled) {
-        LOG_DEBUG("DECODER", "Attempting DRM device: %s", drm_device);
-    }
-    ret = av_hwdevice_ctx_create(&video->hw_device_ctx, AV_HWDEVICE_TYPE_DRM,
-                                  drm_device, NULL, 0);
-    if (ret < 0) {
+    // Create DRM hardware device context
+    // IMPORTANT: Use render node (renderD128) instead of card node for CMA compatibility
+    // V3D GPU requires buffers from CMA heap - render nodes may provide better allocation
+    const char *drm_devices[] = {
+        "/dev/dri/renderD128",  // Try render node first (may use CMA heap)
+        "/dev/dri/card1",       // Fall back to card1 (vc4/v3d)
+        "/dev/dri/card0",       // Fall back to card0
+        NULL
+    };
+    
+    const char *drm_device = NULL;
+    for (int i = 0; drm_devices[i] != NULL; i++) {
         if (hw_debug_enabled) {
-            LOG_DEBUG("DECODER", "card1 failed (%s), trying card0", av_err2str(ret));
+            LOG_DEBUG("DECODER", "Attempting DRM device: %s", drm_devices[i]);
         }
-        drm_device = "/dev/dri/card0";
         ret = av_hwdevice_ctx_create(&video->hw_device_ctx, AV_HWDEVICE_TYPE_DRM,
-                                      drm_device, NULL, 0);
-        if (ret < 0) {
-            LOG_ERROR("DECODER", "Failed to create DRM device context: %s", av_err2str(ret));
-            LOG_ERROR("DECODER", "Without DRM context, V4L2 M2M will use system RAM (no DMABUF)");
-            return -1;
+                                      drm_devices[i], NULL, 0);
+        if (ret >= 0) {
+            drm_device = drm_devices[i];
+            break;
         }
+        if (hw_debug_enabled) {
+            LOG_DEBUG("DECODER", "%s failed (%s), trying next", drm_devices[i], av_err2str(ret));
+        }
+    }
+    
+    if (!drm_device) {
+        LOG_ERROR("DECODER", "Failed to create DRM device context on any device");
+        LOG_ERROR("DECODER", "Without DRM context, V4L2 M2M will use system RAM (no DMABUF)");
+        return -1;
     }
     if (hw_debug_enabled) {
         LOG_DEBUG("DECODER", "✓ DRM device context created using %s", drm_device);

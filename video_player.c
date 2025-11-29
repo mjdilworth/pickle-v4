@@ -1360,9 +1360,10 @@ void app_run(app_context_t *app) {
         // ASYNC OPTIMIZATION: Use async decoder to overlap decode with rendering
         if (app->video2) {
             // Video 2: Should we consume the next frame? (independent timing from V1)
-            // Use 90% threshold to compensate for GL upload overhead (12ms upload in 16.68ms budget)
-            // This runs V2 slightly faster to maintain sync despite CPU texture upload delays
-            bool should_consume_v2 = (current_total_time - last_frame_present_time2 >= target_frame_time2 * 0.90);
+            // Dual-HW mode: Use 1.0 threshold (zero-copy, no GL overhead)
+            // Software mode: Use 0.90 threshold to compensate for 12ms GL upload overhead
+            double timing_threshold = app->video2->use_hardware_decode ? 1.0 : 0.90;
+            bool should_consume_v2 = (current_total_time - last_frame_present_time2 >= target_frame_time2 * timing_threshold);
 
             if (app->async_decoder_secondary) {
                 // AGGRESSIVE PRE-DECODE: Always keep decode thread busy by requesting next frame
@@ -1373,8 +1374,10 @@ void app_run(app_context_t *app) {
                 }
 
                 // ASYNC PATH: Check if frame is ready from background thread
-                // Use minimal timeout since we want to keep decoder working ahead
-                int wait_timeout_ms = first_frame_decoded2 ? 0 : 100;
+                // Hardware decode: Short wait for V4L2 M2M (prevents DMA buffer staleness)
+                // Software decode: Non-blocking after first frame (decoder is fast)
+                int wait_timeout_ms = first_frame_decoded2 ?
+                                     (app->video2->use_hardware_decode ? 5 : 0) : 100;
 
                 // Check if frame is available (non-blocking after first frame)
                 if (async_decode_wait_frame(app->async_decoder_secondary, wait_timeout_ms)) {
@@ -1561,14 +1564,14 @@ void app_run(app_context_t *app) {
                 if (app->show_timing) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_start);
                 }
-                gl_render_frame_external(app->gl, dma_fd, video_width, video_height,
+                // Try zero-copy render - if it fails, fallback paths below will handle it
+                rendered = gl_render_frame_external(app->gl, dma_fd, video_width, video_height,
                                         plane_offsets, plane_pitches,
                                         app->drm, app->keystone, true, 0);
-                if (app->show_timing) {
+                if (app->show_timing && rendered) {
                     clock_gettime(CLOCK_MONOTONIC, &gl_upload_end);
                     upload_frame_time[0] = timespec_diff_seconds(&gl_upload_start, &gl_upload_end);
                 }
-                rendered = true;
             }
         }
 
@@ -1643,7 +1646,9 @@ void app_run(app_context_t *app) {
 
             // ZERO-COPY PATH for V2: Use external texture if DMA buffer available
             // This is the fast path (~1ms) - GPU imports DMA buffer directly
-            if (has_dma2 && use_hw_decode2 && new_secondary_frame_ready && 
+            // CRITICAL: Always render if we've had at least one frame (prevents flickering)
+            // Only create new EGLImage when new_secondary_frame_ready, else reuse last frame
+            if (has_dma2 && use_hw_decode2 && first_frame_decoded2 &&
                 app->video2->skip_sw_transfer && app->gl->supports_external_texture) {
                 int dma_fd2 = video_get_dma_fd(app->video2);
                 if (dma_fd2 >= 0) {
@@ -1660,14 +1665,15 @@ void app_run(app_context_t *app) {
                     if (app->show_timing) {
                         clock_gettime(CLOCK_MONOTONIC, &gl_upload_start2);
                     }
-                    gl_render_frame_external(app->gl, dma_fd2, video_width2, video_height2,
+                    // Try zero-copy render - if it fails, CPU fallback will be used below
+                    bool zero_copy_ok = gl_render_frame_external(app->gl, dma_fd2, video_width2, video_height2,
                                             plane_offsets2, plane_pitches2,
                                             app->drm, app->keystone2, false, 1);
-                    if (app->show_timing) {
+                    if (app->show_timing && zero_copy_ok) {
                         clock_gettime(CLOCK_MONOTONIC, &gl_upload_end2);
                         upload_frame_time[1] = timespec_diff_seconds(&gl_upload_start2, &gl_upload_end2);
                     }
-                    rendered2 = true;
+                    rendered2 = zero_copy_ok;  // Only mark as rendered if zero-copy succeeded
                 }
             }
 
